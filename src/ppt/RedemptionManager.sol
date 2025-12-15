@@ -121,7 +121,7 @@ contract RedemptionManager is
     event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
     event AssetSchedulerUpdated(address indexed oldScheduler, address indexed newScheduler);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
-    event OverdueLiabilityProcessed(uint256 indexed dayIndex, uint256 amount);
+    //event OverdueLiabilityProcessed(uint256 indexed dayIndex, uint256 amount);
     event DailyLiabilityAdded(uint256 indexed dayIndex, uint256 amount);
     event LiabilityRemoved(uint256 indexed dayIndex, uint256 amount, bool wasOverdue);
     event BaseRedemptionFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
@@ -882,16 +882,12 @@ contract RedemptionManager is
         uint256 today = _getDayIndex(block.timestamp);
 
         if (dayIndex < today) {
-            // Overdue: deduct from overdueLiability
-            uint256 toRemove = overdueLiability >= amount ? amount : overdueLiability;
-            overdueLiability -= toRemove;
-            emit LiabilityRemoved(dayIndex, toRemove, true);
-        } else {
-            // Not overdue: deduct from that day
-            uint256 toRemove = dailyLiability[dayIndex] >= amount ? amount : dailyLiability[dayIndex];
-            dailyLiability[dayIndex] -= toRemove;
-            emit LiabilityRemoved(dayIndex, toRemove, false);
-        }
+            uint256 toRemoveFromOverdue = overdueLiability >= amount ? amount : overdueLiability;
+            overdueLiability -= toRemoveFromOverdue;
+        } 
+        uint256 toRemove = dailyLiability[dayIndex] >= amount ? amount : dailyLiability[dayIndex];
+        dailyLiability[dayIndex] -= toRemove;
+        emit LiabilityRemoved(dayIndex, toRemove, dayIndex < today);
     }
 
     /// @notice Calculate total liability for next 7 days (called by Vault)
@@ -912,27 +908,28 @@ contract RedemptionManager is
         return dailyLiability[dayIndex];
     }
 
-    /// @notice Process yesterday's due liability to overdue (called daily by backend/Keeper)
-    function processOverdueLiability() external {
-        uint256 yesterday = _getDayIndex(block.timestamp) - 1;
-        uint256 amount = dailyLiability[yesterday];
-        if (amount > 0) {
-            overdueLiability += amount;
-            dailyLiability[yesterday] = 0;
-            emit OverdueLiabilityProcessed(yesterday, amount);
-        }
-    }
+    // /// @notice Process yesterday's due liability to overdue (called daily by backend/Keeper)
+    // function processOverdueLiability() external {
+    //     uint256 yesterday = _getDayIndex(block.timestamp) - 1;
+    //     uint256 amount = dailyLiability[yesterday];
+    //     if (amount > 0) {
+    //         overdueLiability += amount;
+    //         dailyLiability[yesterday] = 0;
+    //         emit OverdueLiabilityProcessed(yesterday, amount);
+    //     }
+    // }
 
     /// @notice Batch process overdue liability for past N days
     function processOverdueLiabilityBatch(uint256 daysBack) external {
+        overdueLiability=0;
         uint256 today = _getDayIndex(block.timestamp);
         for (uint256 i = 1; i <= daysBack; i++) {
             uint256 dayIndex = today - i;
             uint256 amount = dailyLiability[dayIndex];
             if (amount > 0) {
                 overdueLiability += amount;
-                dailyLiability[dayIndex] = 0;
-                emit OverdueLiabilityProcessed(dayIndex, amount);
+                //dailyLiability[dayIndex] = 0;
+                //emit OverdueLiabilityProcessed(dayIndex, amount);
             }
         }
     }

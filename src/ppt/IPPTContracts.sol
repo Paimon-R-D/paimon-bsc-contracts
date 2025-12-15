@@ -86,7 +86,7 @@ interface IRedemptionManager {
     function getSevenDayLiability() external view returns (uint256);
     function getOverdueLiability() external view returns (uint256);
     function getDailyLiability(uint256 dayIndex) external view returns (uint256);
-    function processOverdueLiability() external;
+    //function processOverdueLiability() external;
 }
 
 /// @title IAssetController
