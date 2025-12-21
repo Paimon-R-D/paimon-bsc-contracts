@@ -16,8 +16,6 @@ interface IPPT {
     function withdrawableRedemptionFees() external view returns (uint256);
     function emergencyMode() external view returns (bool);
     function lockedSharesOf(address owner) external view returns (uint256);
-    function pendingApprovalSharesOf(address owner) external view returns (uint256);
-    function getAvailableShares(address owner) external view returns (uint256);
     function getVaultState() external view returns (PPTTypes.VaultState memory);
 
     // ========== Liquidity Queries ==========
@@ -28,7 +26,7 @@ interface IPPT {
     function getLayer3Value() external view returns (uint256);
     function getAvailableLiquidity() external view returns (uint256);
 
-    // ========== Redemption Liquidity and Emergency Quota ==========
+    // ========== New: Redeemable Liquidity and Emergency Quota ==========
     function emergencyQuota() external view returns (uint256);
     function lockedMintAssets() external view returns (uint256);
     function getRedeemableLiquidity() external view returns (uint256);
@@ -59,9 +57,9 @@ interface IPPT {
 }
 
 /// @title IRedemptionManager
-/// @notice Redemption Manager contract interface - Called directly by users
+/// @notice Redemption management contract interface - User direct calls
 interface IRedemptionManager {
-    // ========== Redemption Requests (Called directly by users) ==========
+    // ========== Redemption Requests (User Direct Calls) ==========
     function requestRedemption(uint256 shares, address receiver) external returns (uint256 requestId);
     function requestEmergencyRedemption(uint256 shares, address receiver) external returns (uint256 requestId);
     function cancelRedemption(uint256 requestId) external;
@@ -69,11 +67,11 @@ interface IRedemptionManager {
     // ========== Settlement ==========
     function settleRedemption(uint256 requestId) external;
 
-    // ========== Approval (VIP_APPROVER calls) ==========
+    // ========== Approval (VIP_APPROVER Calls) ==========
     function approveRedemption(uint256 requestId) external;
     function rejectRedemption(uint256 requestId, string calldata reason) external;
 
-    // ========== Queries (Called directly by users) ==========
+    // ========== Queries (User Direct Calls) ==========
     function previewRedemption(uint256 shares) external view returns (PPTTypes.RedemptionPreview memory);
     function previewEmergencyRedemption(uint256 shares) external view returns (PPTTypes.RedemptionPreview memory);
     function getRedemptionRequest(uint256 requestId) external view returns (PPTTypes.RedemptionRequest memory);
@@ -82,7 +80,7 @@ interface IRedemptionManager {
     function getTotalPendingApprovalAmount() external view returns (uint256);
     function getRequestCount() external view returns (uint256);
 
-    // ========== Liability Tracking (Called by Vault) ==========
+    // ========== Liability Tracking (For Vault Calls) ==========
     function getSevenDayLiability() external view returns (uint256);
     function getOverdueLiability() external view returns (uint256);
     function getDailyLiability(uint256 dayIndex) external view returns (uint256);
@@ -90,9 +88,9 @@ interface IRedemptionManager {
 }
 
 /// @title IAssetController
-/// @notice Asset Controller contract interface - Called by REBALANCER role
+/// @notice Asset controller contract interface - REBALANCER role calls
 interface IAssetController {
-    // ========== Asset Configuration (ADMIN calls) ==========
+    // ========== Asset Configuration (ADMIN Calls) ==========
     function addAsset(
         address token,
         PPTTypes.LiquidityTier tier,
@@ -116,14 +114,14 @@ interface IAssetController {
         uint256 subscriptionEnd
     ) external;
 
-    // ========== Asset Operations (REBALANCER calls) ==========
+    // ========== Asset Operations (REBALANCER Calls) ==========
     function allocateToLayer(PPTTypes.LiquidityTier tier, uint256 amount) external returns (uint256 allocated);
     function purchaseAsset(address token, uint256 usdtAmount) external returns (uint256 tokensReceived);
     function redeemAsset(address token, uint256 tokenAmount) external returns (uint256 usdtReceived);
     function executeWaterfallLiquidation(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier) external returns (uint256 funded);
     function rebalanceBuffer() external;
 
-    // ========== Layer Configuration (ADMIN calls) ==========
+    // ========== Layer Configuration (ADMIN Calls) ==========
     function setLayerConfig(
         PPTTypes.LiquidityTier tier,
         uint256 targetRatio,
@@ -137,14 +135,8 @@ interface IAssetController {
     );
     function validateLayerRatios() external view returns (bool valid, uint256 totalRatio);
 
-    // ========== Fee Management (ADMIN calls) ==========
-    function accrueManagementFee() external;
-    function accruePerformanceFee() external;
-    function collectFees() external;
-    function withdrawRedemptionFees(uint256 amount) external;
-    function setFeeRecipient(address recipient) external;
-    function setLayer3HighWaterMark(uint256 value) external;
-    function getPendingFees() external view returns (PPTTypes.FeeInfo memory);
+    // ========== Redemption Fee Management (ADMIN Calls) ==========
+    function withdrawRedemptionFees(uint256 amount, address recipient) external;
     function getRedemptionFeeInfo() external view returns (PPTTypes.RedemptionFeeInfo memory);
 
     // ========== OTC Management ==========
@@ -165,7 +157,7 @@ interface IAssetController {
     function getBufferPoolInfo() external view returns (PPTTypes.BufferPoolInfo memory);
     function calculateAssetValue() external view returns (uint256);
 
-    // ========== External Contract Settings (ADMIN calls) ==========
+    // ========== External Contract Settings (ADMIN Calls) ==========
     function setOracleAdapter(address oracle) external;
     function setSwapHelper(address helper) external;
     function setOTCManager(address manager) external;
@@ -217,7 +209,7 @@ interface IAssetScheduler {
 }
 
 /// @title IRedemptionVoucher
-/// @notice Redemption Voucher NFT interface - Tradeable voucher for long-term redemptions
+/// @notice Redemption voucher NFT interface - Tradeable voucher for long-term redemptions
 interface IRedemptionVoucher {
     struct VoucherInfo {
         uint256 requestId;       // Associated redemption request ID
@@ -226,7 +218,7 @@ interface IRedemptionVoucher {
         uint256 mintTime;        // Minting time
     }
 
-    // ========== Minting/Burning (RedemptionManager only) ==========
+    // ========== Minting/Burning (RedemptionManager Only) ==========
     function mint(address to, uint256 requestId, uint256 grossAmount, uint256 settlementTime) external returns (uint256 tokenId);
     function burn(uint256 tokenId) external;
 

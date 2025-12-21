@@ -17,8 +17,8 @@ import {IPPT, IAssetController, IRedemptionManager} from "./IPPTContracts.sol";
 
 /// @title PPT (Paimon Prime Token)
 /// @author Paimon Yield Protocol
-/// @notice FoF (Fund of Funds) Vault - ERC4626 Core Contract (UUPS Upgradeable)
-/// @dev Redemption operations call RedemptionManager directly, asset operations call AssetController directly
+/// @notice FoF (Fund of Funds) Vault - ERC4626 core contract (UUPS Upgradeable)
+/// @dev Redemption operations directly call RedemptionManager, asset operations directly call AssetController
 contract PPT is
     Initializable,
     ERC4626Upgradeable,
@@ -35,7 +35,7 @@ contract PPT is
     // Constants
     // =============================================================================
 
-    /// @notice Standard channel request limit ratio (default 70% = 7000 / 10000, configurable)
+    /// @notice Standard channel application limit ratio (default 70% = 7000 / 10000, configurable)
     uint256 public standardQuotaRatio = 7000;
 
     // =============================================================================
@@ -50,10 +50,10 @@ contract PPT is
     // State Variables
     // =============================================================================
 
-    /// @notice Asset controller (for calculating asset value)
+    /// @notice Asset controller (used to calculate asset value)
     IAssetController public assetController;
 
-    /// @notice Redemption manager (for getting liability data)
+    /// @notice Redemption manager (used to get liability data)
     IRedemptionManager public redemptionManager;
 
     /// @notice Total redemption liability
@@ -65,23 +65,20 @@ contract PPT is
     /// @notice Withdrawable redemption fees
     uint256 public override withdrawableRedemptionFees;
 
-    /// @notice Historical accumulated redemption fees
+    /// @notice Historical cumulative redemption fees
     uint256 public totalAccumulatedRedemptionFees;
 
     /// @notice Emergency mode
     bool public override emergencyMode;
 
-    /// @notice Emergency request available quota (admin periodically refreshes)
+    /// @notice Emergency application available quota (admin periodic refresh)
     uint256 public override emergencyQuota;
 
-    /// @notice Underlying assets locked by minting within cycle (not available for redemption)
+    /// @notice Locked underlying assets from mints within the cycle (not available for redemption)
     uint256 public override lockedMintAssets;
 
     /// @notice Locked shares per user
     mapping(address => uint256) public override lockedSharesOf;
-
-    /// @notice Pending approval shares per user (does not affect NAV, but restricts transfer)
-    mapping(address => uint256) public override pendingApprovalSharesOf;
 
     /// @notice Last NAV update time
     uint256 public lastNavUpdate;
@@ -89,7 +86,7 @@ contract PPT is
     // =============================================================================
     // Events
     // =============================================================================
-    
+
     //event DepositProcessed(address indexed sender, address indexed receiver, uint256 assets, uint256 shares);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
     event EmergencyModeChanged(bool enabled);
@@ -111,7 +108,7 @@ contract PPT is
     // =============================================================================
     // Errors
     // =============================================================================
-    
+
     error ZeroAddress();
     error ZeroAmount();
     error DepositBelowMinimum(uint256 amount, uint256 minimum);
@@ -122,7 +119,7 @@ contract PPT is
     // =============================================================================
     // Modifiers
     // =============================================================================
-    
+
     modifier onlyOperator() {
         if (!hasRole(OPERATOR_ROLE, msg.sender)) revert OnlyOperator();
         _;
@@ -167,7 +164,7 @@ contract PPT is
     // =============================================================================
     // ERC4626 Core - View Functions
     // =============================================================================
-    
+
     /// @notice Calculate total assets (after deducting liabilities and fees)
     function totalAssets() public view override returns (uint256) {
         uint256 grossValue = _getGrossAssets();
@@ -195,21 +192,11 @@ contract PPT is
         return (totalAssets() * PPTTypes.PRECISION) / supply;
     }
 
-    /// @notice Get user's available shares (balance - locked - pending approval)
-    /// @dev Used for redemption request and transfer checks
-    function getAvailableShares(address owner) public view override returns (uint256) {
-        uint256 balance = balanceOf(owner);
-        uint256 locked = lockedSharesOf[owner];
-        uint256 pending = pendingApprovalSharesOf[owner];
-        uint256 unavailable = locked + pending;
-        return balance > unavailable ? balance - unavailable : 0;
-    }
-
     /// @notice Gross assets (without deducting liabilities)
     function grossAssets() public view returns (uint256) {
         return _getGrossAssets();
     }
-    
+
     function _getGrossAssets() internal view returns (uint256) {
         uint256 cashValue = IERC20(asset()).balanceOf(address(this));
         uint256 assetValue = address(assetController) != address(0)
@@ -219,44 +206,27 @@ contract PPT is
     }
 
     // =============================================================================
-    // ERC4626 Core - Conversion Overrides (using effectiveSupply for consistent pricing)
+    // ERC4626 Core - Conversion Overrides (use effectiveSupply to maintain pricing consistency)
     // =============================================================================
 
-    /// @notice Override share conversion, using effectiveSupply to maintain consistency with sharePrice
-    /// @dev Default ERC4626 uses totalSupply(), but we need effectiveSupply()
-    ///      Since totalAssets() has deducted redemption liabilities, corresponding locked shares should also be excluded
+    /// @notice Override share conversion, use effectiveSupply to maintain consistency with sharePrice
+    /// @dev Default ERC4626 uses totalSupply(), but we need to use effectiveSupply()
+    ///      because totalAssets() already deducts redemption liability, locked shares should also be excluded
     function _convertToShares(uint256 assets, Math.Rounding rounding) internal view virtual override returns (uint256) {
         uint256 supply = effectiveSupply();
         return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAssets() + 1, rounding);
     }
 
-    /// @notice Override asset conversion, using effectiveSupply to maintain consistency with sharePrice
+    /// @notice Override asset conversion, use effectiveSupply to maintain consistency with sharePrice
     function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view virtual override returns (uint256) {
         uint256 supply = effectiveSupply();
         return shares.mulDiv(totalAssets() + 1, supply + 10 ** _decimalsOffset(), rounding);
     }
 
     // =============================================================================
-    // ERC20 Core - Transfer Override (restricting pending approval/locked shares transfer)
-    // =============================================================================
-
-    /// @notice Override _update to restrict transfer of pending approval and locked shares
-    /// @dev _update is called during transfer, mint, burn operations
-    function _update(address from, address to, uint256 value) internal virtual override {
-        // Only restrict user transfers out (not restricting mint and transfers from vault)
-        if (from != address(0) && from != address(this)) {
-            uint256 available = getAvailableShares(from);
-            if (value > available) {
-                revert InsufficientShares(available, value);
-            }
-        }
-        super._update(from, to, value);
-    }
-
-    // =============================================================================
     // ERC4626 Core - Deposit Functions
     // =============================================================================
-    
+
     function deposit(
         uint256 assets,
         address receiver
@@ -270,13 +240,13 @@ contract PPT is
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
         _mint(receiver, shares);
 
-        // Accumulate cycle-locked assets
+        // Accumulate cycle locked assets
         lockedMintAssets += assets;
 
         emit Deposit(msg.sender, receiver, assets, shares);
         //emit DepositProcessed(msg.sender, receiver, assets, shares);
     }
-    
+
     function mint(
         uint256 shares,
         address receiver
@@ -290,13 +260,13 @@ contract PPT is
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
         _mint(receiver, shares);
 
-        // Accumulate cycle-locked assets
+        // Accumulate cycle locked assets
         lockedMintAssets += assets;
 
         emit Deposit(msg.sender, receiver, assets, shares);
         //emit DepositProcessed(msg.sender, receiver, assets, shares);
     }
-    
+
     /// @notice Disable direct withdraw - use RedemptionManager
     function withdraw(uint256, address, address) public pure override returns (uint256) {
         revert("error");
@@ -310,49 +280,51 @@ contract PPT is
     // =============================================================================
     // Liquidity View Functions
     // =============================================================================
-    
+
     function getLayer1Liquidity() public view override returns (uint256) {
-        return getLayer1Cash() + getLayer1YieldAssets();
+        if (address(assetController) == address(0)) return 0;
+        return assetController.getLayerValue(PPTTypes.LiquidityTier.TIER_1_CASH);
     }
-    
+
     function getLayer1Cash() public view override returns (uint256) {
         return IERC20(asset()).balanceOf(address(this));
     }
-    
+
     function getLayer1YieldAssets() public view override returns (uint256) {
         if (address(assetController) == address(0)) return 0;
         uint256 l1Total = assetController.getLayerValue(PPTTypes.LiquidityTier.TIER_1_CASH);
         uint256 cash = getLayer1Cash();
         return l1Total > cash ? l1Total - cash : 0;
     }
-    
+
     function getLayer2Liquidity() public view override returns (uint256) {
         if (address(assetController) == address(0)) return 0;
         return assetController.getLayerValue(PPTTypes.LiquidityTier.TIER_2_MMF);
     }
-    
+
     function getLayer3Value() public view override returns (uint256) {
         if (address(assetController) == address(0)) return 0;
         return assetController.getLayerValue(PPTTypes.LiquidityTier.TIER_3_HYD);
     }
-    
+
     function getAvailableLiquidity() public view override returns (uint256) {
         return getLayer1Liquidity() + getLayer2Liquidity();
     }
 
-    /// @notice Get redeemable liquidity (Layer1 only, excluding locked assets)
+    /// @notice Get redeemable liquidity (Layer1 only, after deducting locked assets and platform fees)
     function getRedeemableLiquidity() public view override returns (uint256) {
         uint256 layer1 = getLayer1Liquidity();
-        if (layer1 <= lockedMintAssets) return 0;
-        return layer1 - lockedMintAssets;
+        uint256 reserved = lockedMintAssets + withdrawableRedemptionFees;
+        if (layer1 <= reserved) return 0;
+        return layer1 - reserved;
     }
 
-    /// @notice Get standard channel request quota
+    /// @notice Get standard channel application limit
     /// @dev Formula: (L1 + L2) × 70% - emergencyQuota - fees - lockedMint - overdue - sevenDay
     function getStandardChannelQuota() public view override returns (uint256) {
         uint256 totalLiquidity = getLayer1Liquidity() + getLayer2Liquidity();
 
-        // 1. Ratio-based upper limit (default 70%)
+        // 1. Ratio limit (default 70%)
         uint256 maxAvailable = (totalLiquidity * standardQuotaRatio) / PPTTypes.BASIS_POINTS;
 
         // 2. Get liability data from RedemptionManager
@@ -366,9 +338,9 @@ contract PPT is
         // 3. Calculate all deductions
         uint256 totalDeductions = emergencyQuota           // Emergency reserve (Layer1 exclusive)
                                 + withdrawableRedemptionFees // Platform fees
-                                + lockedMintAssets          // Cycle-locked mint
+                                + lockedMintAssets          // Cycle locked mint
                                 + overdue                   // Overdue unsettled (must reserve)
-                                + sevenDay;                 // Due within next 7 days
+                                + sevenDay;                 // Due within 7 days
 
         // 4. Return available quota
         return maxAvailable > totalDeductions ? maxAvailable - totalDeductions : 0;
@@ -385,7 +357,7 @@ contract PPT is
         state.totalLockedShares = totalLockedShares;
         state.emergencyMode = emergencyMode;
     }
-    
+
     function getLiquidityBreakdown() external view returns (
         uint256 layer1Cash,
         uint256 layer1Yield,
@@ -408,63 +380,66 @@ contract PPT is
 
         _transfer(owner, address(this), shares);
         totalLockedShares += shares;
+        // Whether to record this
         lockedSharesOf[owner] += shares;
-        
+
         emit SharesLocked(owner, shares);
     }
-    
+
     function unlockShares(address owner, uint256 shares) external override onlyOperator {
         _transfer(address(this), owner, shares);
         totalLockedShares -= shares;
         lockedSharesOf[owner] -= shares;
-        
+
         emit SharesUnlocked(owner, shares);
     }
-    
+
     function burnLockedShares(address owner, uint256 shares) external override onlyOperator {
         _burn(address(this), shares);
         totalLockedShares -= shares;
         lockedSharesOf[owner] -= shares;
-        
+
         emit SharesBurned(owner, shares);
     }
-    
+
     function addRedemptionLiability(uint256 amount) external override onlyOperator {
         totalRedemptionLiability += amount;
     }
-    
+
     function removeRedemptionLiability(uint256 amount) external override onlyOperator {
         totalRedemptionLiability -= amount;
     }
-    
+
     function addRedemptionFee(uint256 fee) external override onlyOperator {
         totalAccumulatedRedemptionFees += fee;
         withdrawableRedemptionFees += fee;
         emit RedemptionFeeAdded(fee);
     }
-    
+
     function reduceRedemptionFee(uint256 fee) external override onlyOperator {
         withdrawableRedemptionFees -= fee;
         emit RedemptionFeeReduced(fee);
     }
-    
+
     function transferAssetTo(address to, uint256 amount) external override onlyOperator {
         IERC20(asset()).safeTransfer(to, amount);
     }
+
+    // Duplicated
     function getAssetBalance(address token) external view override returns (uint256) {
         return IERC20(token).balanceOf(address(this));
     }
-    
+
     function approveAsset(address token, address spender, uint256 amount) external override onlyOperator {
         IERC20(token).safeIncreaseAllowance(spender, amount);
     }
 
-    /// @notice Reduce emergency request quota (called by RedemptionManager)
+    /// @notice Reduce emergency application quota (called by RedemptionManager)
     function reduceEmergencyQuota(uint256 amount) external override onlyOperator {
         emergencyQuota -= amount;
     }
 
-    /// @notice Restore emergency request quota (called on cancel/reject)
+    /// @notice Restore emergency application quota (called on cancel/reject)
     function restoreEmergencyQuota(uint256 amount) external override onlyOperator {
         emergencyQuota += amount;
         emit EmergencyQuotaRestored(amount);
@@ -474,47 +449,41 @@ contract PPT is
     // Pending Approval Shares Management (Does Not Affect NAV)
     // =============================================================================
 
-    /// @notice Add pending approval shares (called when request requires approval)
-    /// @dev Does not lock shares or add liability, only restricts transfer
+    /// @notice Add pending approval shares (called when approval is required)
+    /// @dev Transfer shares to vault, not counted as liability or locked
     function addPendingApprovalShares(address owner, uint256 shares) external override onlyOperator {
-        uint256 available = getAvailableShares(owner);
-        if (available < shares) revert InsufficientShares(available, shares);
-        pendingApprovalSharesOf[owner] += shares;
+        _transfer(owner, address(this), shares);
         emit PendingApprovalSharesAdded(owner, shares);
     }
 
-    /// @notice Remove pending approval shares (called on cancel/reject)
+    /// @notice Remove pending approval shares (called on rejection)
+    /// @dev Return shares to user
     function removePendingApprovalShares(address owner, uint256 shares) external override onlyOperator {
-        pendingApprovalSharesOf[owner] -= shares;
+        _transfer(address(this), owner, shares);
         emit PendingApprovalSharesRemoved(owner, shares);
     }
 
     /// @notice Convert pending approval shares to locked shares (called on approval)
-    /// @dev After approval: pending → locked, also adds liability
+    /// @dev After approval: pending → locked (shares already in vault, no need to transfer again)
     function convertPendingToLocked(address owner, uint256 shares) external override onlyOperator {
-        // Reduce pending approval
-        pendingApprovalSharesOf[owner] -= shares;
-
-        // Transfer to vault and lock
-        _transfer(owner, address(this), shares);
         totalLockedShares += shares;
         lockedSharesOf[owner] += shares;
-
         emit PendingApprovalSharesConverted(owner, shares);
         emit SharesLocked(owner, shares);
     }
 
+
     // =============================================================================
     // Admin Functions
     // =============================================================================
-    
+
     function setAssetController(address controller) external onlyRole(ADMIN_ROLE) {
         address old = address(assetController);
         assetController = IAssetController(controller);
         emit AssetControllerUpdated(old, controller);
     }
-    
-    /// @notice Grant RedemptionManager or AssetController permission to operate Vault
+
+    /// @notice Authorize RedemptionManager or AssetController to operate Vault
     function grantOperator(address operator) external onlyRole(ADMIN_ROLE) {
         _grantRole(OPERATOR_ROLE, operator);
     }
@@ -523,26 +492,26 @@ contract PPT is
     function revokeOperator(address operator) external onlyRole(ADMIN_ROLE) {
         _revokeRole(OPERATOR_ROLE, operator);
     }
-    
+
     function setEmergencyMode(bool enabled) external onlyRole(ADMIN_ROLE) {
         emergencyMode = enabled;
         emit EmergencyModeChanged(enabled);
     }
 
-    /// @notice Admin refresh emergency request quota
+    /// @notice Admin refresh emergency application quota
     function refreshEmergencyQuota(uint256 amount) external override onlyRole(ADMIN_ROLE) {
         emergencyQuota = amount;
         emit EmergencyQuotaRefreshed(amount);
     }
 
-    /// @notice Admin reset cycle-locked assets (called during cycle refresh)
+    /// @notice Admin reset cycle locked assets (called on cycle refresh)
     function resetLockedMintAssets() external override onlyRole(ADMIN_ROLE) {
         uint256 old = lockedMintAssets;
         lockedMintAssets = 0;
         emit LockedMintAssetsReset(old);
     }
 
-    /// @notice Set redemption manager (for getting liability data)
+    /// @notice Set redemption manager (used to get liability data)
     function setRedemptionManager(address manager) external onlyRole(ADMIN_ROLE) {
         address old = address(redemptionManager);
         redemptionManager = IRedemptionManager(manager);
@@ -561,18 +530,18 @@ contract PPT is
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
-    
+
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
-    
-    /// @notice Emergency withdraw (only in emergency mode)
+
+    /// @notice Emergency withdraw (emergency mode only)
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
         require(emergencyMode, "Not in emergency mode");
         IERC20(token).safeTransfer(to, amount);
     }
 
-    /// @notice Update NAV (for record keeping)
+    /// @notice Update NAV (for recording)
     function updateNav() external {
         uint256 oldNav = sharePrice();
         lastNavUpdate = block.timestamp;
