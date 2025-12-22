@@ -14,10 +14,11 @@ interface IPPT {
     function totalRedemptionLiability() external view returns (uint256);
     function totalLockedShares() external view returns (uint256);
     function withdrawableRedemptionFees() external view returns (uint256);
+    function totalAccumulatedRedemptionFees()external view returns (uint256);
     function emergencyMode() external view returns (bool);
     function lockedSharesOf(address owner) external view returns (uint256);
     function getVaultState() external view returns (PPTTypes.VaultState memory);
-
+    
     // ========== Liquidity Queries ==========
     function getLayer1Liquidity() external view returns (uint256);
     function getLayer1Cash() external view returns (uint256);
@@ -26,7 +27,7 @@ interface IPPT {
     function getLayer3Value() external view returns (uint256);
     function getAvailableLiquidity() external view returns (uint256);
 
-    // ========== New: Redeemable Liquidity and Emergency Quota ==========
+    // ========== New: Redemption Liquidity and Emergency Quota ==========
     function emergencyQuota() external view returns (uint256);
     function lockedMintAssets() external view returns (uint256);
     function getRedeemableLiquidity() external view returns (uint256);
@@ -37,8 +38,8 @@ interface IPPT {
 
     // ========== Standard Channel Dynamic Quota ==========
     function getStandardChannelQuota() external view returns (uint256);
-
-    // ========== For OPERATOR Role (RedemptionManager / AssetController) ==========
+    
+    // ========== Called by OPERATOR Role (RedemptionManager / AssetController) ==========
     function lockShares(address owner, uint256 shares) external;
     function unlockShares(address owner, uint256 shares) external;
     function burnLockedShares(address owner, uint256 shares) external;
@@ -57,21 +58,21 @@ interface IPPT {
 }
 
 /// @title IRedemptionManager
-/// @notice Redemption management contract interface - User direct calls
+/// @notice Redemption Manager contract interface - Called directly by users
 interface IRedemptionManager {
-    // ========== Redemption Requests (User Direct Calls) ==========
+    // ========== Redemption Requests (Called Directly by Users) ==========
     function requestRedemption(uint256 shares, address receiver) external returns (uint256 requestId);
     function requestEmergencyRedemption(uint256 shares, address receiver) external returns (uint256 requestId);
     function cancelRedemption(uint256 requestId) external;
-
+    
     // ========== Settlement ==========
     function settleRedemption(uint256 requestId) external;
 
-    // ========== Approval (VIP_APPROVER Calls) ==========
+    // ========== Approval (Called by VIP_APPROVER) ==========
     function approveRedemption(uint256 requestId) external;
     function rejectRedemption(uint256 requestId, string calldata reason) external;
 
-    // ========== Queries (User Direct Calls) ==========
+    // ========== Queries (Called Directly by Users) ==========
     function previewRedemption(uint256 shares) external view returns (PPTTypes.RedemptionPreview memory);
     function previewEmergencyRedemption(uint256 shares) external view returns (PPTTypes.RedemptionPreview memory);
     function getRedemptionRequest(uint256 requestId) external view returns (PPTTypes.RedemptionRequest memory);
@@ -80,7 +81,7 @@ interface IRedemptionManager {
     function getTotalPendingApprovalAmount() external view returns (uint256);
     function getRequestCount() external view returns (uint256);
 
-    // ========== Liability Tracking (For Vault Calls) ==========
+    // ========== Liability Tracking (Called by Vault) ==========
     function getSevenDayLiability() external view returns (uint256);
     function getOverdueLiability() external view returns (uint256);
     function getDailyLiability(uint256 dayIndex) external view returns (uint256);
@@ -88,40 +89,32 @@ interface IRedemptionManager {
 }
 
 /// @title IAssetController
-/// @notice Asset controller contract interface - REBALANCER role calls
+/// @notice Asset Controller contract interface - Called by REBALANCER role
 interface IAssetController {
-    // ========== Asset Configuration (ADMIN Calls) ==========
+    // ========== Asset Configuration (Called by ADMIN) ==========
     function addAsset(
         address token,
         PPTTypes.LiquidityTier tier,
-        uint256 targetAllocation,
         address purchaseAdapter
     ) external;
     function addAssetSimple(
         address token,
-        PPTTypes.LiquidityTier tier,
-        uint256 targetAllocation
+        PPTTypes.LiquidityTier tier
     ) external;
     function removeAsset(address token) external;
-    function updateAssetAllocation(address token, uint256 newAllocation) external;
     function setAssetAdapter(address token, address newAdapter) external;
     function setAssetPurchaseConfig(
         address token,
         PPTTypes.PurchaseMethod method,
-        uint256 maxSlippage,
-        uint256 minPurchaseAmount,
-        uint256 subscriptionStart,
-        uint256 subscriptionEnd
+        uint256 maxSlippage
     ) external;
-
-    // ========== Asset Operations (REBALANCER Calls) ==========
-    function allocateToLayer(PPTTypes.LiquidityTier tier, uint256 amount) external returns (uint256 allocated);
+    
+    // ========== Asset Operations (Called by REBALANCER) ==========
     function purchaseAsset(address token, uint256 usdtAmount) external returns (uint256 tokensReceived);
     function redeemAsset(address token, uint256 tokenAmount) external returns (uint256 usdtReceived);
     function executeWaterfallLiquidation(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier) external returns (uint256 funded);
-    function rebalanceBuffer() external;
 
-    // ========== Layer Configuration (ADMIN Calls) ==========
+    // ========== Layer Configuration (Called by ADMIN) ==========
     function setLayerConfig(
         PPTTypes.LiquidityTier tier,
         uint256 targetRatio,
@@ -134,34 +127,19 @@ interface IAssetController {
         PPTTypes.LayerConfig memory layer3
     );
     function validateLayerRatios() external view returns (bool valid, uint256 totalRatio);
-
-    // ========== Redemption Fee Management (ADMIN Calls) ==========
+    
+    // ========== Redemption Fee Management (Called by ADMIN) ==========
     function withdrawRedemptionFees(uint256 amount, address recipient) external;
-    function getRedemptionFeeInfo() external view returns (PPTTypes.RedemptionFeeInfo memory);
-
-    // ========== OTC Management ==========
-    function createOTCOrder(
-        address rwaToken,
-        uint256 usdtAmount,
-        uint256 expectedTokens,
-        address counterparty,
-        uint256 expiresIn
-    ) external returns (uint256 orderId);
-    function executeOTCPayment(uint256 orderId) external;
-    function confirmOTCDelivery(uint256 orderId, uint256 actualTokens) external;
 
     // ========== Queries ==========
     function getAssetConfigs() external view returns (PPTTypes.AssetConfig[] memory);
     function getLayerAssets(PPTTypes.LiquidityTier tier) external view returns (address[] memory);
     function getLayerValue(PPTTypes.LiquidityTier tier) external view returns (uint256);
-    function getBufferPoolInfo() external view returns (PPTTypes.BufferPoolInfo memory);
     function calculateAssetValue() external view returns (uint256);
-
-    // ========== External Contract Settings (ADMIN Calls) ==========
+    
+    // ========== External Contract Settings (Called by ADMIN) ==========
     function setOracleAdapter(address oracle) external;
     function setSwapHelper(address helper) external;
-    function setOTCManager(address manager) external;
-    function setAssetScheduler(address scheduler) external;
     function setDefaultSwapSlippage(uint256 slippage) external;
     function refreshCache() external;
 }
@@ -173,8 +151,8 @@ interface IOracleAdapter {
 
 /// @title ISwapHelper
 interface ISwapHelper {
-    function buyRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps) external returns (uint256);
-    function sellRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps) external returns (uint256);
+    function buyRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient) external returns (uint256);
+    function sellRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient) external returns (uint256);
 }
 
 /// @title IOTCManager
@@ -209,13 +187,13 @@ interface IAssetScheduler {
 }
 
 /// @title IRedemptionVoucher
-/// @notice Redemption voucher NFT interface - Tradeable voucher for long-term redemptions
+/// @notice Redemption Voucher NFT interface - Tradeable voucher for long-term redemptions
 interface IRedemptionVoucher {
     struct VoucherInfo {
         uint256 requestId;       // Associated redemption request ID
         uint256 grossAmount;     // Redemption amount (USDT)
         uint256 settlementTime;  // Settlement date
-        uint256 mintTime;        // Minting time
+        uint256 mintTime;        // Mint time
     }
 
     // ========== Minting/Burning (RedemptionManager Only) ==========

@@ -9,7 +9,7 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
-import {IPPT, IRedemptionManager, IAssetScheduler, IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
+import {IPPT, IRedemptionManager, IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
 
 /// @title RedemptionManager
 /// @author Paimon Yield Protocol
@@ -41,7 +41,6 @@ contract RedemptionManager is
 
     /// @notice Vault contract address (immutable, preserved during upgrades)
     IPPT public vault;
-    IAssetScheduler public assetScheduler;
     IAssetController public assetController;
 
     // =============================================================================
@@ -119,7 +118,6 @@ contract RedemptionManager is
     event RedemptionCancelled(uint256 indexed requestId, address indexed owner);
     event LowLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available, uint256 total);
     event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
-    event AssetSchedulerUpdated(address indexed oldScheduler, address indexed newScheduler);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
    // event OverdueLiabilityProcessed(uint256 indexed dayIndex, uint256 amount);
     event DailyLiabilityAdded(uint256 indexed dayIndex, uint256 amount);
@@ -960,11 +958,6 @@ contract RedemptionManager is
         emit VoucherThresholdUpdated(old, threshold_);
     }
 
-    function setAssetScheduler(address scheduler) external onlyRole(ADMIN_ROLE) {
-        address old = address(assetScheduler);
-        assetScheduler = IAssetScheduler(scheduler);
-        emit AssetSchedulerUpdated(old, scheduler);
-    }
 
     function setAssetController(address controller) external onlyRole(ADMIN_ROLE) {
         address old = address(assetController);
