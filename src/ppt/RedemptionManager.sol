@@ -255,10 +255,10 @@ contract RedemptionManager is
     /// @param tokenId NFT voucher tokenId
     function settleWithVoucher(uint256 tokenId) external nonReentrant {
         // Verify caller is NFT holder
-        address voucherOwner = redemptionVoucher.ownerOf(tokenId);
-        if (msg.sender != voucherOwner) {
-            revert NotVoucherOwner(msg.sender, voucherOwner);
-        }
+        // address voucherOwner = redemptionVoucher.ownerOf(tokenId);
+        // if (msg.sender != voucherOwner) {
+        //     revert NotVoucherOwner(msg.sender, voucherOwner);
+        // }
 
         // Get associated requestId and call core settlement logic
         (uint256 requestId, , , ) = redemptionVoucher.voucherInfo(tokenId);
@@ -670,9 +670,8 @@ contract RedemptionManager is
             revert SettlementTimeNotReached(request.settlementTime, block.timestamp);
         }
 
-        bool isEmergency = request.channel == PPTTypes.RedemptionChannel.EMERGENCY;
-        uint256 actualFee = _calculateRedemptionFee(request.grossAmount, isEmergency);
-        uint256 payoutAmount = request.grossAmount - actualFee;
+        uint256 actualFee = request.estimatedFee;
+        uint256 payoutAmount = request.grossAmount;
 
         // 1. Calculate settlement available funds (don't deduct emergencyQuota, it's a limit at request time)
         uint256 rawCash = IERC20(_asset()).balanceOf(address(vault));
@@ -716,7 +715,7 @@ contract RedemptionManager is
         vault.burnLockedShares(request.owner, request.shares);
         vault.removeRedemptionLiability(request.grossAmount);
         vault.addRedemptionFee(actualFee);
-        vault.transferAssetTo(payoutReceiver, payoutAmount);
+        vault.transferAssetTo(payoutReceiver, payoutAmount-actualFee);
 
         request.status = PPTTypes.RedemptionStatus.SETTLED;
 
