@@ -9,16 +9,16 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
-import {IPPT, IRedemptionManager, IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
+import {IPPT, IRedemptionManager,  IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
 
 /// @title RedemptionManager
 /// @author Paimon Yield Protocol
-/// @notice Redemption management contract - Users directly call for redemption operations (UUPS Upgradeable)
+/// @notice Redemption manager contract - User directly calls for redemption operations (UUPS Upgradeable)
 /// @dev Redemption channel description:
 ///      1. Standard channel (T+7): Base fee (default 1%, configurable)
-///         - Approval condition: >=100K USDT or exceeds dynamic quota
+///         - Approval condition: >=100K or exceeds dynamic quota
 ///      2. Emergency channel (T+1): Base fee + penalty fee (default 2%, configurable)
-///         - Approval condition: >30K USDT or >10% of Layer1
+///         - Approval condition: >30K or >10% of Layer1
 contract RedemptionManager is
     IRedemptionManager,
     Initializable,
@@ -27,11 +27,11 @@ contract RedemptionManager is
     PausableUpgradeable,
     UUPSUpgradeable
 {
-
+    
     // =============================================================================
     // Roles
     // =============================================================================
-
+    
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant VIP_APPROVER_ROLE = keccak256("VIP_APPROVER_ROLE");
 
@@ -39,7 +39,7 @@ contract RedemptionManager is
     // External Contracts
     // =============================================================================
 
-    /// @notice Vault contract address (immutable, preserved during upgrades)
+    /// @notice Vault contract address (immutable, preserved during upgrade)
     IPPT public vault;
     IAssetController public assetController;
 
@@ -52,6 +52,22 @@ contract RedemptionManager is
 
     /// @notice Emergency redemption penalty fee (default 1% = 100 bps)
     uint256 public emergencyPenaltyFeeBps;
+
+    // =============================================================================
+    // Approval Threshold Configuration (Admin Configurable)
+    // =============================================================================
+
+    /// @notice Standard channel approval amount threshold (default 50K = 50_000e18)
+    uint256 public standardApprovalAmount;
+
+    /// @notice Standard channel approval quota ratio threshold (default 20% = 2000 bps)
+    uint256 public standardApprovalQuotaRatio;
+
+    /// @notice Emergency channel approval amount threshold (default 30K = 30_000e18)
+    uint256 public emergencyApprovalAmount;
+
+    /// @notice Emergency channel approval quota ratio threshold (default 20% = 2000 bps)
+    uint256 public emergencyApprovalQuotaRatio;
 
     // =============================================================================
     // State Variables
@@ -73,7 +89,7 @@ contract RedemptionManager is
     /// @notice Liability amount mapped by settlement date (dayIndex => amount)
     mapping(uint256 => uint256) public dailyLiability;
 
-    /// @notice Total overdue unsettled liability (must be reserved immediately)
+    /// @notice Total overdue but unsettled liability (must be reserved immediately)
     uint256 public overdueLiability;
 
     // =============================================================================
@@ -89,7 +105,7 @@ contract RedemptionManager is
     // =============================================================================
     // Events
     // =============================================================================
-
+    
     event RedemptionRequested(
         uint256 indexed requestId,
         address indexed owner,
@@ -102,7 +118,7 @@ contract RedemptionManager is
         uint256 settlementTime,
         uint256 windowId
     );
-
+    
     event RedemptionSettled(
         uint256 indexed requestId,
         address indexed owner,
@@ -112,14 +128,12 @@ contract RedemptionManager is
         uint256 netAmount,
         PPTTypes.RedemptionChannel channel
     );
-
+    
     event RedemptionApproved(uint256 indexed requestId, address indexed approver, uint256 settlementTime);
     event RedemptionRejected(uint256 indexed requestId, address indexed rejector, string reason);
-    event RedemptionCancelled(uint256 indexed requestId, address indexed owner);
     event LowLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available, uint256 total);
     event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
-   // event OverdueLiabilityProcessed(uint256 indexed dayIndex, uint256 amount);
     event DailyLiabilityAdded(uint256 indexed dayIndex, uint256 amount);
     event LiabilityRemoved(uint256 indexed dayIndex, uint256 amount, bool wasOverdue);
     event BaseRedemptionFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
@@ -128,11 +142,15 @@ contract RedemptionManager is
     event RedemptionVoucherUpdated(address indexed oldVoucher, address indexed newVoucher);
     event VoucherThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
     event VoucherMinted(uint256 indexed requestId, uint256 indexed tokenId, address indexed owner);
+    event StandardApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
+    event StandardApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
+    event EmergencyApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
+    event EmergencyApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
 
     // =============================================================================
     // Errors
     // =============================================================================
-
+    
     error ZeroAddress();
     error ZeroAmount();
     error InsufficientShares(uint256 available, uint256 required);
@@ -142,8 +160,6 @@ contract RedemptionManager is
     error SettlementTimeNotReached(uint256 settlementTime, uint256 currentTime);
     error NotPendingApproval(uint256 requestId);
     error EmergencyModeNotActive();
-    error SchedulerNotConfigured();
-    error NotRequestOwner();
     error EmergencyQuotaExceeded(uint256 available, uint256 requested);
     error InvalidSettlementTime(uint256 provided, uint256 minimum);
     error NotVoucherOwner(address caller, address owner);
@@ -175,6 +191,12 @@ contract RedemptionManager is
         baseRedemptionFeeBps = 100; // 1%
         emergencyPenaltyFeeBps = 100; // 1%
 
+        // Initialize approval threshold configuration
+        standardApprovalAmount = 50_000e18;    // 50K
+        standardApprovalQuotaRatio = 2000;     // 20%
+        emergencyApprovalAmount = 30_000e18;   // 30K
+        emergencyApprovalQuotaRatio = 2000;    // 20%
+
         // Initialize NFT voucher threshold (default 7 days)
         voucherThreshold = 7 days;
 
@@ -191,11 +213,11 @@ contract RedemptionManager is
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
 
     // =============================================================================
-    // User Functions - Users directly call
+    // User Functions - User Direct Calls
     // =============================================================================
 
-    /// @notice Request redemption (user directly calls) - Standard channel T+7
-    /// @param shares Number of shares to redeem
+    /// @notice Request redemption (user direct call) - Standard channel T+7
+    /// @param shares Shares to redeem
     /// @param receiver Address to receive USDT
     /// @return requestId Redemption request ID
     function requestRedemption(
@@ -206,7 +228,7 @@ contract RedemptionManager is
         if (receiver == address(0)) revert ZeroAddress();
 
         address owner = msg.sender;
-        // Since pending approval and locked shares are transferred to vault, user's balanceOf is available balance
+        // Since pending approval and locked shares are transferred to vault, user balanceOf is available balance
         uint256 availableShares = IERC20(address(vault)).balanceOf(owner);
 
         if (availableShares < shares) revert InsufficientShares(availableShares, shares);
@@ -217,8 +239,8 @@ contract RedemptionManager is
         return _processStandardRedemption(owner, shares, receiver, grossAmount, nav);
     }
 
-    /// @notice Request emergency redemption (user directly calls)
-    /// @param shares Number of shares to redeem
+    /// @notice Request emergency redemption (user direct call)
+    /// @param shares Shares to redeem
     /// @param receiver Address to receive USDT
     /// @return requestId Redemption request ID
     function requestEmergencyRedemption(
@@ -230,7 +252,7 @@ contract RedemptionManager is
         if (receiver == address(0)) revert ZeroAddress();
 
         address owner = msg.sender;
-        // Since pending approval and locked shares are transferred to vault, user's balanceOf is available balance
+        // Since pending approval and locked shares are transferred to vault, user balanceOf is available balance
         uint256 availableShares = IERC20(address(vault)).balanceOf(owner);
 
         if (availableShares < shares) revert InsufficientShares(availableShares, shares);
@@ -240,17 +262,17 @@ contract RedemptionManager is
 
         return _processEmergencyRedemption(owner, shares, receiver, grossAmount, nav);
     }
-
-    /// @notice Settle redemption (via requestId)
+    
+    /// @notice Settle redemption (by requestId)
     /// @dev Without NFT voucher: Anyone can call, assets sent to receiver
     ///      With NFT voucher: Only NFT holder can call, assets sent to NFT holder
     function settleRedemption(uint256 requestId) external override nonReentrant {
         _settleRedemptionCore(requestId);
     }
 
-    /// @notice NFT voucher holder dedicated settlement method (via tokenId)
-    /// @dev Settle via tokenId, convenient for NFT holders who don't know requestId
-    /// @param tokenId NFT voucher tokenId
+    /// @notice Settlement method for NFT voucher holders (by tokenId)
+    /// @dev Settle by tokenId, convenient when NFT holder doesn't know requestId
+    /// @param tokenId NFT voucher's tokenId
     function settleWithVoucher(uint256 tokenId) external nonReentrant {
         // Verify caller is NFT holder
         // address voucherOwner = redemptionVoucher.ownerOf(tokenId);
@@ -258,14 +280,14 @@ contract RedemptionManager is
         //     revert NotVoucherOwner(msg.sender, voucherOwner);
         // }
 
-        // Get associated requestId and call core settlement logic
+        // Get associated requestId, call core settlement logic
         (uint256 requestId, , , ) = redemptionVoucher.voucherInfo(tokenId);
         if (requestId == 0) revert RequestNotFound(0);
 
         _settleRedemptionCore(requestId);
     }
 
-    /// @dev Settlement core logic (shared by settleRedemption and settleWithVoucher)
+    /// @dev Core settlement logic (shared by settleRedemption and settleWithVoucher)
     function _settleRedemptionCore(uint256 requestId) internal {
         PPTTypes.RedemptionRequest storage request = _requests[requestId];
 
@@ -289,7 +311,7 @@ contract RedemptionManager is
                 revert NotVoucherOwner(msg.sender, voucherOwner);
             }
 
-            // Assets sent to NFT holder
+            // Send assets to NFT holder
             payoutReceiver = voucherOwner;
 
             // Burn NFT
@@ -299,18 +321,18 @@ contract RedemptionManager is
         _executeSettlement(request, payoutReceiver);
     }
 
-    /// @notice User cancels unsettled redemption request (disabled)
-    /// @dev Redemption requests cannot be cancelled once submitted, can only wait for settlement or rejection
+    /// @notice User cancel unsettled redemption request (disabled)
+    /// @dev Once redemption application is submitted it cannot be cancelled, can only wait for settlement or rejection
     function cancelRedemption(uint256 requestId) external override nonReentrant {
-        // Redemption cancellation feature is disabled
+        // Redemption cancellation is disabled
         revert CancellationDisabled();
     }
 
     // =============================================================================
-    // Preview Functions - Users directly call
+    // Preview Functions - User Direct Calls
     // =============================================================================
 
-    /// @notice Preview redemption (user directly calls)
+    /// @notice Preview redemption (user direct call)
     /// @dev Anyone can call, checks caller's (msg.sender) available shares
     function previewRedemption(uint256 shares) external view override returns (PPTTypes.RedemptionPreview memory preview) {
         // Check if contract is paused
@@ -347,14 +369,14 @@ contract RedemptionManager is
         // Note: If approval required, actual settlement time starts from approval time
         preview.estimatedSettlementTime = block.timestamp + PPTTypes.STANDARD_REDEMPTION_DELAY;
 
-        // T+7 settlement, don't check liquidity at request time
-        // Liquidity is checked at _executeSettlement
+        // T+7 settlement, do not use current liquidity to determine if can apply
+        // Liquidity is checked at settlement time
         preview.canProcess = true;
         preview.channelReason = preview.requiresApproval
             ? "Standard channel (T+7): Requires approval (>50K or >20% of dynamic quota)"
             : "Standard channel (T+7): No approval required";
     }
-
+    
     /// @notice Preview emergency redemption
     function previewEmergencyRedemption(uint256 shares) external view override returns (PPTTypes.RedemptionPreview memory preview) {
         if (!vault.emergencyMode()) {
@@ -389,7 +411,7 @@ contract RedemptionManager is
         preview.settlementDelay = PPTTypes.EMERGENCY_REDEMPTION_DELAY;
         preview.estimatedSettlementTime = block.timestamp + PPTTypes.EMERGENCY_REDEMPTION_DELAY;
 
-        // Check emergency quota (hard limit, deducted at request time)
+        // Check emergency application quota (hard limit, deducted at application)
         uint256 quota = vault.emergencyQuota();
         if (preview.grossAmount > quota) {
             preview.canProcess = false;
@@ -397,8 +419,8 @@ contract RedemptionManager is
             return preview;
         }
 
-        // T+1 settlement, don't check liquidity at request time
-        // Liquidity is checked at _executeSettlement
+        // T+1 settlement, do not use current liquidity to determine if can apply
+        // Liquidity is checked at settlement time
         preview.canProcess = true;
         preview.channelReason = preview.requiresApproval
             ? "Emergency channel (T+1): Requires approval (>30K or >20% of emergency quota), +1% fee"
@@ -406,7 +428,7 @@ contract RedemptionManager is
     }
 
     // =============================================================================
-    // Approval Functions - VIP Approver calls
+    // Approval Functions - VIP Approver Calls
     // =============================================================================
 
     /// @notice Approve redemption (using default settlement time)
@@ -426,7 +448,7 @@ contract RedemptionManager is
         _approveRedemptionCore(requestId, customSettlementTime);
     }
 
-    /// @dev Approval core logic (shared by approveRedemption and approveRedemptionWithDate)
+    /// @dev Core approval logic (shared by approveRedemption and approveRedemptionWithDate)
     /// @param requestId Redemption request ID
     /// @param customSettlementTime Custom settlement time (0 means use default delay)
     function _approveRedemptionCore(uint256 requestId, uint256 customSettlementTime) internal {
@@ -459,7 +481,7 @@ contract RedemptionManager is
         request.settlementTime = settlementTime;
         request.status = PPTTypes.RedemptionStatus.APPROVED;
 
-        // Calculate delay and decide whether to generate NFT
+        // Calculate delay, decide whether to generate NFT
         uint256 delay = settlementTime - block.timestamp;
         uint256 threshold = voucherThreshold > 0 ? voucherThreshold : 7 days;
 
@@ -506,10 +528,10 @@ contract RedemptionManager is
 
         request.status = PPTTypes.RedemptionStatus.CANCELLED;
 
-        // PENDING_APPROVAL status: Only pending approval shares were added at request time (doesn't affect NAV)
-        // On rejection: Remove pending approval shares marker, user can freely transfer
-        // No need to removeRedemptionLiability (because it was never added)
-        // No need to removeLiability (because settlementTime=0, no daily liability was recorded)
+        // PENDING_APPROVAL state: only pending approval shares were added at application (does not affect NAV)
+        // On rejection: remove pending approval shares marker, user can transfer freely
+        // No need for removeRedemptionLiability (never added)
+        // No need for removeLiability (settlementTime=0, no daily liability recorded)
         vault.removePendingApprovalShares(request.owner, request.shares);
 
         // If emergency channel, refund quota
@@ -526,7 +548,7 @@ contract RedemptionManager is
     // =============================================================================
     // Internal Processing
     // =============================================================================
-
+    
     function _processStandardRedemption(
         address owner,
         uint256 shares,
@@ -537,8 +559,8 @@ contract RedemptionManager is
         bool requiresApproval = _requiresStandardApproval(grossAmount);
         uint256 estimatedFee = _calculateRedemptionFee(grossAmount, false);
 
-        // Note: T+7 settlement, don't check liquidity at request time
-        // Liquidity check happens at _executeSettlement
+        // Note: T+7 settlement, do not check liquidity at application
+        // Liquidity check is done at _executeSettlement
 
         requestId = ++_requestIdCounter;
 
@@ -567,13 +589,13 @@ contract RedemptionManager is
         _userRequests[owner].push(requestId);
 
         if (requiresApproval) {
-            // Requires approval: Only mark pending approval shares, don't lock or add liability
-            // Completely doesn't affect NAV, but restricts transfers
+            // Requires approval: only mark pending approval shares, no locking, no liability
+            // Does not affect NAV, but restricts transfer
             vault.addPendingApprovalShares(owner, shares);
             _pendingApprovals.push(requestId);
             totalPendingApprovalAmount += grossAmount;
         } else {
-            // No approval needed: Lock shares + add liability + daily liability
+            // No approval needed: lock shares + add liability + daily liability
             vault.lockShares(owner, shares);
             vault.addRedemptionLiability(grossAmount);
             _addDailyLiability(settlementTime, grossAmount);
@@ -586,7 +608,7 @@ contract RedemptionManager is
 
         _checkLiquidityAndAlert();
     }
-
+    
     function _processEmergencyRedemption(
         address owner,
         uint256 shares,
@@ -594,7 +616,7 @@ contract RedemptionManager is
         uint256 grossAmount,
         uint256 nav
     ) internal returns (uint256 requestId) {
-        // Check emergency quota
+        // Check emergency application quota
         uint256 quota = vault.emergencyQuota();
         if (grossAmount > quota) {
             revert EmergencyQuotaExceeded(quota, grossAmount);
@@ -603,10 +625,10 @@ contract RedemptionManager is
         bool requiresApproval = _requiresEmergencyApproval(grossAmount);
         uint256 estimatedFee = _calculateRedemptionFee(grossAmount, true);
 
-        // Note: T+1 settlement, don't check liquidity at request time
-        // Liquidity check happens at _executeSettlement
+        // Note: T+1 settlement, do not check liquidity at application
+        // Liquidity check is done at _executeSettlement
 
-        // Deduct emergency quota (regardless of approval requirement)
+        // Deduct emergency application quota (deduct regardless of whether approval is required)
         vault.reduceEmergencyQuota(grossAmount);
 
         requestId = ++_requestIdCounter;
@@ -636,13 +658,13 @@ contract RedemptionManager is
         _userRequests[owner].push(requestId);
 
         if (requiresApproval) {
-            // Requires approval: Only mark pending approval shares, don't lock or add liability
-            // Completely doesn't affect NAV, but restricts transfers
+            // Requires approval: only mark pending approval shares, no locking, no liability
+            // Does not affect NAV, but restricts transfer
             vault.addPendingApprovalShares(owner, shares);
             _pendingApprovals.push(requestId);
             totalPendingApprovalAmount += grossAmount;
         } else {
-            // No approval needed: Lock shares + add liability + daily liability
+            // No approval needed: lock shares + add liability + daily liability
             vault.lockShares(owner, shares);
             vault.addRedemptionLiability(grossAmount);
             _addDailyLiability(settlementTime, grossAmount);
@@ -653,12 +675,12 @@ contract RedemptionManager is
             PPTTypes.RedemptionChannel.EMERGENCY, requiresApproval, settlementTime, 0
         );
     }
-
+    
     function _executeSettlement(
         PPTTypes.RedemptionRequest storage request,
         address payoutReceiver
     ) internal {
-        // Safety check: Ensure request is valid and status is correct
+        // Guard check: ensure request is valid and status is correct
         if (request.requestId == 0) revert RequestNotFound(0);
         if (request.status != PPTTypes.RedemptionStatus.PENDING &&
             request.status != PPTTypes.RedemptionStatus.APPROVED) {
@@ -671,20 +693,20 @@ contract RedemptionManager is
         uint256 actualFee = request.estimatedFee;
         uint256 payoutAmount = request.grossAmount;
 
-        // 1. Calculate settlement available funds (don't deduct emergencyQuota, it's a limit at request time)
+        // 1. Calculate available funds for settlement (don't deduct emergencyQuota, it's an application-time limit)
         uint256 rawCash = IERC20(_asset()).balanceOf(address(vault));
         uint256 fees = vault.withdrawableRedemptionFees();
         uint256 locked = vault.lockedMintAssets();
 
-        // Available = cash - fee reserve - locked assets
+        // Available = cash - reserved fees - locked assets
         uint256 reserved = fees + locked;
         uint256 availableCash = rawCash > reserved ? rawCash - reserved : 0;
 
-        // 2. If available funds insufficient, try waterfall liquidation TIER_1_CASH
+        // 2. If available funds insufficient, try waterfall liquidation of TIER_1_CASH
         if (availableCash < payoutAmount) {
             uint256 deficit = payoutAmount - availableCash;
 
-            // Call AssetController waterfall liquidation Layer1 yield assets
+            // Call AssetController to waterfall liquidate Layer1 yield assets
             if (address(assetController) != address(0)) {
                 uint256 funded = assetController.executeWaterfallLiquidation(
                     deficit,
@@ -704,12 +726,12 @@ contract RedemptionManager is
             }
         }
 
-        // 3. Remove liability at settlement (if settlement time exists)
+        // 3. Remove liability at settlement (if has settlement time)
         if (request.settlementTime > 0) {
             _removeLiability(request.settlementTime, request.grossAmount);
         }
 
-        // 4. Execute settlement (assets sent to payoutReceiver, may be original receiver or NFT holder)
+        // 4. Execute settlement (send assets to payoutReceiver, may be original receiver or NFT holder)
         vault.burnLockedShares(request.owner, request.shares);
         vault.removeRedemptionLiability(request.grossAmount);
         vault.addRedemptionFee(actualFee);
@@ -732,32 +754,32 @@ contract RedemptionManager is
     // Channel Detection
     // =============================================================================
 
-    /// @notice Determine if standard channel requires approval
-    /// @dev Condition: Single > 50K USDT or > 20% of dynamic quota
+    /// @notice Check if standard channel requires approval
+    /// @dev Condition: single transaction > standardApprovalAmount OR > standardApprovalQuotaRatio of dynamic quota
     function _requiresStandardApproval(uint256 amount) internal view returns (bool) {
-        // 1. Absolute threshold: > 50K USDT requires approval
-        if (amount > PPTTypes.STANDARD_APPROVAL_AMOUNT) {
+        // 1. Absolute threshold: > standardApprovalAmount requires approval
+        if (amount > standardApprovalAmount) {
             return true;
         }
-        // 2. Ratio threshold: > 20% of dynamic quota requires approval
+        // 2. Ratio threshold: > standardApprovalQuotaRatio of dynamic quota requires approval
         uint256 quota = vault.getStandardChannelQuota();
-        uint256 ratioThreshold = (quota * PPTTypes.STANDARD_APPROVAL_QUOTA_RATIO) / PPTTypes.BASIS_POINTS;
+        uint256 ratioThreshold = (quota * standardApprovalQuotaRatio) / PPTTypes.BASIS_POINTS;
         return amount > ratioThreshold;
     }
 
-    /// @notice Determine if emergency channel requires approval
-    /// @dev Condition: Single > 30K USDT or > 20% of emergency quota balance
+    /// @notice Check if emergency channel requires approval
+    /// @dev Condition: single transaction > emergencyApprovalAmount OR > emergencyApprovalQuotaRatio of emergency quota balance
     function _requiresEmergencyApproval(uint256 amount) internal view returns (bool) {
-        // 1. Absolute threshold: > 30K USDT requires approval
-        if (amount > PPTTypes.EMERGENCY_APPROVAL_AMOUNT) {
+        // 1. Absolute threshold: > emergencyApprovalAmount requires approval
+        if (amount > emergencyApprovalAmount) {
             return true;
         }
-        // 2. Ratio threshold: > 20% of emergency quota balance requires approval
+        // 2. Ratio threshold: > emergencyApprovalQuotaRatio of emergency quota balance requires approval
         uint256 emergencyQuota = vault.emergencyQuota();
-        uint256 ratioThreshold = (emergencyQuota * PPTTypes.EMERGENCY_APPROVAL_QUOTA_RATIO) / PPTTypes.BASIS_POINTS;
+        uint256 ratioThreshold = (emergencyQuota * emergencyApprovalQuotaRatio) / PPTTypes.BASIS_POINTS;
         return amount > ratioThreshold;
     }
-
+    
     /// @notice Calculate redemption fee
     /// @dev Standard redemption: baseRedemptionFeeBps (default 1%)
     ///      Emergency redemption: baseRedemptionFeeBps + emergencyPenaltyFeeBps (default 2%)
@@ -804,16 +826,17 @@ contract RedemptionManager is
             }
         }
     }
+    
 
     function _checkLiquidityAndAlert() internal {
         if (block.timestamp < _lastLiquidityAlertTime + 1 hours) return;
-
+        
         uint256 available = vault.getAvailableLiquidity();
         uint256 gross = _totalAssets() + vault.totalRedemptionLiability();
         if (gross == 0) return;
-
+        
         uint256 ratio = (available * PPTTypes.BASIS_POINTS) / gross;
-
+        
         if (ratio < PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD) {
             emit CriticalLiquidityAlert(ratio, PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD, available);
             _lastLiquidityAlertTime = block.timestamp;
@@ -826,23 +849,23 @@ contract RedemptionManager is
     // =============================================================================
     // View Functions
     // =============================================================================
-
+    
     function getRedemptionRequest(uint256 requestId) external view override returns (PPTTypes.RedemptionRequest memory) {
         return _requests[requestId];
     }
-
+    
     function getUserRedemptions(address user) external view override returns (uint256[] memory) {
         return _userRequests[user];
     }
-
+    
     function getPendingApprovals() external view override returns (uint256[] memory) {
         return _pendingApprovals;
     }
-
+    
     function getTotalPendingApprovalAmount() external view override returns (uint256) {
         return totalPendingApprovalAmount;
     }
-
+    
     function getRequestCount() external view override returns (uint256) {
         return _requestIdCounter;
     }
@@ -856,16 +879,16 @@ contract RedemptionManager is
         return timestamp / 1 days;
     }
 
-    /// @notice Add daily liability
+    /// @notice Add liability for a specific day
     function _addDailyLiability(uint256 settlementTime, uint256 amount) internal {
         uint256 dayIndex = _getDayIndex(settlementTime);
         dailyLiability[dayIndex] += amount;
         emit DailyLiabilityAdded(dayIndex, amount);
     }
 
-    /// @notice Remove liability (distinguish between overdue and not overdue)
-    /// @dev Overdue: Deduct from both dailyLiability[dayIndex] and overdueLiability (overdueLiability is cache)
-    ///      Not overdue: Only deduct from dailyLiability[dayIndex]
+    /// @notice Remove liability (distinguish between overdue and non-overdue)
+    /// @dev Overdue: deduct from both dailyLiability[dayIndex] and overdueLiability (overdueLiability is cache)
+    ///      Non-overdue: only deduct from dailyLiability[dayIndex]
     function _removeLiability(uint256 settlementTime, uint256 amount) internal {
         uint256 dayIndex = _getDayIndex(settlementTime);
         uint256 today = _getDayIndex(block.timestamp);
@@ -877,14 +900,14 @@ contract RedemptionManager is
         if (dayIndex < today) {
             uint256 toRemoveFromOverdue = overdueLiability >= amount ? amount : overdueLiability;
             overdueLiability -= toRemoveFromOverdue;
-        }
+        } 
         uint256 toRemove = dailyLiability[dayIndex] >= amount ? amount : dailyLiability[dayIndex];
         dailyLiability[dayIndex] -= toRemove;
         emit LiabilityRemoved(dayIndex, toRemove, dayIndex < today);
-
+        
     }
 
-    /// @notice Calculate total liability for next 7 days (called by Vault)
+    /// @notice Calculate total liability for the next 7 days (for Vault to call)
     function getSevenDayLiability() public view returns (uint256 total) {
         uint256 today = _getDayIndex(block.timestamp);
         for (uint256 i = 0; i <= 7; i++) {
@@ -897,12 +920,12 @@ contract RedemptionManager is
         return overdueLiability;
     }
 
-    /// @notice Get daily liability (for external queries)
+    /// @notice Get liability for a specific day (for external queries)
     function getDailyLiability(uint256 dayIndex) public view returns (uint256) {
         return dailyLiability[dayIndex];
     }
 
-    /// @notice Process yesterday's due to overdue (backend/Keeper daily call)
+    /// @notice Process yesterday's due liability to overdue (backend/Keeper daily call)
     // function processOverdueLiability() external {
     //     uint256 yesterday = _getDayIndex(block.timestamp) - 1;
     //     uint256 amount = dailyLiability[yesterday];
@@ -913,7 +936,7 @@ contract RedemptionManager is
     //     }
     // }
 
-    /// @notice Batch process overdue liability for past N days
+    /// @notice Batch process overdue liability for the past N days
     function processOverdueLiabilityBatch(uint256 daysBack) external {
         overdueLiability=0;
         uint256 today = _getDayIndex(block.timestamp);
@@ -928,12 +951,12 @@ contract RedemptionManager is
         }
     }
 
-    /// @notice Admin adjust overdueLiability (emergency/fix use)
+    /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
     function adjustOverdueLiability(uint256 amount) external onlyRole(ADMIN_ROLE) {
         overdueLiability = amount;
     }
 
-    /// @notice Admin adjust daily liability (emergency/fix use)
+    /// @notice Admin adjust liability for a specific day (for emergency/fix purposes)
     function adjustDailyLiability(uint256 dayIndex, uint256 amount) external onlyRole(ADMIN_ROLE) {
         dailyLiability[dayIndex] = amount;
     }
@@ -951,13 +974,18 @@ contract RedemptionManager is
     }
 
     /// @notice Set NFT generation threshold
-    /// @param threshold_ Delay threshold (seconds), generate NFT when exceeds this threshold
+    /// @param threshold_ Delay threshold (seconds), generate NFT if exceeds this threshold
     function setVoucherThreshold(uint256 threshold_) external onlyRole(ADMIN_ROLE) {
         uint256 old = voucherThreshold;
         voucherThreshold = threshold_;
         emit VoucherThresholdUpdated(old, threshold_);
     }
 
+    // function setAssetScheduler(address scheduler) external onlyRole(ADMIN_ROLE) {
+    //     address old = address(assetScheduler);
+    //     assetScheduler = IAssetScheduler(scheduler);
+    //     emit AssetSchedulerUpdated(old, scheduler);
+    // }
 
     function setAssetController(address controller) external onlyRole(ADMIN_ROLE) {
         address old = address(assetController);
@@ -981,6 +1009,40 @@ contract RedemptionManager is
         uint256 old = emergencyPenaltyFeeBps;
         emergencyPenaltyFeeBps = feeBps;
         emit EmergencyPenaltyFeeUpdated(old, feeBps);
+    }
+
+    /// @notice Set standard channel approval amount threshold
+    /// @param amount Amount threshold (18 decimals), e.g., 50_000e18 = 50K USDT
+    function setStandardApprovalAmount(uint256 amount) external onlyRole(ADMIN_ROLE) {
+        uint256 old = standardApprovalAmount;
+        standardApprovalAmount = amount;
+        emit StandardApprovalAmountUpdated(old, amount);
+    }
+
+    /// @notice Set standard channel approval ratio threshold
+    /// @param ratio Ratio threshold (basis points), e.g., 2000 = 20%
+    function setStandardApprovalQuotaRatio(uint256 ratio) external onlyRole(ADMIN_ROLE) {
+        require(ratio <= PPTTypes.BASIS_POINTS, "Ratio too high"); // Max 100%
+        uint256 old = standardApprovalQuotaRatio;
+        standardApprovalQuotaRatio = ratio;
+        emit StandardApprovalQuotaRatioUpdated(old, ratio);
+    }
+
+    /// @notice Set emergency channel approval amount threshold
+    /// @param amount Amount threshold (18 decimals), e.g., 30_000e18 = 30K USDT
+    function setEmergencyApprovalAmount(uint256 amount) external onlyRole(ADMIN_ROLE) {
+        uint256 old = emergencyApprovalAmount;
+        emergencyApprovalAmount = amount;
+        emit EmergencyApprovalAmountUpdated(old, amount);
+    }
+
+    /// @notice Set emergency channel approval ratio threshold
+    /// @param ratio Ratio threshold (basis points), e.g., 2000 = 20%
+    function setEmergencyApprovalQuotaRatio(uint256 ratio) external onlyRole(ADMIN_ROLE) {
+        require(ratio <= PPTTypes.BASIS_POINTS, "Ratio too high"); // Max 100%
+        uint256 old = emergencyApprovalQuotaRatio;
+        emergencyApprovalQuotaRatio = ratio;
+        emit EmergencyApprovalQuotaRatioUpdated(old, ratio);
     }
 
     function pause() external onlyRole(ADMIN_ROLE) {

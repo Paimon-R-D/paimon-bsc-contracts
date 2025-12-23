@@ -15,8 +15,8 @@ import {IPPT, IAssetController, IOracleAdapter, ISwapHelper, IOTCManager, IAsset
 
 /// @title AssetController
 /// @author Paimon Yield Protocol
-/// @notice Asset control contract - Manages asset configuration, purchase, redemption, and fees (UUPS Upgradeable)
-/// @dev REBALANCER role calls directly for asset operations
+/// @notice Asset controller contract - Manages asset configuration, purchase, redemption and fees (UUPS Upgradeable)
+/// @dev REBALANCER role directly calls for asset operations
 contract AssetController is
     IAssetController,
     Initializable,
@@ -33,16 +33,16 @@ contract AssetController is
 
     /// @notice Admin role - Can configure assets, set parameters, pause contract
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    /// @notice Rebalancer role - Can execute asset purchases, redemptions, waterfall liquidations, etc.
+    /// @notice Rebalancer role - Can execute asset purchase, redemption, waterfall liquidation, etc.
     bytes32 public constant REBALANCER_ROLE = keccak256("REBALANCER_ROLE");
 
     // =============================================================================
     // External Contract References
     // =============================================================================
 
-    /// @notice PPT Vault contract - Vault holding all assets
+    /// @notice PPT Vault contract - The vault holding all assets
     IPPT public vault;
-    /// @notice Price oracle adapter - Fetches asset prices
+    /// @notice Price oracle adapter - Gets asset prices
     IOracleAdapter public oracleAdapter;
     /// @notice Swap helper contract - Executes DEX trades
     ISwapHelper public swapHelper;
@@ -52,13 +52,13 @@ contract AssetController is
     // Asset Configuration State
     // =============================================================================
 
-    /// @dev Configuration array of all added assets
+    /// @dev Array of all added asset configurations
     PPTTypes.AssetConfig[] private _assetConfigs;
-    /// @dev Asset address => config index+1 mapping (0 means non-existent)
+    /// @dev Mapping of asset address => config index+1 (0 means not exists)
     mapping(address => uint256) private _assetIndex;
-    /// @notice Configuration for each tier (target ratio, min/max ratios)
+    /// @notice Layer configurations (target ratio, min/max ratios)
     mapping(PPTTypes.LiquidityTier => PPTTypes.LayerConfig) public layerConfigs;
-    /// @dev List of asset addresses included in each tier
+    /// @dev List of asset addresses in each layer
     mapping(PPTTypes.LiquidityTier => address[]) private _layerAssets;
 
     // =============================================================================
@@ -81,28 +81,32 @@ contract AssetController is
     // Event Definitions
     // =============================================================================
 
-    /// @notice Asset added event
+    /// @notice New asset added event
     event AssetAdded(address indexed token, PPTTypes.LiquidityTier tier);
     /// @notice Asset removed event
     event AssetRemoved(address indexed token);
-    /// @notice Asset adapter updated event
-    event AssetAdapterUpdated(address indexed token, address indexed oldAdapter, address indexed newAdapter);
     /// @notice Asset purchased event
     event AssetPurchased(address indexed token, PPTTypes.LiquidityTier tier, uint256 usdtAmount, uint256 tokensReceived);
     /// @notice Asset redeemed event
     event AssetRedeemed(address indexed token, PPTTypes.LiquidityTier tier, uint256 tokenAmount, uint256 usdtReceived);
-    /// @notice Purchase routed event - Records specific purchase method used
+    /// @notice Purchase routed event - Records the specific purchase method used
     event PurchaseRouted(address indexed token, PPTTypes.LiquidityTier indexed tier, PPTTypes.PurchaseMethod method, uint256 usdtAmount, uint256 tokensReceived);
-    /// @notice Waterfall liquidation event - Liquidates assets from lower priority tiers
+    /// @notice Waterfall liquidation event - Liquidates assets from lower priority layers
     event WaterfallLiquidation(PPTTypes.LiquidityTier tier, address indexed token, uint256 amountLiquidated, uint256 usdtReceived);
-    /// @notice Layer configuration updated event
+    /// @notice Layer config updated event
     event LayerConfigUpdated(PPTTypes.LiquidityTier indexed tier, uint256 targetRatio, uint256 minRatio, uint256 maxRatio);
     /// @notice Redemption fees withdrawn event
     event RedemptionFeesWithdrawn(address indexed recipient, uint256 amount);
     /// @notice Oracle adapter updated event
     event OracleAdapterUpdated(address indexed oldOracle, address indexed newOracle);
-    /// @notice Swap helper updated event
+    /// @notice Swap helper contract updated event
     event SwapHelperUpdated(address indexed oldHelper, address indexed newHelper);
+    /// @notice Asset active status updated event
+    event AssetActiveUpdated(address indexed token, bool active);
+    /// @notice Asset tier updated event
+    event AssetTierUpdated(address indexed token, PPTTypes.LiquidityTier oldTier, PPTTypes.LiquidityTier newTier);
+    /// @notice Asset config updated event
+    event AssetConfigUpdated(address indexed token, PPTTypes.LiquidityTier tier, address purchaseAdapter, PPTTypes.PurchaseMethod method, uint256 maxSlippage);
 
     // =============================================================================
     // Error Definitions
@@ -118,30 +122,32 @@ contract AssetController is
     error AssetNotFound(address token);
     /// @notice Asset not purchasable (disabled)
     error AssetNotPurchasable(address token);
-    /// @notice Invalid layer ratio configuration
+    /// @notice Invalid layer ratios configuration
     error InvalidLayerRatios();
     /// @notice Swap helper not configured
     error SwapHelperNotConfigured();
     /// @notice Asset adapter not configured
     error AssetAdapterNotConfigured(address token);
-    /// @notice Insufficient available cash
+    /// @notice Not enough available cash
     error NotEnoughAvailableCash(uint256 requested, uint256 available);
-    /// @notice Slippage setting too high
+    /// @notice Slippage too high
     error SlippageTooHigh(uint256 provided, uint256 maxAllowed);
     /// @notice Insufficient liquidity
     error InsufficientLiquidity(uint256 available, uint256 required);
+    /// @notice Attempting to set same active status
+    error SameActiveStatus(bool status);
 
     // =============================================================================
     // Constructor & Initialization
     // =============================================================================
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    /// @dev Constructor - Disables implementation contract initialization (UUPS proxy pattern requirement)
+    /// @dev Constructor - Disables initialization of implementation contract (required by UUPS proxy pattern)
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Initialization function (replaces constructor in proxy pattern)
+    /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param vault_ Vault contract address
     /// @param admin_ Admin address
     function initialize(address vault_, address admin_) external initializer {
@@ -164,56 +170,32 @@ contract AssetController is
     // UUPS Upgrade Authorization
     // =============================================================================
 
-    /// @notice Authorize contract upgrade (ADMIN only)
+    /// @notice Authorize contract upgrade (only ADMIN can call)
     /// @dev UUPS pattern requires overriding this function to control upgrade permissions
     /// @param newImplementation New implementation contract address
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
 
     // =============================================================================
-    // Asset Configuration Management (ADMIN Only)
+    // Asset Configuration Management (ADMIN only)
     // =============================================================================
 
     /// @notice Add new asset to configuration
-    /// @dev Adds asset to specified tier, uses equal allocation strategy
+    /// @dev Add asset to specified layer, configure all parameters at once
     /// @param token Asset token address
     /// @param tier Liquidity tier (TIER_1_CASH/TIER_2_MMF/TIER_3_HYD)
-    /// @param purchaseAdapter Purchase adapter address (for OTC purchases)
+    /// @param purchaseAdapter Purchase adapter address (for OTC purchase, 0 uses DEX)
+    /// @param method Purchase method (AUTO/SWAP/OTC)
+    /// @param maxSlippage Maximum slippage (basis points, 0=use default)
     function addAsset(
         address token,
         PPTTypes.LiquidityTier tier,
-        address purchaseAdapter
+        address purchaseAdapter,
+        PPTTypes.PurchaseMethod method,
+        uint256 maxSlippage
     ) external override onlyRole(ADMIN_ROLE) {
         if (token == address(0)) revert ZeroAddress();
         if (_assetIndex[token] != 0) revert AssetAlreadyExists(token);
-
-        uint8 decimals = IERC20Metadata(token).decimals();
-
-        _assetConfigs.push(PPTTypes.AssetConfig({
-            tokenAddress: token,              // Asset token address
-            tier: tier,                       // Liquidity tier (TIER_1_CASH/TIER_2_MMF/TIER_3_HYD)
-            isActive: true,                   // Whether asset enabled
-            purchaseAdapter: purchaseAdapter, // OTC purchase adapter address (0 means use DEX)
-            decimals: decimals,               // Token decimals
-            purchaseMethod: PPTTypes.PurchaseMethod.AUTO, // Purchase method: AUTO=auto select/SWAP=DEX/OTC=adapter
-            maxSlippage: 0                    // Max slippage limit (basis points, 0=use default)
-        }));
-
-        _assetIndex[token] = _assetConfigs.length;
-        _layerAssets[tier].push(token);
-
-        emit AssetAdded(token, tier);
-    }
-
-    /// @notice Simplified add asset (without adapter)
-    /// @dev Adds asset without specifying purchase adapter, will use DEX swap for purchases, uses equal allocation strategy
-    /// @param token Asset token address
-    /// @param tier Liquidity tier
-    function addAssetSimple(
-        address token,
-        PPTTypes.LiquidityTier tier
-    ) external override onlyRole(ADMIN_ROLE) {
-        if (token == address(0)) revert ZeroAddress();
-        if (_assetIndex[token] != 0) revert AssetAlreadyExists(token);
+        if (maxSlippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(maxSlippage, PPTTypes.MAX_SLIPPAGE_BPS);
 
         uint8 decimals = IERC20Metadata(token).decimals();
 
@@ -221,10 +203,10 @@ contract AssetController is
             tokenAddress: token,
             tier: tier,
             isActive: true,
-            purchaseAdapter: address(0),
+            purchaseAdapter: purchaseAdapter,
             decimals: decimals,
-            purchaseMethod: PPTTypes.PurchaseMethod.AUTO,
-            maxSlippage: 0
+            purchaseMethod: method,
+            maxSlippage: maxSlippage
         }));
 
         _assetIndex[token] = _assetConfigs.length;
@@ -234,7 +216,7 @@ contract AssetController is
     }
 
     /// @notice Remove asset from configuration
-    /// @dev Removes specified asset from configuration array and tier asset list
+    /// @dev Remove specified asset from config array and layer asset list
     /// @param token Asset address to remove
     function removeAsset(address token) external override onlyRole(ADMIN_ROLE) {
         uint256 index = _assetIndex[token];
@@ -263,30 +245,17 @@ contract AssetController is
         emit AssetRemoved(token);
     }
 
-    /// @notice Set asset purchase adapter
-    /// @dev Specifies OTC purchase adapter contract for asset
+    /// @notice Update asset configuration
+    /// @dev Update asset's tier, adapter, purchase method and slippage config at once
     /// @param token Asset address
-    /// @param newAdapter New adapter address
-    function setAssetAdapter(
-        address token,
-        address newAdapter
-    ) external override onlyRole(ADMIN_ROLE) {
-        uint256 index = _assetIndex[token];
-        if (index == 0) revert AssetNotFound(token);
-        
-        address oldAdapter = _assetConfigs[index - 1].purchaseAdapter;
-        _assetConfigs[index - 1].purchaseAdapter = newAdapter;
-        
-        emit AssetAdapterUpdated(token, oldAdapter, newAdapter);
-    }
-
-    /// @notice Set asset purchase configuration
-    /// @dev Configures asset purchase method and slippage limits
-    /// @param token Asset address
+    /// @param newTier New liquidity tier
+    /// @param purchaseAdapter Purchase adapter address (0 uses DEX)
     /// @param method Purchase method (AUTO/SWAP/OTC)
-    /// @param maxSlippage Max slippage (basis points)
-    function setAssetPurchaseConfig(
+    /// @param maxSlippage Maximum slippage (basis points)
+    function updateAssetConfig(
         address token,
+        PPTTypes.LiquidityTier newTier,
+        address purchaseAdapter,
         PPTTypes.PurchaseMethod method,
         uint256 maxSlippage
     ) external override onlyRole(ADMIN_ROLE) {
@@ -294,21 +263,62 @@ contract AssetController is
         if (index == 0) revert AssetNotFound(token);
         if (maxSlippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(maxSlippage, PPTTypes.MAX_SLIPPAGE_BPS);
 
-        PPTTypes.AssetConfig storage cfg = _assetConfigs[index - 1];
-        cfg.purchaseMethod = method;
-        cfg.maxSlippage = maxSlippage;
+        PPTTypes.AssetConfig storage config = _assetConfigs[index - 1];
+        PPTTypes.LiquidityTier oldTier = config.tier;
+
+        // If tier changed, update _layerAssets mapping
+        if (oldTier != newTier) {
+            // Remove from old tier
+            address[] storage oldLayerAssets = _layerAssets[oldTier];
+            for (uint256 i = 0; i < oldLayerAssets.length; i++) {
+                if (oldLayerAssets[i] == token) {
+                    oldLayerAssets[i] = oldLayerAssets[oldLayerAssets.length - 1];
+                    oldLayerAssets.pop();
+                    break;
+                }
+            }
+            // Add to new tier
+            _layerAssets[newTier].push(token);
+            config.tier = newTier;
+            emit AssetTierUpdated(token, oldTier, newTier);
+        }
+
+        // Update other configurations
+        config.purchaseAdapter = purchaseAdapter;
+        config.purchaseMethod = method;
+        config.maxSlippage = maxSlippage;
+
+        emit AssetConfigUpdated(token, newTier, purchaseAdapter, method, maxSlippage);
+    }
+
+    /// @notice Set asset active status
+    /// @dev Modify asset's isActive status, supports pausing/resuming asset purchase
+    /// @param token Asset address
+    /// @param active Whether active (true=enabled, false=disabled)
+    function setAssetActive(
+        address token,
+        bool active
+    ) external override onlyRole(ADMIN_ROLE) {
+        uint256 index = _assetIndex[token];
+        if (index == 0) revert AssetNotFound(token);
+
+        PPTTypes.AssetConfig storage config = _assetConfigs[index - 1];
+        if (config.isActive == active) revert SameActiveStatus(active);
+
+        config.isActive = active;
+        emit AssetActiveUpdated(token, active);
     }
 
     // =============================================================================
-    // Asset Operations (REBALANCER Only)
+    // Asset Operations (REBALANCER only)
     // =============================================================================
 
 
     /// @notice Purchase specified asset
-    /// @dev Uses USDT from Vault to purchase specified asset, selects OTC or SWAP based on configuration
+    /// @dev Use USDT from Vault to purchase specified asset, choose OTC or SWAP based on config
     /// @param token Asset address to purchase
     /// @param usdtAmount USDT amount for purchase
-    /// @return tokensReceived Asset tokens received
+    /// @return tokensReceived Amount of asset tokens received
     function purchaseAsset(
         address token,
         uint256 usdtAmount
@@ -324,10 +334,10 @@ contract AssetController is
     }
 
     /// @notice Redeem specified asset
-    /// @dev Sells asset tokens for USDT, uses adapter first, otherwise uses DEX swap
+    /// @dev Sell asset tokens for USDT, prioritize using adapter, otherwise use DEX swap
     /// @param token Asset address to redeem
-    /// @param tokenAmount Token amount to redeem
-    /// @return usdtReceived USDT received
+    /// @param tokenAmount Amount of tokens to redeem
+    /// @return usdtReceived Amount of USDT received
     function redeemAsset(
         address token,
         uint256 tokenAmount
@@ -362,9 +372,9 @@ contract AssetController is
     }
 
     /// @notice Execute waterfall liquidation
-    /// @dev Liquidates assets by priority from lower tiers to meet funding needs (Layer1 → Layer2)
+    /// @dev Liquidate assets from lower priority layers to meet funding needs (Layer1 → Layer2)
     /// @param amountNeeded USDT amount needed
-    /// @param maxTier Maximum liquidation tier
+    /// @param maxTier Maximum tier allowed for liquidation
     /// @return funded Actual USDT amount raised
     function executeWaterfallLiquidation(
         uint256 amountNeeded,
@@ -375,12 +385,12 @@ contract AssetController is
 
 
     // =============================================================================
-    // Layer Configuration (ADMIN Only)
+    // Layer Configuration (ADMIN only)
     // =============================================================================
 
     /// @notice Set layer configuration
-    /// @dev Configures layer target ratio, minimum ratio, and maximum ratio
-    /// @param tier Tier type
+    /// @dev Configure layer's target ratio, minimum ratio and maximum ratio
+    /// @param tier Layer type
     /// @param targetRatio Target ratio (basis points)
     /// @param minRatio Minimum ratio (basis points)
     /// @param maxRatio Maximum ratio (basis points)
@@ -403,10 +413,10 @@ contract AssetController is
     }
 
     /// @notice Get all layer configurations
-    /// @dev Returns configuration information for all three tiers
-    /// @return layer1 Layer1 (cash tier) configuration
-    /// @return layer2 Layer2 (money market fund tier) configuration
-    /// @return layer3 Layer3 (high-yield tier) configuration
+    /// @dev Returns configuration info for all three layers
+    /// @return layer1 Layer1 (cash layer) configuration
+    /// @return layer2 Layer2 (money market fund layer) configuration
+    /// @return layer3 Layer3 (high yield debt layer) configuration
     function getLayerConfigs() external view override returns (
         PPTTypes.LayerConfig memory layer1,
         PPTTypes.LayerConfig memory layer2,
@@ -418,7 +428,7 @@ contract AssetController is
     }
 
     /// @notice Validate layer ratio configuration
-    /// @dev Checks if sum of target ratios for all three tiers equals 100%
+    /// @dev Check if the sum of target ratios of all three layers equals 100%
     /// @return valid Whether valid (sum = 10000 basis points)
     /// @return totalRatio Current total ratio
     function validateLayerRatios() public view override returns (bool valid, uint256 totalRatio) {
@@ -429,11 +439,11 @@ contract AssetController is
     }
 
     // =============================================================================
-    // Redemption Fee Management (ADMIN Only)
+    // Redemption Fee Management (ADMIN only)
     // =============================================================================
 
     /// @notice Withdraw redemption fees
-    /// @dev Withdraws fees generated from user redemptions from Vault
+    /// @dev Withdraw fees generated from user redemptions from Vault
     /// @param amount Withdrawal amount, 0 means withdraw all available
     /// @param recipient Fee recipient address
     function withdrawRedemptionFees(uint256 amount, address recipient) external onlyRole(ADMIN_ROLE) {
@@ -470,16 +480,16 @@ contract AssetController is
         return _assetConfigs;
     }
 
-    /// @notice Get asset list for specified tier
-    /// @param tier Tier type
-    /// @return Array of asset addresses contained in this tier
+    /// @notice Get asset list for specified layer
+    /// @param tier Layer type
+    /// @return Asset addresses array in this layer
     function getLayerAssets(PPTTypes.LiquidityTier tier) external view override returns (address[] memory) {
         return _layerAssets[tier];
     }
 
-    /// @notice Get total value of specified tier
-    /// @dev Calculates sum of USDT value of all assets in tier
-    /// @param tier Tier type
+    /// @notice Get total value for specified layer
+    /// @dev Calculate sum of USDT value of all assets in the layer
+    /// @param tier Layer type
     /// @return total Total value (USDT denominated)
     function getLayerValue(PPTTypes.LiquidityTier tier) public view override returns (uint256 total) {
         if (tier == PPTTypes.LiquidityTier.TIER_1_CASH) {
@@ -499,7 +509,7 @@ contract AssetController is
     }
 
     /// @notice Calculate total value of all assets
-    /// @dev Uses caching mechanism to optimize frequent calls, recalculates after cache expires
+    /// @dev Uses cache mechanism to optimize frequent calls, recalculate when cache expires
     /// @return totalValue Total USDT value of all assets
     function calculateAssetValue() public view override returns (uint256 totalValue) {
         if (_cachedAssetValue.timestamp != 0 && 
@@ -551,7 +561,7 @@ contract AssetController is
         return IERC4626(address(vault)).totalAssets();
     }
 
-    /// @dev Preview shares receivable from deposit
+    /// @dev Preview shares obtainable from deposit
     function _previewDeposit(uint256 assets) internal view returns (uint256) {
         return IERC4626(address(vault)).previewDeposit(assets);
     }
@@ -559,33 +569,33 @@ contract AssetController is
 
 
     /// @dev Execute asset purchase
-    /// @param configIndex Asset configuration index
+    /// @param configIndex Asset config index
     /// @param usdtAmount Purchase amount
     /// @return spent Actual USDT spent
-    /// @return tokensReceived Tokens received
+    /// @return tokensReceived Amount of tokens received
     ///
     /// @notice Purchase flow description:
     /// ┌─────────────────────────────────────────────────────────┐
     /// │  Step 0: Pre-validation checks                          │
-    /// │    - Asset enabled, amount non-zero, cash balance       │
+    /// │    - Asset enabled, amount not 0, cash balance          │
     /// ├─────────────────────────────────────────────────────────┤
     /// │  Step 1: Determine purchase method                      │
-    /// │    AUTO mode: has adapter→OTC / no adapter→SWAP        │
+    /// │    AUTO mode: has adapter→OTC / no adapter→SWAP         │
     /// ├─────────────────────────────────────────────────────────┤
     /// │  Step 2: Execute purchase                               │
-    /// │    OTC mode: adapter.purchase() → balance diff         │
-    /// │    SWAP mode: swapHelper.buyRWAAsset() → direct return │
+    /// │    OTC mode: adapter.purchase() → balance diff for gain │
+    /// │    SWAP mode: swapHelper.buyRWAAsset() → direct return  │
     /// ├─────────────────────────────────────────────────────────┤
     /// │  Step 3: Cleanup                                        │
-    /// │    Emit event, invalidate cache                         │
+    /// │    Emit events, invalidate cache                        │
     /// └─────────────────────────────────────────────────────────┘
     ///
-    /// Purchase mode comparison:
-    /// | Feature        | OTC Mode                  | SWAP Mode              |
-    /// |----------------|---------------------------|------------------------|
-    /// | Use case       | RWA, large, KYC required  | Onchain liquid tokens  |
-    /// | Executor       | Custom adapter contract   | SwapHelper (DEX agg)   |
-    /// | Typical assets | T-Bill tokens, funds      | aUSDC, stETH           |
+    /// Comparison of two purchase modes:
+    /// | Feature   | OTC Mode              | SWAP Mode              |
+    /// |-----------|----------------------|------------------------|
+    /// | Use Case  | RWA, large amount,KYC| On-chain liquid tokens |
+    /// | Executor  | Custom adapter       | SwapHelper (DEX aggr.) |
+    /// | Examples  | T-Bill tokens, PE    | aUSDC, stETH           |
     ///
     function _executePurchase(
         uint256 configIndex,    // Asset index in _assetConfigs array
@@ -594,7 +604,7 @@ contract AssetController is
 
         // ==================== Step 0: Pre-validation checks ====================
 
-        // Get asset config from storage (storage reference saves gas)
+        // Get asset config from storage (use storage reference to save gas)
         PPTTypes.AssetConfig storage config = _assetConfigs[configIndex];
 
         // Check 1: Asset must be enabled, disabled assets cannot be purchased
@@ -603,10 +613,10 @@ contract AssetController is
         // Check 2: Purchase amount cannot be 0, return directly if 0
         if (usdtAmount == 0) return (0, 0);
 
-        // Check 3: Vault cash balance sufficient
-        uint256 cashBalance = IERC20(_asset()).balanceOf(address(vault));  // Get Vault USDT balance
+        // Check 3: Vault cash balance must be sufficient
+        uint256 cashBalance = IERC20(_asset()).balanceOf(address(vault));  // Get USDT balance in Vault
         if (usdtAmount > cashBalance) {
-            revert NotEnoughAvailableCash(usdtAmount, cashBalance);  // Revert if insufficient
+            revert NotEnoughAvailableCash(usdtAmount, cashBalance);  // Insufficient balance error
         }
 
         // ==================== Step 1: Determine purchase method ====================
@@ -615,7 +625,7 @@ contract AssetController is
         PPTTypes.PurchaseMethod method = config.purchaseMethod;
 
         // If AUTO mode, auto-select based on adapter configuration:
-        // - Has adapter → OTC (over-the-counter, suitable for large or special assets)
+        // - Has adapter → OTC (OTC trading, suitable for large or special assets)
         // - No adapter → SWAP (DEX trading, suitable for liquid assets)
         if (method == PPTTypes.PurchaseMethod.AUTO) {
             method = config.purchaseAdapter != address(0)
@@ -623,14 +633,14 @@ contract AssetController is
                 : PPTTypes.PurchaseMethod.SWAP;
         }
 
-        // Get Vault's underlying asset address (typically USDT)
+        // Get Vault's underlying asset address (usually USDT)
         address vaultAsset = _asset();
 
         // ==================== Step 2: Execute purchase ====================
 
         if (method == PPTTypes.PurchaseMethod.OTC) {
-            // ---------- OTC over-the-counter mode ----------
-            // Suitable for: RWA assets, assets without onchain liquidity, KYC-required assets
+            // ---------- OTC mode ----------
+            // Use cases: RWA assets, assets without on-chain liquidity, KYC required assets
 
             // Check adapter is configured
             if (config.purchaseAdapter == address(0)) revert AssetAdapterNotConfigured(config.tokenAddress);
@@ -642,11 +652,11 @@ contract AssetController is
             vault.approveAsset(vaultAsset, config.purchaseAdapter, usdtAmount);
 
             // Call adapter's purchase method to execute purchase
-            // Adapter internally: 1.Transfer USDT 2.Execute purchase logic 3.Transfer asset tokens to Vault
+            // Adapter internally: 1.Transfer USDT 2.Execute purchase logic 3.Transfer tokens to Vault
             (bool success,) = config.purchaseAdapter.call(
                 abi.encodeWithSignature("purchase(uint256)", usdtAmount)
             );
-            require(success, "Adapter purchase failed");  // Revert if purchase fails
+            require(success, "Adapter purchase failed");  // Revert if purchase failed
 
             // Calculate actual tokens received via balance difference
             tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - balBefore;
@@ -654,15 +664,15 @@ contract AssetController is
 
         } else {
             // ---------- DEX SWAP mode ----------
-            // Suitable for: Tokens with onchain liquidity (e.g., aUSDC, stETH, etc.)
+            // Use cases: Tokens with on-chain liquidity (e.g., aUSDC, stETH)
 
             // Check SwapHelper is configured
             if (address(swapHelper) == address(0)) revert SwapHelperNotConfigured();
 
-            // Determine slippage: prioritize asset custom slippage, otherwise use default
+            // Determine slippage: prefer asset custom slippage, otherwise use default
             uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
 
-            // Slippage safety check, prevent high settings leading to MEV attacks
+            // Slippage safety check, prevent MEV attacks from high slippage
             if (slippageBps > PPTTypes.MAX_SLIPPAGE_BPS) {
                 revert SlippageTooHigh(slippageBps, PPTTypes.MAX_SLIPPAGE_BPS);
             }
@@ -671,24 +681,24 @@ contract AssetController is
             vault.approveAsset(vaultAsset, address(swapHelper), usdtAmount);
 
             // Execute swap on DEX via SwapHelper
-            // SwapHelper internally selects optimal path (e.g., Uniswap/Curve)
+            // SwapHelper internally selects optimal route (e.g., Uniswap/Curve)
             tokensReceived = swapHelper.buyRWAAsset(vaultAsset, config.tokenAddress, usdtAmount, slippageBps, address(vault));
             spent = usdtAmount;  // Record USDT spent
         }
 
         // ==================== Step 3: Cleanup ====================
 
-        // Emit purchase routed event, recording detailed purchase information
-        // Includes: asset address, tier, purchase method, spent amount, tokens received
+        // Emit purchase routed event, record purchase details
+        // Contains: asset address, tier, purchase method, amount spent, tokens received
         emit PurchaseRouted(config.tokenAddress, config.tier, method, usdtAmount, tokensReceived);
 
-        // Invalidate asset value cache (since new assets purchased, total asset value changed)
+        // Invalidate asset value cache (asset value changed after purchase)
         _cachedAssetValue.timestamp = 0;
     }
 
     /// @dev Execute waterfall liquidation (internal implementation)
     /// @param amountNeeded USDT amount to raise
-    /// @param maxTier Maximum liquidation tier
+    /// @param maxTier Maximum tier allowed for liquidation
     /// @return funded Actual amount raised
     function _executeWaterfallLiquidation(
         uint256 amountNeeded,
@@ -697,14 +707,14 @@ contract AssetController is
         if (address(swapHelper) == address(0)) return 0;
         
         uint256 remaining = amountNeeded;
-        
-        // 清算 Layer1 生息资产
+
+        // Liquidate Layer1 yield assets
         address[] storage l1Assets = _layerAssets[PPTTypes.LiquidityTier.TIER_1_CASH];
         for (uint256 i = 0; i < l1Assets.length && remaining > 0; i++) {
             remaining = _liquidateAsset(l1Assets[i], remaining, PPTTypes.LiquidityTier.TIER_1_CASH);
         }
-        
-        // 清算 Layer2
+
+        // Liquidate Layer2
         if (maxTier >= PPTTypes.LiquidityTier.TIER_2_MMF) {
             address[] storage l2Assets = _layerAssets[PPTTypes.LiquidityTier.TIER_2_MMF];
             for (uint256 i = 0; i < l2Assets.length && remaining > 0; i++) {
@@ -719,8 +729,8 @@ contract AssetController is
     /// @dev Liquidate single asset
     /// @param token Asset address
     /// @param amountNeeded USDT amount needed
-    /// @param tier Asset tier
-    /// @return remaining Remaining unmet need
+    /// @param tier Asset's layer
+    /// @return remaining Remaining unfulfilled demand
     function _liquidateAsset(
         address token,
         uint256 amountNeeded,
@@ -785,7 +795,7 @@ contract AssetController is
     }
 
     /// @notice Refresh asset value cache
-    /// @dev Forces update of asset value cache
+    /// @dev Force update asset value cache
     function refreshCache() external override {
         _cachedAssetValue = CachedValue({
             value: _calculateAssetValueInternal(),
@@ -794,13 +804,13 @@ contract AssetController is
     }
 
     /// @notice Pause contract
-    /// @dev Pauses all non-admin operations
+    /// @dev Pause all non-admin operations
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
     }
 
     /// @notice Unpause contract
-    /// @dev Resumes normal contract operations
+    /// @dev Resume normal contract operations
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
