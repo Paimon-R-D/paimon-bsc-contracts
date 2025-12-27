@@ -348,9 +348,9 @@ contract RedemptionManager is
             return preview;
         }
 
-        uint256 userBalance = _balanceOf(msg.sender);
-        uint256 lockedShares = vault.lockedSharesOf(msg.sender);
-        uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
+        // [H01 FIX] Locked shares are already transferred to vault via lockShares(),
+        // so user's balanceOf() already excludes them. No need to deduct lockedSharesOf again.
+        uint256 availableShares = _balanceOf(msg.sender);
 
         if (availableShares < shares) {
             preview.canProcess = false;
@@ -392,9 +392,9 @@ contract RedemptionManager is
             return preview;
         }
 
-        uint256 userBalance = _balanceOf(owner);
-        uint256 lockedShares = vault.lockedSharesOf(owner);
-        uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
+        // [H01 FIX] Locked shares are already transferred to vault via lockShares(),
+        // so user's balanceOf() already excludes them. No need to deduct lockedSharesOf again.
+        uint256 availableShares = _balanceOf(owner);
 
         if (availableShares < shares) {
             preview.canProcess = false;
@@ -937,7 +937,8 @@ contract RedemptionManager is
     // }
 
     /// @notice Batch process overdue liability for the past N days
-    function processOverdueLiabilityBatch(uint256 daysBack) external {
+    /// @dev [M03 FIX] Added access control to prevent unauthorized modification of overdueLiability
+    function processOverdueLiabilityBatch(uint256 daysBack) external onlyRole(ADMIN_ROLE) {
         overdueLiability=0;
         uint256 today = _getDayIndex(block.timestamp);
         for (uint256 i = 1; i <= daysBack; i++) {
