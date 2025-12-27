@@ -474,8 +474,31 @@ contract PPT is
     // Admin Functions
     // =============================================================================
     
+    /// @notice Set asset controller with validation checks
+    /// @dev [M04 FIX] Added validation to prevent unsafe controller changes:
+    ///      1. Cannot remove controller if redemption liability > cash balance
+    ///      2. New controller's asset value should >= current value (unless current is 0)
     function setAssetController(address controller) external onlyRole(ADMIN_ROLE) {
         address old = address(assetController);
+
+        // Get current cash balance
+        uint256 cashBalance = IERC20(asset()).balanceOf(address(this));
+
+        // Check 1: Cannot remove controller if redemption liability > cash balance
+        if (controller == address(0) && totalRedemptionLiability > cashBalance) {
+            revert("Cannot remove controller: redemption liability exceeds cash");
+        }
+
+        // Check 2: New controller's asset value should >= current value
+        if (old != address(0) && controller != address(0)) {
+            uint256 oldValue = IAssetController(old).calculateAssetValue();
+            uint256 newValue = IAssetController(controller).calculateAssetValue();
+            // Only enforce if there's actual asset value to preserve
+            if (oldValue > 0 && newValue < oldValue) {
+                revert("New controller asset value less than current");
+            }
+        }
+
         assetController = IAssetController(controller);
         emit AssetControllerUpdated(old, controller);
     }
