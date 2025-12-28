@@ -14,6 +14,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IAssetController, IRedemptionManager} from "./IPPTContracts.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title PPT (Paimon Prime Token)
 /// @author Paimon Yield Protocol
@@ -25,6 +26,7 @@ contract PPT is
     AccessControlUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable,
+    Ownable2StepUpgradeable,
     UUPSUpgradeable,
     IPPT
 {
@@ -143,6 +145,8 @@ contract PPT is
         __ERC20_init("PPT Token", "PPT");
         __AccessControl_init();
         __Pausable_init();
+        __Ownable_init(msg.sender);
+        __Ownable2Step_init();
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
 
@@ -158,7 +162,7 @@ contract PPT is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     // =============================================================================
     // ERC4626 Core - View Functions

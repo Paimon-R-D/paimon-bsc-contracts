@@ -10,6 +10,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IRedemptionManager,  IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title RedemptionManager
 /// @author Paimon Yield Protocol
@@ -24,6 +25,7 @@ contract RedemptionManager is
     Initializable,
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
+    Ownable2StepUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable
 {
@@ -183,6 +185,8 @@ contract RedemptionManager is
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
+        __Ownable_init(msg.sender);
+        __Ownable2Step_init();
         __UUPSUpgradeable_init();
 
         vault = IPPT(vault_);
@@ -210,7 +214,7 @@ contract RedemptionManager is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     // =============================================================================
     // User Functions - User Direct Calls
@@ -348,15 +352,15 @@ contract RedemptionManager is
             return preview;
         }
 
-        uint256 userBalance = _balanceOf(msg.sender);
-        uint256 lockedShares = vault.lockedSharesOf(msg.sender);
-        uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
+        // uint256 userBalance = _balanceOf(msg.sender);
+        // uint256 lockedShares = vault.lockedSharesOf(msg.sender);
+        // uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
 
-        if (availableShares < shares) {
-            preview.canProcess = false;
-            preview.channelReason = "Insufficient available shares";
-            return preview;
-        }
+        // if (availableShares < shares) {
+        //     preview.canProcess = false;
+        //     preview.channelReason = "Insufficient available shares";
+        //     return preview;
+        // }
 
         uint256 nav = vault.sharePrice();
         preview.grossAmount = (shares * nav) / PPTTypes.PRECISION;
@@ -385,22 +389,22 @@ contract RedemptionManager is
             return preview;
         }
 
-        address owner = msg.sender;
+        //address owner = msg.sender;
         if (shares == 0) {
             preview.canProcess = false;
             preview.channelReason = "Shares cannot be zero";
             return preview;
         }
 
-        uint256 userBalance = _balanceOf(owner);
-        uint256 lockedShares = vault.lockedSharesOf(owner);
-        uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
+        // uint256 userBalance = _balanceOf(owner);
+        // uint256 lockedShares = vault.lockedSharesOf(owner);
+        // uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
 
-        if (availableShares < shares) {
-            preview.canProcess = false;
-            preview.channelReason = "Insufficient available shares";
-            return preview;
-        }
+        // if (availableShares < shares) {
+        //     preview.canProcess = false;
+        //     preview.channelReason = "Insufficient available shares";
+        //     return preview;
+        // }
 
         uint256 nav = vault.sharePrice();
         preview.grossAmount = (shares * nav) / PPTTypes.PRECISION;

@@ -12,6 +12,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IAssetController, IOracleAdapter, ISwapHelper, IOTCManager, IAssetScheduler} from "./IPPTContracts.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title AssetController
 /// @author Paimon Yield Protocol
@@ -23,6 +24,7 @@ contract AssetController is
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
+    Ownable2StepUpgradeable,
     UUPSUpgradeable
 {
     using SafeERC20 for IERC20;
@@ -156,6 +158,8 @@ contract AssetController is
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
+        __Ownable_init(msg.sender);
+        __Ownable2Step_init();
         __UUPSUpgradeable_init();
 
         vault = IPPT(vault_);
@@ -173,7 +177,7 @@ contract AssetController is
     /// @notice Authorize contract upgrade (only ADMIN can call)
     /// @dev UUPS pattern requires overriding this function to control upgrade permissions
     /// @param newImplementation New implementation contract address
-    function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     // =============================================================================
     // Asset Configuration Management (ADMIN only)
