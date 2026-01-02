@@ -133,15 +133,16 @@ contract RedemptionManager is
     
     event RedemptionApproved(uint256 indexed requestId, address indexed approver, uint256 settlementTime);
     event RedemptionRejected(uint256 indexed requestId, address indexed rejector, string reason);
-    event LowLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available, uint256 total);
-    event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
+  //  event LowLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available, uint256 total);
+  //  event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
     event DailyLiabilityAdded(uint256 indexed dayIndex, uint256 amount);
     event LiabilityRemoved(uint256 indexed dayIndex, uint256 amount, bool wasOverdue);
     event BaseRedemptionFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event EmergencyPenaltyFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event SettlementWaterfallTriggered(uint256 indexed requestId, uint256 deficit, uint256 funded);
-    event RedemptionVoucherUpdated(address indexed oldVoucher, address indexed newVoucher);
+    event SettlementLiquidityInsufficient(uint256 indexed requestId, uint256 availableCash, uint256 payoutAmount);
+    //event RedemptionVoucherUpdated(address indexed oldVoucher, address indexed newVoucher);
     event VoucherThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
     event VoucherMinted(uint256 indexed requestId, uint256 indexed tokenId, address indexed owner);
     event StandardApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
@@ -179,7 +180,7 @@ contract RedemptionManager is
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param vault_ Vault contract address
     /// @param admin_ Admin address
-    function initialize(address vault_, address admin_) external initializer {
+    function initialize(address vault_, address admin_,address redemptionVoucher_) external initializer {
         if (vault_ == address(0) || admin_ == address(0)) revert ZeroAddress();
 
         __AccessControl_init();
@@ -190,6 +191,7 @@ contract RedemptionManager is
         __UUPSUpgradeable_init();
 
         vault = IPPT(vault_);
+        redemptionVoucher = IRedemptionVoucher(redemptionVoucher_);
 
         // Initialize fee configuration
         baseRedemptionFeeBps = 100; // 1%
@@ -610,7 +612,7 @@ contract RedemptionManager is
             PPTTypes.RedemptionChannel.STANDARD, requiresApproval, settlementTime, 0
         );
 
-        _checkLiquidityAndAlert();
+       // _checkLiquidityAndAlert();
     }
     
     function _processEmergencyRedemption(
@@ -726,6 +728,7 @@ contract RedemptionManager is
 
             // Final check
             if (availableCash < payoutAmount) {
+                emit SettlementLiquidityInsufficient(request.requestId, availableCash, payoutAmount);
                 revert InsufficientLiquidity(availableCash, payoutAmount);
             }
         }
@@ -832,23 +835,23 @@ contract RedemptionManager is
     }
     
 
-    function _checkLiquidityAndAlert() internal {
-        if (block.timestamp < _lastLiquidityAlertTime + 1 hours) return;
+    // function _checkLiquidityAndAlert() internal {
+    //     if (block.timestamp < _lastLiquidityAlertTime + 1 hours) return;
         
-        uint256 available = vault.getAvailableLiquidity();
-        uint256 gross = _totalAssets() + vault.totalRedemptionLiability();
-        if (gross == 0) return;
+    //     uint256 available = vault.getAvailableLiquidity();
+    //     uint256 gross = _totalAssets() + vault.totalRedemptionLiability();
+    //     if (gross == 0) return;
         
-        uint256 ratio = (available * PPTTypes.BASIS_POINTS) / gross;
+    //     uint256 ratio = (available * PPTTypes.BASIS_POINTS) / gross;
         
-        if (ratio < PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD) {
-            emit CriticalLiquidityAlert(ratio, PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD, available);
-            _lastLiquidityAlertTime = block.timestamp;
-        } else if (ratio < PPTTypes.LOW_LIQUIDITY_THRESHOLD) {
-            emit LowLiquidityAlert(ratio, PPTTypes.LOW_LIQUIDITY_THRESHOLD, available, gross);
-            _lastLiquidityAlertTime = block.timestamp;
-        }
-    }
+    //     if (ratio < PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD) {
+    //         emit CriticalLiquidityAlert(ratio, PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD, available);
+    //         _lastLiquidityAlertTime = block.timestamp;
+    //     } else if (ratio < PPTTypes.LOW_LIQUIDITY_THRESHOLD) {
+    //         emit LowLiquidityAlert(ratio, PPTTypes.LOW_LIQUIDITY_THRESHOLD, available, gross);
+    //         _lastLiquidityAlertTime = block.timestamp;
+    //     }
+    // }
 
     // =============================================================================
     // View Functions
@@ -940,19 +943,35 @@ contract RedemptionManager is
     //     }
     // }
 
-    /// @notice Batch process overdue liability for the past N days
-    function processOverdueLiabilityBatch(uint256 daysBack) external {
-        overdueLiability=0;
-        uint256 today = _getDayIndex(block.timestamp);
-        for (uint256 i = 1; i <= daysBack; i++) {
-            uint256 dayIndex = today - i;
-            uint256 amount = dailyLiability[dayIndex];
-            if (amount > 0) {
-                overdueLiability += amount;
-                //dailyLiability[dayIndex] = 0;
-                //emit OverdueLiabilityProcessed(dayIndex, amount);
-            }
-        }
+    // /// @notice Batch process overdue liability for the past N days
+    // function processOverdueLiabilityBatch(uint256 daysBack) external view returns(uint256) {
+    //     uint256 overdueLiabilityView=0;
+    //     uint256 today = _getDayIndex(block.timestamp);
+    //     for (uint256 i = 1; i <= daysBack; i++) {
+    //         uint256 dayIndex = today - i;
+    //         uint256 amount = dailyLiability[dayIndex];
+    //         if (amount > 0) {
+    //             overdueLiabilityView += amount;
+    //             //dailyLiability[dayIndex] = 0;
+    //             //emit OverdueLiabilityProcessed(dayIndex, amount);
+    //         }
+    //     }
+    //     return overdueLiabilityView;
+    // }
+
+     /**
+        * @notice Get total overdue liability from the past specified days
+        * @dev Used to inform decisions for adjustOverdueLiability()
+        * @param daysBack Number of days to look back
+        * @return total Total unredeemed liability amount
+    */
+    function getOverdueLiability(uint256 daysBack) external view returns (uint256) {
+         uint256 total = 0;
+         uint256 today = _getDayIndex(block.timestamp);
+         for (uint256 i = 1; i <= daysBack; i++) {
+            total += dailyLiability[today - i];
+         }
+      return total;
     }
 
     /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
@@ -971,11 +990,11 @@ contract RedemptionManager is
 
     /// @notice Set redemption voucher NFT contract
     /// @param voucher_ RedemptionVoucher contract address
-    function setRedemptionVoucher(address voucher_) external onlyRole(ADMIN_ROLE) {
-        address old = address(redemptionVoucher);
-        redemptionVoucher = IRedemptionVoucher(voucher_);
-        emit RedemptionVoucherUpdated(old, voucher_);
-    }
+    // function setRedemptionVoucher(address voucher_) external onlyRole(ADMIN_ROLE) {
+    //     address old = address(redemptionVoucher);
+    //     redemptionVoucher = IRedemptionVoucher(voucher_);
+    //     emit RedemptionVoucherUpdated(old, voucher_);
+    // }
 
     /// @notice Set NFT generation threshold
     /// @param threshold_ Delay threshold (seconds), generate NFT if exceeds this threshold

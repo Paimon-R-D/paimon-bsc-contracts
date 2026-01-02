@@ -118,7 +118,7 @@ contract RedemptionVoucher is
         }
 
         tokenId = ++_tokenIdCounter;
-        _safeMint(to, tokenId);
+       
 
         _voucherInfo[tokenId] = VoucherInfo({
             requestId: requestId,
@@ -127,6 +127,7 @@ contract RedemptionVoucher is
             mintTime: block.timestamp
         });
         _requestToToken[requestId] = tokenId;
+         _safeMint(to, tokenId);
 
         emit VoucherMinted(tokenId, requestId, to, grossAmount, settlementTime);
     }

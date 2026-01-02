@@ -138,6 +138,7 @@ contract AssetController is
     error InsufficientLiquidity(uint256 available, uint256 required);
     /// @notice Attempting to set same active status
     error SameActiveStatus(bool status);
+    error AssetNotAllowed(address token);
 
     // =============================================================================
     // Constructor & Initialization
@@ -200,6 +201,7 @@ contract AssetController is
         if (token == address(0)) revert ZeroAddress();
         if (_assetIndex[token] != 0) revert AssetAlreadyExists(token);
         if (maxSlippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(maxSlippage, PPTTypes.MAX_SLIPPAGE_BPS);
+         if (token == _asset()) revert AssetNotAllowed(token);
 
         uint8 decimals = IERC20Metadata(token).decimals();
 
@@ -245,7 +247,7 @@ contract AssetController is
                 break;
             }
         }
-        
+         _cachedAssetValue.timestamp = 0;
         emit AssetRemoved(token);
     }
 

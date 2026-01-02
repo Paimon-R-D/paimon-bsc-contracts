@@ -38,7 +38,7 @@ contract PPT is
     // =============================================================================
 
     /// @notice Standard channel application limit ratio (default 70% = 7000 / 10000, configurable)
-    uint256 public standardQuotaRatio = 7000;
+    uint256 public standardQuotaRatio;
 
     // =============================================================================
     // Roles
@@ -217,13 +217,22 @@ contract PPT is
     ///      because totalAssets() has deducted redemption liability, locked shares should also be excluded
     function _convertToShares(uint256 assets, Math.Rounding rounding) internal view virtual override returns (uint256) {
         uint256 supply = effectiveSupply();
-        return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAssets() + 1, rounding);
+         uint256 totalAsset = totalAssets();
+        if(supply>0){
+            require(totalAsset>0, "totalAsset is not 0");
+        }
+        return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAsset, rounding);
     }
 
     /// @notice Override asset conversion, using effectiveSupply to maintain consistency with sharePrice
     function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view virtual override returns (uint256) {
         uint256 supply = effectiveSupply();
-        return shares.mulDiv(totalAssets() + 1, supply + 10 ** _decimalsOffset(), rounding);
+
+        uint256 totalAsset = totalAssets();
+        if(supply>0){
+            require(totalAsset>0, "totalAsset is not 0");
+        }
+        return shares.mulDiv(totalAsset + 1, supply + 10 ** _decimalsOffset(), rounding);
     }
 
     // =============================================================================
