@@ -191,18 +191,18 @@ interface IAssetScheduler {
 interface IRedemptionVoucher {
     struct VoucherInfo {
         uint256 requestId;       // Associated redemption request ID
-        uint256 grossAmount;     // Redemption amount (USDT)
+        uint256 netAmount;     // Redemption amount (USDT)
         uint256 settlementTime;  // Settlement date
         uint256 mintTime;        // Minting time
     }
 
     // ========== Mint/Burn (RedemptionManager Only) ==========
-    function mint(address to, uint256 requestId, uint256 grossAmount, uint256 settlementTime) external returns (uint256 tokenId);
+    function mint(address to, uint256 requestId, uint256 netAmount, uint256 settlementTime) external returns (uint256 tokenId);
     function burn(uint256 tokenId) external;
 
     // ========== Queries ==========
     function ownerOf(uint256 tokenId) external view returns (address);
-    function voucherInfo(uint256 tokenId) external view returns (uint256 requestId, uint256 grossAmount, uint256 settlementTime, uint256 mintTime);
+    function voucherInfo(uint256 tokenId) external view returns (uint256 requestId, uint256 netAmount, uint256 settlementTime, uint256 mintTime);
     function requestToToken(uint256 requestId) external view returns (uint256 tokenId);
     function getVoucherByRequest(uint256 requestId) external view returns (uint256 tokenId, VoucherInfo memory info);
 }

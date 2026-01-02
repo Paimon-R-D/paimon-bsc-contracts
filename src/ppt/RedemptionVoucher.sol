@@ -80,7 +80,7 @@ contract RedemptionVoucher is
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param admin Admin address
     function initialize(address admin) external initializer {
-        __ERC721_init("PNGY Redemption Voucher", "PNGY-RV");
+        __ERC721_init("PPT Redemption Voucher", "PPT-RV");
         __ERC721Enumerable_init();
         __AccessControl_init();
         __UUPSUpgradeable_init();
@@ -209,12 +209,12 @@ contract RedemptionVoucher is
         string memory amountStr = _formatAmount(info.grossAmount);
 
         string memory json = string(abi.encodePacked(
-            '{"name":"PNGY Redemption Voucher #', tokenId.toString(),
+            '{"name":"PPT Redemption Voucher #', tokenId.toString(),
             '","description":"Redeemable for ', amountStr, ' USDT. Settlement timestamp: ',
             info.settlementTime.toString(), '",',
             '"attributes":[',
                 '{"trait_type":"Request ID","value":"', info.requestId.toString(), '"},',
-                '{"trait_type":"Amount (USDT)","value":"', amountStr, '"},',
+                '{"trait_type":"Net Amount (USDT)","value":"', amountStr, '"},',
                 '{"trait_type":"Settlement Time","value":"', info.settlementTime.toString(), '"},',
                 '{"trait_type":"Mint Time","value":"', info.mintTime.toString(), '"}',
             '],',
