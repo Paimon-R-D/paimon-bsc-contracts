@@ -106,6 +106,7 @@ contract PPT is
     event PendingApprovalSharesAdded(address indexed owner, uint256 shares);
     event PendingApprovalSharesRemoved(address indexed owner, uint256 shares);
     event PendingApprovalSharesConverted(address indexed owner, uint256 shares);
+    event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
     // =============================================================================
     // Errors
@@ -162,7 +163,9 @@ contract PPT is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        emit PPTUpgraded(newImplementation, block.timestamp, block.number);
+    }
 
     // =============================================================================
     // ERC4626 Core - View Functions
@@ -548,7 +551,7 @@ contract PPT is
     /// @notice Emergency withdraw (only in emergency mode)
     function emergencyWithdraw(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
         require(emergencyMode, "Not in emergency mode");
-        IERC20(token).safeTransfer(to, amount);
+        IERC20(token).safeTransfer(to, amount);  
     }
 
     // /// @notice Update NAV (for recording)

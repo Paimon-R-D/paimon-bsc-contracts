@@ -109,6 +109,8 @@ contract AssetController is
     event AssetTierUpdated(address indexed token, PPTTypes.LiquidityTier oldTier, PPTTypes.LiquidityTier newTier);
     /// @notice Asset config updated event
     event AssetConfigUpdated(address indexed token, PPTTypes.LiquidityTier tier, address purchaseAdapter, PPTTypes.PurchaseMethod method, uint256 maxSlippage);
+    event SwapNotExisted(address indexed assert);
+    event SwapSlippageUpdate(uint256 slippage);
 
     // =============================================================================
     // Error Definitions
@@ -370,6 +372,7 @@ contract AssetController is
             vault.approveAsset(token, address(swapHelper), tokenAmount);
             usdtReceived = swapHelper.sellRWAAsset(token, vaultAsset, tokenAmount, defaultSwapSlippage, address(vault));
         } else {
+            emit SwapNotExisted(token);
             revert SwapHelperNotConfigured();
         }
         
@@ -798,6 +801,7 @@ contract AssetController is
     function setDefaultSwapSlippage(uint256 slippage) external override onlyRole(ADMIN_ROLE) {
         if (slippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(slippage, PPTTypes.MAX_SLIPPAGE_BPS);
         defaultSwapSlippage = slippage;
+        emit SwapSlippageUpdate(slippage);
     }
 
     /// @notice Refresh asset value cache

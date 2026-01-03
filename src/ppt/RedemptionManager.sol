@@ -149,6 +149,8 @@ contract RedemptionManager is
     event StandardApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
     event EmergencyApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
     event EmergencyApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
+    event AdjustOverdueLiability(uint256 amount);
+    event AdjustDailyLiability(uint256 dayIndex, uint256 amount);
 
     // =============================================================================
     // Errors
@@ -977,11 +979,13 @@ contract RedemptionManager is
     /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
     function adjustOverdueLiability(uint256 amount) external onlyRole(ADMIN_ROLE) {
         overdueLiability = amount;
+        emit AdjustOverdueLiability(amount);
     }
 
     /// @notice Admin adjust liability for a specific day (for emergency/fix purposes)
     function adjustDailyLiability(uint256 dayIndex, uint256 amount) external onlyRole(ADMIN_ROLE) {
         dailyLiability[dayIndex] = amount;
+         emit AdjustDailyLiability(dayIndex, amount);
     }
 
     // =============================================================================
