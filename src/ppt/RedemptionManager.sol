@@ -80,6 +80,7 @@ contract RedemptionManager is
     uint256 private _requestIdCounter;
 
     uint256[] private _pendingApprovals;
+    mapping(uint256 => uint256) private _pendingApprovalIndex;
     uint256 public  totalPendingApprovalAmount;
 
     uint256 private _lastLiquidityAlertTime;
@@ -600,7 +601,8 @@ contract RedemptionManager is
             // Requires approval: only mark pending approval shares, no locking, no liability
             // Does not affect NAV, but restricts transfer
             vault.addPendingApprovalShares(owner, shares);
-            _pendingApprovals.push(requestId);
+             // _pendingApprovals.push(requestId);
+            _addToPendingApprovals(requestId);
             totalPendingApprovalAmount += grossAmount;
         } else {
             // No approval needed: lock shares + add liability + daily liability
@@ -669,7 +671,8 @@ contract RedemptionManager is
             // Requires approval: only mark pending approval shares, no locking, no liability
             // Does not affect NAV, but restricts transfer
             vault.addPendingApprovalShares(owner, shares);
-            _pendingApprovals.push(requestId);
+            // _pendingApprovals.push(requestId);
+            _addToPendingApprovals(requestId);
             totalPendingApprovalAmount += grossAmount;
         } else {
             // No approval needed: lock shares + add liability + daily liability
@@ -825,16 +828,27 @@ contract RedemptionManager is
     // Internal Helpers
     // =============================================================================
 
-    function _removeFromPendingApprovals(uint256 requestId) internal {
-        uint256 len = _pendingApprovals.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (_pendingApprovals[i] == requestId) {
-                _pendingApprovals[i] = _pendingApprovals[len - 1];
-                _pendingApprovals.pop();
-                return;
-            }
-        }
+   function _addToPendingApprovals(uint256 requestId) internal {
+        _pendingApprovals.push(requestId);
+        _pendingApprovalIndex[requestId] = _pendingApprovals.length; // index + 1
     }
+
+ function _removeFromPendingApprovals(uint256 requestId) internal {
+    uint256 indexPlusOne = _pendingApprovalIndex[requestId];
+    if (indexPlusOne == 0) return; // requestId not in pending approvals
+    
+    uint256 index = indexPlusOne - 1;
+    uint256 lastIndex = _pendingApprovals.length - 1;
+    
+    if (index != lastIndex) {
+        uint256 lastRequestId = _pendingApprovals[lastIndex];
+        _pendingApprovals[index] = lastRequestId;
+        _pendingApprovalIndex[lastRequestId] = indexPlusOne; // update the index of the last requestId
+    }
+    
+    _pendingApprovals.pop();
+    delete _pendingApprovalIndex[requestId];
+}
     
 
     // function _checkLiquidityAndAlert() internal {
