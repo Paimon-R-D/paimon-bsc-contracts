@@ -12,7 +12,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IAssetController, IOracleAdapter, ISwapHelper, IOTCManager, IAssetScheduler} from "./IPPTContracts.sol";
-import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title AssetController
 /// @author Paimon Yield Protocol
@@ -111,6 +111,7 @@ contract AssetController is
     event AssetConfigUpdated(address indexed token, PPTTypes.LiquidityTier tier, address purchaseAdapter, PPTTypes.PurchaseMethod method, uint256 maxSlippage);
     event SwapNotExisted(address indexed assert);
     event SwapSlippageUpdate(uint256 slippage);
+    event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
     // =============================================================================
     // Error Definitions
@@ -180,7 +181,9 @@ contract AssetController is
     /// @notice Authorize contract upgrade (only ADMIN can call)
     /// @dev UUPS pattern requires overriding this function to control upgrade permissions
     /// @param newImplementation New implementation contract address
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        emit PPTUpgraded(newImplementation, block.timestamp, block.number);
+    }
 
     // =============================================================================
     // Asset Configuration Management (ADMIN only)

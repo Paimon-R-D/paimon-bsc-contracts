@@ -10,7 +10,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IRedemptionManager,  IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
-import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title RedemptionManager
 /// @author Paimon Yield Protocol
@@ -152,6 +152,7 @@ contract RedemptionManager is
     event EmergencyApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
     event AdjustOverdueLiability(uint256 amount);
     event AdjustDailyLiability(uint256 dayIndex, uint256 amount);
+     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
     // =============================================================================
     // Errors
@@ -219,7 +220,9 @@ contract RedemptionManager is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+        emit PPTUpgraded(newImplementation, block.timestamp, block.number);
+    }
 
     // =============================================================================
     // User Functions - User Direct Calls

@@ -8,6 +8,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title RedemptionVoucher
 /// @author Paimon Yield Protocol
@@ -18,6 +19,7 @@ contract RedemptionVoucher is
     ERC721Upgradeable,
     ERC721EnumerableUpgradeable,
     AccessControlUpgradeable,
+    Ownable2StepUpgradeable,
     UUPSUpgradeable
 {
     using Strings for uint256;
@@ -59,6 +61,7 @@ contract RedemptionVoucher is
 
     event VoucherMinted(uint256 indexed tokenId, uint256 indexed requestId, address indexed to, uint256 grossAmount, uint256 settlementTime);
     event VoucherBurned(uint256 indexed tokenId, uint256 indexed requestId);
+     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
     // =============================================================================
     // Errors
@@ -83,7 +86,10 @@ contract RedemptionVoucher is
         __ERC721_init("PPT Redemption Voucher", "PPT-RV");
         __ERC721Enumerable_init();
         __AccessControl_init();
+        __Ownable_init(msg.sender);
+        __Ownable2Step_init();
         __UUPSUpgradeable_init();
+        
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);
@@ -94,7 +100,9 @@ contract RedemptionVoucher is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyRole(ADMIN_ROLE) {}
+    function _authorizeUpgrade(address newImplementation) internal override onlyOwner() {
+         emit PPTUpgraded(newImplementation, block.timestamp, block.number);
+    }
 
     // =============================================================================
     // Minting & Burning (Only MINTER_ROLE - RedemptionManager)
