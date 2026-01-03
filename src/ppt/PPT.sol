@@ -82,8 +82,8 @@ contract PPT is
     /// @notice Locked shares per user
     mapping(address => uint256) public override lockedSharesOf;
 
-    /// @notice Last NAV update time
-    uint256 public lastNavUpdate;
+    // /// @notice Last NAV update time
+    // uint256 public lastNavUpdate;
 
     // =============================================================================
     // Events
@@ -97,7 +97,7 @@ contract PPT is
     event SharesBurned(address indexed owner, uint256 shares);
     event RedemptionFeeAdded(uint256 fee);
     event RedemptionFeeReduced(uint256 fee);
-    event NavUpdated(uint256 oldNav, uint256 newNav, uint256 timestamp);
+    // event NavUpdated(uint256 oldNav, uint256 newNav, uint256 timestamp);
     event EmergencyQuotaRefreshed(uint256 amount);
     event EmergencyQuotaRestored(uint256 amount);
     event LockedMintAssetsReset(uint256 oldAmount);
@@ -153,7 +153,7 @@ contract PPT is
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
 
-        lastNavUpdate = block.timestamp;
+        // lastNavUpdate = block.timestamp;
         standardQuotaRatio = 7000; // Default 70%
     }
 
@@ -551,11 +551,11 @@ contract PPT is
         IERC20(token).safeTransfer(to, amount);
     }
 
-    /// @notice Update NAV (for recording)
-    function updateNav() external {
-        uint256 oldNav = sharePrice();
-        lastNavUpdate = block.timestamp;
-        uint256 newNav = sharePrice();
-        emit NavUpdated(oldNav, newNav, block.timestamp);
-    }
+    // /// @notice Update NAV (for recording)
+    // function updateNav() external {
+    //     uint256 oldNav = sharePrice();
+    //     lastNavUpdate = block.timestamp;
+    //     uint256 newNav = sharePrice();
+    //     emit NavUpdated(oldNav, newNav, block.timestamp);
+    // }
 }
