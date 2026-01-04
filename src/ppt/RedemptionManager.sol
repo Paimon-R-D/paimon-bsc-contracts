@@ -385,7 +385,7 @@ contract RedemptionManager is
         // Liquidity is checked at settlement time
         preview.canProcess = true;
         preview.channelReason = preview.requiresApproval
-            ? "Standard channel (T+7): Requires approval (>50K or >20% of dynamic quota)"
+            ? "Standard channel (T+7): Requires approval "
             : "Standard channel (T+7): No approval required";
     }
     
@@ -394,8 +394,7 @@ contract RedemptionManager is
         if (!vault.emergencyMode()) {
             preview.canProcess = false;
             preview.channelReason = "Emergency mode not active";
-            return preview;
-        }
+         }
 
         //address owner = msg.sender;
         if (shares == 0) {
