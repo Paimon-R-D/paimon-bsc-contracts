@@ -36,7 +36,7 @@ contract RedemptionVoucher is
 
     struct VoucherInfo {
         uint256 requestId;       // Associated redemption request ID
-        uint256 grossAmount;     // Redemption amount (USDT, 18 decimals)
+        uint256 netAmount;     // Redemption amount (USDT, 18 decimals)
         uint256 settlementTime;  // Settlement date (UNIX timestamp)
         uint256 mintTime;        // Minting time (UNIX timestamp)
     }
@@ -58,7 +58,7 @@ contract RedemptionVoucher is
     // Events
     // =============================================================================
 
-    event VoucherMinted(uint256 indexed tokenId, uint256 indexed requestId, address indexed to, uint256 grossAmount, uint256 settlementTime);
+    event VoucherMinted(uint256 indexed tokenId, uint256 indexed requestId, address indexed to, uint256 netAmount, uint256 settlementTime);
     event VoucherBurned(uint256 indexed tokenId, uint256 indexed requestId);
      event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
@@ -109,13 +109,13 @@ contract RedemptionVoucher is
     /// @notice Mint redemption voucher NFT
     /// @param to Recipient address
     /// @param requestId Associated redemption request ID
-    /// @param grossAmount Redemption amount
+    /// @param netAmount Redemption amount
     /// @param settlementTime Settlement time
     /// @return tokenId Minted NFT token ID
     function mint(
         address to,
         uint256 requestId,
-        uint256 grossAmount,
+        uint256 netAmount,
         uint256 settlementTime
     ) external onlyRole(MINTER_ROLE) returns (uint256 tokenId) {
         if (requestId == 0) revert InvalidRequestId();
@@ -128,14 +128,14 @@ contract RedemptionVoucher is
 
         _voucherInfo[tokenId] = VoucherInfo({
             requestId: requestId,
-            grossAmount: grossAmount,
+            netAmount: netAmount,
             settlementTime: settlementTime,
             mintTime: block.timestamp
         });
         _requestToToken[requestId] = tokenId;
          _safeMint(to, tokenId);
 
-        emit VoucherMinted(tokenId, requestId, to, grossAmount, settlementTime);
+        emit VoucherMinted(tokenId, requestId, to, netAmount, settlementTime);
     }
 
     /// @notice Burn redemption voucher NFT (called at settlement)
@@ -159,12 +159,12 @@ contract RedemptionVoucher is
     /// @param tokenId NFT token ID
     function voucherInfo(uint256 tokenId) external view returns (
         uint256 requestId,
-        uint256 grossAmount,
+        uint256 netAmount,
         uint256 settlementTime,
         uint256 mintTime
     ) {
         VoucherInfo memory info = _voucherInfo[tokenId];
-        return (info.requestId, info.grossAmount, info.settlementTime, info.mintTime);
+        return (info.requestId, info.netAmount, info.settlementTime, info.mintTime);
     }
 
     /// @notice Get tokenId by requestId
@@ -212,7 +212,7 @@ contract RedemptionVoucher is
         if (info.requestId == 0) revert VoucherNotFound(tokenId);
 
         string memory svg = _generateSVG(info);
-        string memory amountStr = _formatAmount(info.grossAmount);
+        string memory amountStr = _formatAmount(info.netAmount);
 
         string memory json = string(abi.encodePacked(
             '{"name":"PPT Redemption Voucher #', tokenId.toString(),
@@ -232,7 +232,7 @@ contract RedemptionVoucher is
 
     /// @notice Generate SVG image
     function _generateSVG(VoucherInfo memory info) internal pure returns (string memory) {
-        string memory amountStr = _formatAmount(info.grossAmount);
+        string memory amountStr = _formatAmount(info.netAmount);
 
         return string(abi.encodePacked(
             '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="250" viewBox="0 0 400 250">',
