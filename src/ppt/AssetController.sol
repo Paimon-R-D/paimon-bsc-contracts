@@ -12,7 +12,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IAssetController, IOracleAdapter, ISwapHelper, IOTCManager, IAssetScheduler} from "./IPPTContracts.sol";
-import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+
 
 /// @title AssetController
 /// @author Paimon Yield Protocol
@@ -24,7 +24,6 @@ contract AssetController is
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
     PausableUpgradeable,
-    Ownable2StepUpgradeable,
     UUPSUpgradeable
 {
     using SafeERC20 for IERC20;
@@ -37,6 +36,8 @@ contract AssetController is
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     /// @notice Rebalancer role - Can execute asset purchase, redemption, waterfall liquidation, etc.
     bytes32 public constant REBALANCER_ROLE = keccak256("REBALANCER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant KEEPER_ROLE=keccak256("KEEPER_ROLE");
 
     // =============================================================================
     // External Contract References
@@ -156,14 +157,12 @@ contract AssetController is
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param vault_ Vault contract address
     /// @param admin_ Admin address
-    function initialize(address vault_, address admin_) external initializer {
-        if (vault_ == address(0) || admin_ == address(0)) revert ZeroAddress();
+    function initialize(address vault_, address admin_,address timerlock) external initializer {
+        if (vault_ == address(0) || admin_ == address(0)||timerlock==address(0)) revert ZeroAddress();
 
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
-        __Ownable_init(msg.sender);
-        __Ownable2Step_init();
         __UUPSUpgradeable_init();
 
         vault = IPPT(vault_);
@@ -172,6 +171,7 @@ contract AssetController is
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
         _grantRole(REBALANCER_ROLE, admin_);
+        _grantRole(UPGRADER_ROLE, timerlock);
     }
 
     // =============================================================================
@@ -181,7 +181,7 @@ contract AssetController is
     /// @notice Authorize contract upgrade (only ADMIN can call)
     /// @dev UUPS pattern requires overriding this function to control upgrade permissions
     /// @param newImplementation New implementation contract address
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {
         emit PPTUpgraded(newImplementation, block.timestamp, block.number);
     }
 
@@ -202,7 +202,7 @@ contract AssetController is
         address purchaseAdapter,
         PPTTypes.PurchaseMethod method,
         uint256 maxSlippage
-    ) external override onlyRole(ADMIN_ROLE) {
+    ) external override onlyRole(KEEPER_ROLE) {
         if (token == address(0)) revert ZeroAddress();
         if (_assetIndex[token] != 0) revert AssetAlreadyExists(token);
         if (maxSlippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(maxSlippage, PPTTypes.MAX_SLIPPAGE_BPS);
@@ -229,7 +229,7 @@ contract AssetController is
     /// @notice Remove asset from configuration
     /// @dev Remove specified asset from config array and layer asset list
     /// @param token Asset address to remove
-    function removeAsset(address token) external override onlyRole(ADMIN_ROLE) {
+    function removeAsset(address token) external override onlyRole(KEEPER_ROLE) {
         uint256 index = _assetIndex[token];
         if (index == 0) revert AssetNotFound(token);
         
@@ -269,7 +269,7 @@ contract AssetController is
         address purchaseAdapter,
         PPTTypes.PurchaseMethod method,
         uint256 maxSlippage
-    ) external override onlyRole(ADMIN_ROLE) {
+    ) external override onlyRole(KEEPER_ROLE) {
         uint256 index = _assetIndex[token];
         if (index == 0) revert AssetNotFound(token);
         if (maxSlippage > PPTTypes.MAX_SLIPPAGE_BPS) revert SlippageTooHigh(maxSlippage, PPTTypes.MAX_SLIPPAGE_BPS);
@@ -309,7 +309,7 @@ contract AssetController is
     function setAssetActive(
         address token,
         bool active
-    ) external override onlyRole(ADMIN_ROLE) {
+    ) external override onlyRole(KEEPER_ROLE) {
         uint256 index = _assetIndex[token];
         if (index == 0) revert AssetNotFound(token);
 
@@ -411,7 +411,7 @@ contract AssetController is
         uint256 targetRatio,
         uint256 minRatio,
         uint256 maxRatio
-    ) external override onlyRole(ADMIN_ROLE) {
+    ) external override onlyRole(KEEPER_ROLE) {
         if (targetRatio < minRatio || targetRatio > maxRatio) revert InvalidLayerRatios();
         if (maxRatio > PPTTypes.BASIS_POINTS) revert InvalidLayerRatios();
         

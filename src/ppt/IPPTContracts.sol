@@ -15,7 +15,6 @@ interface IPPT {
     function totalLockedShares() external view returns (uint256);
     function withdrawableRedemptionFees() external view returns (uint256);
     function totalAccumulatedRedemptionFees()external view returns (uint256);
-    function emergencyMode() external view returns (bool);
     function lockedSharesOf(address owner) external view returns (uint256);
     function getVaultState() external view returns (PPTTypes.VaultState memory);
 

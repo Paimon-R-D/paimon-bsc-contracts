@@ -8,7 +8,6 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {Base64} from "@openzeppelin/contracts/utils/Base64.sol";
-import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title RedemptionVoucher
 /// @author Paimon Yield Protocol
@@ -19,7 +18,6 @@ contract RedemptionVoucher is
     ERC721Upgradeable,
     ERC721EnumerableUpgradeable,
     AccessControlUpgradeable,
-    Ownable2StepUpgradeable,
     UUPSUpgradeable
 {
     using Strings for uint256;
@@ -30,6 +28,7 @@ contract RedemptionVoucher is
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     // =============================================================================
     // Data Structures
@@ -81,18 +80,17 @@ contract RedemptionVoucher is
     }
 
     /// @notice Initialize function (replaces constructor in proxy pattern)
-    /// @param admin Admin address
-    function initialize(address admin) external initializer {
+    /// @param adminSig Admin address
+    function initialize(address adminSig,address timerlock) external initializer {
         __ERC721_init("PPT Redemption Voucher", "PPT-RV");
         __ERC721Enumerable_init();
         __AccessControl_init();
-        __Ownable_init(msg.sender);
-        __Ownable2Step_init();
         __UUPSUpgradeable_init();
-        
 
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        _grantRole(ADMIN_ROLE, admin);
+        _grantRole(DEFAULT_ADMIN_ROLE, adminSig);
+        _grantRole(ADMIN_ROLE, adminSig);
+        _grantRole(UPGRADER_ROLE,timerlock);
+        
     }
 
     // =============================================================================
@@ -100,7 +98,7 @@ contract RedemptionVoucher is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner() {
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {
          emit PPTUpgraded(newImplementation, block.timestamp, block.number);
     }
 

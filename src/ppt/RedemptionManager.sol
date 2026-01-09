@@ -10,7 +10,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IRedemptionManager,  IAssetController, IRedemptionVoucher} from "./IPPTContracts.sol";
-import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
+
 
 /// @title RedemptionManager
 /// @author Paimon Yield Protocol
@@ -25,7 +25,6 @@ contract RedemptionManager is
     Initializable,
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
-    Ownable2StepUpgradeable,
     PausableUpgradeable,
     UUPSUpgradeable
 {
@@ -35,7 +34,8 @@ contract RedemptionManager is
     // =============================================================================
     
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 public constant VIP_APPROVER_ROLE = keccak256("VIP_APPROVER_ROLE");
+    bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
 
     // =============================================================================
     // External Contracts
@@ -166,7 +166,7 @@ contract RedemptionManager is
     error InvalidRequestStatus(uint256 requestId);
     error SettlementTimeNotReached(uint256 settlementTime, uint256 currentTime);
     error NotPendingApproval(uint256 requestId);
-    error EmergencyModeNotActive();
+    // error EmergencyModeNotActive();
     error EmergencyQuotaExceeded(uint256 available, uint256 requested);
     error InvalidSettlementTime(uint256 provided, uint256 minimum);
     error NotVoucherOwner(address caller, address owner);
@@ -183,15 +183,15 @@ contract RedemptionManager is
 
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param vault_ Vault contract address
-    /// @param admin_ Admin address
-    function initialize(address vault_, address admin_,address redemptionVoucher_) external initializer {
-        if (vault_ == address(0) || admin_ == address(0)) revert ZeroAddress();
+    /// @param adminSig_ Admin address
+    function initialize(address vault_, address adminSig_, address timerlock,address redemptionVoucher_) external initializer {
+        if (vault_ == address(0) || adminSig_ == address(0)||timerlock==address(0)) revert ZeroAddress();
 
         __AccessControl_init();
         __ReentrancyGuard_init();
         __Pausable_init();
-        __Ownable_init(msg.sender);
-        __Ownable2Step_init();
+        // __Ownable_init(msg.sender);
+        // __Ownable2Step_init();
         __UUPSUpgradeable_init();
 
         vault = IPPT(vault_);
@@ -210,9 +210,10 @@ contract RedemptionManager is
         // Initialize NFT voucher threshold (default 7 days)
         voucherThreshold = 7 days;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
-        _grantRole(ADMIN_ROLE, admin_);
-        _grantRole(VIP_APPROVER_ROLE, admin_);
+        _grantRole(DEFAULT_ADMIN_ROLE, adminSig_);
+        _grantRole(ADMIN_ROLE, adminSig_);
+        _grantRole(KEEPER_ROLE, adminSig_);
+        _grantRole(UPGRADER_ROLE, timerlock);
     }
 
     // =============================================================================
@@ -220,7 +221,7 @@ contract RedemptionManager is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {
         emit PPTUpgraded(newImplementation, block.timestamp, block.number);
     }
 
@@ -259,7 +260,7 @@ contract RedemptionManager is
         uint256 shares,
         address receiver
     ) external override nonReentrant returns (uint256 requestId) {
-        if (!vault.emergencyMode()) revert EmergencyModeNotActive();
+        // if (!vault.emergencyMode()) revert EmergencyModeNotActive();
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
 
@@ -278,14 +279,14 @@ contract RedemptionManager is
     /// @notice Settle redemption (by requestId)
     /// @dev Without NFT voucher: Anyone can call, assets sent to receiver
     ///      With NFT voucher: Only NFT holder can call, assets sent to NFT holder
-    function settleRedemption(uint256 requestId) external override nonReentrant {
+    function settleRedemption(uint256 requestId) external override whenNotPaused nonReentrant {
         _settleRedemptionCore(requestId);
     }
 
     /// @notice Settlement method for NFT voucher holders (by tokenId)
     /// @dev Settle by tokenId, convenient when NFT holder doesn't know requestId
     /// @param tokenId NFT voucher's tokenId
-    function settleWithVoucher(uint256 tokenId) external nonReentrant {
+    function settleWithVoucher(uint256 tokenId) external whenNotPaused nonReentrant {
         // Verify caller is NFT holder
         // address voucherOwner = redemptionVoucher.ownerOf(tokenId);
         // if (msg.sender != voucherOwner) {
@@ -391,10 +392,10 @@ contract RedemptionManager is
     
     /// @notice Preview emergency redemption
     function previewEmergencyRedemption(uint256 shares) external view override returns (PPTTypes.RedemptionPreview memory preview) {
-        if (!vault.emergencyMode()) {
-            preview.canProcess = false;
-            preview.channelReason = "Emergency mode not active";
-         }
+        // if (!vault.emergencyMode()) {
+        //     preview.canProcess = false;
+        //     preview.channelReason = "Emergency mode not active";
+        //  }
 
         //address owner = msg.sender;
         if (shares == 0) {
@@ -444,7 +445,7 @@ contract RedemptionManager is
 
     /// @notice Approve redemption (using default settlement time)
     /// @dev Standard channel +7 days, emergency channel +1 day
-    function approveRedemption(uint256 requestId) external override onlyRole(VIP_APPROVER_ROLE) {
+    function approveRedemption(uint256 requestId) external override onlyRole(KEEPER_ROLE) {
         _approveRedemptionCore(requestId, 0);
     }
 
@@ -455,7 +456,7 @@ contract RedemptionManager is
     function approveRedemptionWithDate(
         uint256 requestId,
         uint256 customSettlementTime
-    ) external onlyRole(VIP_APPROVER_ROLE) {
+    ) external onlyRole(KEEPER_ROLE) {
         _approveRedemptionCore(requestId, customSettlementTime);
     }
 
@@ -528,7 +529,7 @@ contract RedemptionManager is
         emit RedemptionApproved(requestId, msg.sender, settlementTime);
     }
 
-    function rejectRedemption(uint256 requestId, string calldata reason) external override onlyRole(VIP_APPROVER_ROLE) {
+    function rejectRedemption(uint256 requestId, string calldata reason) external override onlyRole(KEEPER_ROLE) {
         PPTTypes.RedemptionRequest storage request = _requests[requestId];
 
         if (request.requestId == 0) revert RequestNotFound(requestId);
@@ -993,13 +994,13 @@ contract RedemptionManager is
     }
 
     /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
-    function adjustOverdueLiability(uint256 amount) external onlyRole(ADMIN_ROLE) {
+    function adjustOverdueLiability(uint256 amount) external onlyRole(KEEPER_ROLE) {
         overdueLiability = amount;
         emit AdjustOverdueLiability(amount);
     }
 
     /// @notice Admin adjust liability for a specific day (for emergency/fix purposes)
-    function adjustDailyLiability(uint256 dayIndex, uint256 amount) external onlyRole(ADMIN_ROLE) {
+    function adjustDailyLiability(uint256 dayIndex, uint256 amount) external onlyRole(KEEPER_ROLE) {
         dailyLiability[dayIndex] = amount;
          emit AdjustDailyLiability(dayIndex, amount);
     }

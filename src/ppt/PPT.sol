@@ -26,7 +26,6 @@ contract PPT is
     AccessControlUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable,
-    Ownable2StepUpgradeable,
     UUPSUpgradeable,
     IPPT
 {
@@ -47,6 +46,8 @@ contract PPT is
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
     /// @notice Authorized contract role (RedemptionManager and AssetController)
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
+    bytes32 public constant KEEPER_ROLE=keccak256("KEEPER_ROLE");
 
     // =============================================================================
     // State Variables
@@ -70,8 +71,8 @@ contract PPT is
     /// @notice Historical accumulated redemption fees
     uint256 public totalAccumulatedRedemptionFees;
 
-    /// @notice Emergency mode
-    bool public override emergencyMode;
+    // /// @notice Emergency mode
+    // bool public override emergencyMode;
 
     /// @notice Emergency application available quota (admin periodically refreshes)
     uint256 public override emergencyQuota;
@@ -91,7 +92,7 @@ contract PPT is
     
     //event DepositProcessed(address indexed sender, address indexed receiver, uint256 assets, uint256 shares);
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
-    event EmergencyModeChanged(bool enabled);
+    //event EmergencyModeChanged(bool enabled);
     event SharesLocked(address indexed owner, uint256 shares);
     event SharesUnlocked(address indexed owner, uint256 shares);
     event SharesBurned(address indexed owner, uint256 shares);
@@ -138,23 +139,19 @@ contract PPT is
 
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param asset_ Underlying asset address
-    /// @param admin_ Admin address
-    function initialize(IERC20 asset_, address admin_) external initializer {
-        if (admin_ == address(0)) revert ZeroAddress();
-
+    /// @param adminsig_ Admin address
+    function initialize(IERC20 asset_,  address adminsig_,address timerlock) external initializer {
+        if (adminsig_ == address(0)||timerlock==address(0)) revert ZeroAddress();
         __ERC4626_init(asset_);
         __ERC20_init("PPT Token", "PPT");
         __AccessControl_init();
         __Pausable_init();
-        __Ownable_init(msg.sender);
-        __Ownable2Step_init();
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
-
-        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
-        _grantRole(ADMIN_ROLE, admin_);
-
-        // lastNavUpdate = block.timestamp;
+        _grantRole(DEFAULT_ADMIN_ROLE, adminsig_);
+        _grantRole(UPGRADER_ROLE, timerlock);
+        _grantRole(ADMIN_ROLE, adminsig_);
+        //emergencyMode=true;
         standardQuotaRatio = 7000; // Default 70%
     }
 
@@ -163,7 +160,7 @@ contract PPT is
     // =============================================================================
 
     /// @notice Authorize upgrade (only ADMIN can call)
-    function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {
         emit PPTUpgraded(newImplementation, block.timestamp, block.number);
     }
 
@@ -369,7 +366,7 @@ contract PPT is
         state.layer3Value = getLayer3Value();
         state.totalRedemptionLiability = totalRedemptionLiability;
         state.totalLockedShares = totalLockedShares;
-        state.emergencyMode = emergencyMode;
+     
     }
     
     function getLiquidityBreakdown() external view returns (
@@ -496,29 +493,29 @@ contract PPT is
         emit AssetControllerUpdated(old, controller);
     }
     
-    /// @notice Grant RedemptionManager or AssetController to operate Vault
-    function grantOperator(address operator) external onlyRole(ADMIN_ROLE) {
-        _grantRole(OPERATOR_ROLE, operator);
-    }
+    // /// @notice Grant RedemptionManager or AssetController to operate Vault
+    // function grantOperator(address operator) external onlyRole(ADMIN_ROLE) {
+    //     _grantRole(OPERATOR_ROLE, operator);
+    // }
 
-    /// @notice Revoke operator permission
-    function revokeOperator(address operator) external onlyRole(ADMIN_ROLE) {
-        _revokeRole(OPERATOR_ROLE, operator);
-    }
+    // /// @notice Revoke operator permission
+    // function revokeOperator(address operator) external onlyRole(ADMIN_ROLE) {
+    //     _revokeRole(OPERATOR_ROLE, operator);
+    // }
     
-    function setEmergencyMode(bool enabled) external onlyRole(ADMIN_ROLE) {
-        emergencyMode = enabled;
-        emit EmergencyModeChanged(enabled);
-    }
+    // function setEmergencyMode(bool enabled) external onlyRole(ADMIN_ROLE) {
+    //     emergencyMode = enabled;
+    //     emit EmergencyModeChanged(enabled);
+    // }
 
     /// @notice Admin refresh emergency application quota
-    function refreshEmergencyQuota(uint256 amount) external override onlyRole(ADMIN_ROLE) {
+    function refreshEmergencyQuota(uint256 amount) external override onlyRole(KEEPER_ROLE) {
         emergencyQuota = amount;
         emit EmergencyQuotaRefreshed(amount);
     }
 
     /// @notice Admin reset period locked assets (called on period refresh)
-    function resetLockedMintAssets() external override onlyRole(ADMIN_ROLE) {
+    function resetLockedMintAssets() external override onlyRole(KEEPER_ROLE) {
         uint256 old = lockedMintAssets;
         lockedMintAssets = 0;
         emit LockedMintAssetsReset(old);
@@ -548,11 +545,11 @@ contract PPT is
         _unpause();
     }
     
-    /// @notice Emergency withdraw (only in emergency mode)
-    function emergencyWithdraw(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
-        require(emergencyMode, "Not in emergency mode");
-        IERC20(token).safeTransfer(to, amount);  
-    }
+    // /// @notice Emergency withdraw (only in emergency mode)
+    // function emergencyWithdraw(address token, address to, uint256 amount) external onlyRole(ADMIN_ROLE) {
+    //     require(emergencyMode, "Not in emergency mode");
+    //     IERC20(token).safeTransfer(to, amount);  
+    // }
 
     // /// @notice Update NAV (for recording)
     // function updateNav() external {
