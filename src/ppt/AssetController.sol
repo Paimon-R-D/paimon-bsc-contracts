@@ -72,13 +72,13 @@ contract AssetController is
     uint256 public defaultSwapSlippage;
 
 
-    /// @dev Cache structure - Used to optimize frequent asset value calculations
-    struct CachedValue {
-        uint256 value;      // Cached total asset value
-        uint256 timestamp;  // Cache timestamp
-    }
-    /// @dev Asset value cache
-    CachedValue private _cachedAssetValue;
+    // /// @dev Cache structure - Used to optimize frequent asset value calculations
+    // struct CachedValue {
+    //     uint256 value;      // Cached total asset value
+    //     uint256 timestamp;  // Cache timestamp
+    // }
+    // /// @dev Asset value cache
+    // CachedValue private _cachedAssetValue;
 
     // =============================================================================
     // Event Definitions
@@ -814,14 +814,14 @@ contract AssetController is
         emit SwapSlippageUpdate(slippage);
     }
 
-    /// @notice Refresh asset value cache
-    /// @dev Force update asset value cache
-    function refreshCache() external override {
-        _cachedAssetValue = CachedValue({
-            value: _calculateAssetValueInternal(),
-            timestamp: block.timestamp
-        });
-    }
+    // /// @notice Refresh asset value cache
+    // /// @dev Force update asset value cache
+    // function refreshCache() external override {
+    //     _cachedAssetValue = CachedValue({
+    //         value: _calculateAssetValueInternal(),
+    //         timestamp: block.timestamp
+    //     });
+    // }
 
     /// @notice Pause contract
     /// @dev Pause all non-admin operations

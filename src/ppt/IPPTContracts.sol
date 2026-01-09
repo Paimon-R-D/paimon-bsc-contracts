@@ -140,7 +140,7 @@ interface IAssetController {
     function setOracleAdapter(address oracle) external;
     function setSwapHelper(address helper) external;
     function setDefaultSwapSlippage(uint256 slippage) external;
-    function refreshCache() external;
+    // function refreshCache() external;
 }
 
 /// @title IOracleAdapter
