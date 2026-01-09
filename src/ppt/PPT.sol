@@ -441,7 +441,8 @@ contract PPT is
     }
     
     function approveAsset(address token, address spender, uint256 amount) external override onlyOperator {
-        IERC20(token).safeIncreaseAllowance(spender, amount);
+        //IERC20(token).safeIncreaseAllowance(spender, amount);
+        IERC20(token).forceApprove(spender, amount);
     }
 
     /// @notice Reduce emergency application quota (called by RedemptionManager)
