@@ -626,7 +626,14 @@ contract AssetController is
         if (usdtAmount == 0) return (0, 0);
 
         // Check 3: Vault cash balance must be sufficient
-        uint256 cashBalance = IERC20(_asset()).balanceOf(address(vault));  // Get USDT balance in Vault
+        uint256 vaultBalance = IERC20(_asset()).balanceOf(address(vault));  // Get USDT balance in Vault
+
+        uint256 withdrawable = vault.withdrawableRedemptionFees();
+        uint256 lockmint = vault.lockedMintAssets();
+
+        uint256 totalDeductions = withdrawable + lockmint;
+        uint256 cashBalance = vaultBalance > totalDeductions 
+                             ? vaultBalance - totalDeductions : 0;
         if (usdtAmount > cashBalance) {
             revert NotEnoughAvailableCash(usdtAmount, cashBalance);  // Insufficient balance error
         }
