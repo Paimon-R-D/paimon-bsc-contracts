@@ -710,7 +710,6 @@ contract RedemptionManager is
 
             // Final check
             if (availableCash < payoutAmount) {
-                emit SettlementLiquidityInsufficient(request.requestId, availableCash, payoutAmount);
                 revert InsufficientLiquidity(availableCash, payoutAmount);
             }
         }
