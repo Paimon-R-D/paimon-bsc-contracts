@@ -166,7 +166,6 @@ contract RedemptionManager is
     error InvalidRequestStatus(uint256 requestId);
     error SettlementTimeNotReached(uint256 settlementTime, uint256 currentTime);
     error NotPendingApproval(uint256 requestId);
-    // error EmergencyModeNotActive();
     error EmergencyQuotaExceeded(uint256 available, uint256 requested);
     error InvalidSettlementTime(uint256 provided, uint256 minimum);
     error NotVoucherOwner(address caller, address owner);
@@ -260,7 +259,7 @@ contract RedemptionManager is
         uint256 shares,
         address receiver
     ) external override nonReentrant returns (uint256 requestId) {
-        // if (!vault.emergencyMode()) revert EmergencyModeNotActive();
+      
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
 
@@ -288,10 +287,7 @@ contract RedemptionManager is
     /// @param tokenId NFT voucher's tokenId
     function settleWithVoucher(uint256 tokenId) external whenNotPaused nonReentrant {
         // Verify caller is NFT holder
-        // address voucherOwner = redemptionVoucher.ownerOf(tokenId);
-        // if (msg.sender != voucherOwner) {
-        //     revert NotVoucherOwner(msg.sender, voucherOwner);
-        // }
+     
 
         // Get associated requestId, call core settlement logic
         (uint256 requestId, , , ) = redemptionVoucher.voucherInfo(tokenId);
@@ -361,15 +357,7 @@ contract RedemptionManager is
             return preview;
         }
 
-        // uint256 userBalance = _balanceOf(msg.sender);
-        // uint256 lockedShares = vault.lockedSharesOf(msg.sender);
-        // uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
-
-        // if (availableShares < shares) {
-        //     preview.canProcess = false;
-        //     preview.channelReason = "Insufficient available shares";
-        //     return preview;
-        // }
+     
 
         uint256 nav = vault.sharePrice();
         preview.grossAmount = (shares * nav) / PPTTypes.PRECISION;
@@ -392,27 +380,13 @@ contract RedemptionManager is
     
     /// @notice Preview emergency redemption
     function previewEmergencyRedemption(uint256 shares) external view override returns (PPTTypes.RedemptionPreview memory preview) {
-        // if (!vault.emergencyMode()) {
-        //     preview.canProcess = false;
-        //     preview.channelReason = "Emergency mode not active";
-        //  }
 
-        //address owner = msg.sender;
+
         if (shares == 0) {
             preview.canProcess = false;
             preview.channelReason = "Shares cannot be zero";
             return preview;
         }
-
-        // uint256 userBalance = _balanceOf(owner);
-        // uint256 lockedShares = vault.lockedSharesOf(owner);
-        // uint256 availableShares = userBalance > lockedShares ? userBalance - lockedShares : 0;
-
-        // if (availableShares < shares) {
-        //     preview.canProcess = false;
-        //     preview.channelReason = "Insufficient available shares";
-        //     return preview;
-        // }
 
         uint256 nav = vault.sharePrice();
         preview.grossAmount = (shares * nav) / PPTTypes.PRECISION;
@@ -854,23 +828,7 @@ contract RedemptionManager is
 }
     
 
-    // function _checkLiquidityAndAlert() internal {
-    //     if (block.timestamp < _lastLiquidityAlertTime + 1 hours) return;
-        
-    //     uint256 available = vault.getAvailableLiquidity();
-    //     uint256 gross = _totalAssets() + vault.totalRedemptionLiability();
-    //     if (gross == 0) return;
-        
-    //     uint256 ratio = (available * PPTTypes.BASIS_POINTS) / gross;
-        
-    //     if (ratio < PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD) {
-    //         emit CriticalLiquidityAlert(ratio, PPTTypes.CRITICAL_LIQUIDITY_THRESHOLD, available);
-    //         _lastLiquidityAlertTime = block.timestamp;
-    //     } else if (ratio < PPTTypes.LOW_LIQUIDITY_THRESHOLD) {
-    //         emit LowLiquidityAlert(ratio, PPTTypes.LOW_LIQUIDITY_THRESHOLD, available, gross);
-    //         _lastLiquidityAlertTime = block.timestamp;
-    //     }
-    // }
+
 
     // =============================================================================
     // View Functions
@@ -951,32 +909,7 @@ contract RedemptionManager is
         return dailyLiability[dayIndex];
     }
 
-    /// @notice Process yesterday's due liability to overdue (backend/Keeper daily call)
-    // function processOverdueLiability() external {
-    //     uint256 yesterday = _getDayIndex(block.timestamp) - 1;
-    //     uint256 amount = dailyLiability[yesterday];
-    //     if (amount > 0) {
-    //         overdueLiability += amount;
-    //         dailyLiability[yesterday] = 0;
-    //         emit OverdueLiabilityProcessed(yesterday, amount);
-    //     }
-    // }
-
-    // /// @notice Batch process overdue liability for the past N days
-    // function processOverdueLiabilityBatch(uint256 daysBack) external view returns(uint256) {
-    //     uint256 overdueLiabilityView=0;
-    //     uint256 today = _getDayIndex(block.timestamp);
-    //     for (uint256 i = 1; i <= daysBack; i++) {
-    //         uint256 dayIndex = today - i;
-    //         uint256 amount = dailyLiability[dayIndex];
-    //         if (amount > 0) {
-    //             overdueLiabilityView += amount;
-    //             //dailyLiability[dayIndex] = 0;
-    //             //emit OverdueLiabilityProcessed(dayIndex, amount);
-    //         }
-    //     }
-    //     return overdueLiabilityView;
-    // }
+    
 
      /**
         * @notice Get total overdue liability from the past specified days
@@ -1009,13 +942,7 @@ contract RedemptionManager is
     // Admin Functions
     // =============================================================================
 
-    /// @notice Set redemption voucher NFT contract
-    /// @param voucher_ RedemptionVoucher contract address
-    // function setRedemptionVoucher(address voucher_) external onlyRole(ADMIN_ROLE) {
-    //     address old = address(redemptionVoucher);
-    //     redemptionVoucher = IRedemptionVoucher(voucher_);
-    //     emit RedemptionVoucherUpdated(old, voucher_);
-    // }
+ 
 
     /// @notice Set NFT generation threshold
     /// @param threshold_ Delay threshold (seconds), generate NFT if exceeds this threshold
@@ -1025,11 +952,7 @@ contract RedemptionManager is
         emit VoucherThresholdUpdated(old, threshold_);
     }
 
-    // function setAssetScheduler(address scheduler) external onlyRole(ADMIN_ROLE) {
-    //     address old = address(assetScheduler);
-    //     assetScheduler = IAssetScheduler(scheduler);
-    //     emit AssetSchedulerUpdated(old, scheduler);
-    // }
+
 
     function setAssetController(address controller) external onlyRole(ADMIN_ROLE) {
         address old = address(assetController);
