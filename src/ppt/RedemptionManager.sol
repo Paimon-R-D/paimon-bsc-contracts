@@ -18,7 +18,7 @@ import {IPPT, IRedemptionManager,  IAssetController, IRedemptionVoucher} from ".
 /// @dev Redemption channel description:
 ///      1. Standard channel (T+7): Base fee (default 1%, configurable)
 ///         - Approval condition: >=100K or exceeds dynamic quota
-///      2. Emergency channel (T+1): Base fee + penalty fee (default 2%, configurable)
+///      2. Emergency channel (T+0): Base fee + penalty fee (default 2%, configurable)
 ///         - Approval condition: >30K or >10% of Layer1
 contract RedemptionManager is
     IRedemptionManager,
@@ -141,6 +141,7 @@ contract RedemptionManager is
     event BaseRedemptionFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event EmergencyPenaltyFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event SettlementWaterfallTriggered(uint256 indexed requestId, uint256 deficit, uint256 funded);
+  
     event VoucherThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
     event VoucherMinted(uint256 indexed requestId, uint256 indexed tokenId, address indexed owner);
     event StandardApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
@@ -406,8 +407,8 @@ contract RedemptionManager is
         // Liquidity is checked at settlement time
         preview.canProcess = true;
         preview.channelReason = preview.requiresApproval
-            ? "Emergency channel (T+1): Requires approval (>30K or >20% of emergency quota), +1% fee"
-            : "Emergency channel (T+1): No approval required, +1% fee";
+            ? "Emergency channel (T+0): Requires approval (>30K or >20% of emergency quota), +1% fee"
+            : "Emergency channel (T+0): No approval required, +1% fee";
     }
 
     // =============================================================================

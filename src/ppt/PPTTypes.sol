@@ -14,7 +14,7 @@ library PPTTypes {
 
     // Redemption delays
     uint256 constant STANDARD_REDEMPTION_DELAY = 7 days;
-    uint256 constant EMERGENCY_REDEMPTION_DELAY = 1 days;
+    uint256 constant EMERGENCY_REDEMPTION_DELAY = 0 seconds;
 
     // Fee related
     uint256 constant BASE_REDEMPTION_FEE = 10;      // 0.1%
@@ -54,7 +54,7 @@ library PPTTypes {
 
     enum RedemptionChannel {
         STANDARD,   // Standard channel (T+7)
-        EMERGENCY,  // Emergency channel (T+1)
+        EMERGENCY,  // Emergency channel (T+0)
         SCHEDULED   // Large scheduled channel
     }
 
