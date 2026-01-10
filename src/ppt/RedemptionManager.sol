@@ -134,16 +134,13 @@ contract RedemptionManager is
     
     event RedemptionApproved(uint256 indexed requestId, address indexed approver, uint256 settlementTime);
     event RedemptionRejected(uint256 indexed requestId, address indexed rejector, string reason);
-  //  event LowLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available, uint256 total);
-  //  event CriticalLiquidityAlert(uint256 currentRatio, uint256 threshold, uint256 available);
+
     event AssetControllerUpdated(address indexed oldController, address indexed newController);
     event DailyLiabilityAdded(uint256 indexed dayIndex, uint256 amount);
     event LiabilityRemoved(uint256 indexed dayIndex, uint256 amount, bool wasOverdue);
     event BaseRedemptionFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event EmergencyPenaltyFeeUpdated(uint256 oldFeeBps, uint256 newFeeBps);
     event SettlementWaterfallTriggered(uint256 indexed requestId, uint256 deficit, uint256 funded);
-    event SettlementLiquidityInsufficient(uint256 indexed requestId, uint256 availableCash, uint256 payoutAmount);
-    //event RedemptionVoucherUpdated(address indexed oldVoucher, address indexed newVoucher);
     event VoucherThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
     event VoucherMinted(uint256 indexed requestId, uint256 indexed tokenId, address indexed owner);
     event StandardApprovalAmountUpdated(uint256 oldAmount, uint256 newAmount);
