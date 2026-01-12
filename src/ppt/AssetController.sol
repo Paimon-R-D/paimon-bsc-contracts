@@ -252,7 +252,7 @@ contract AssetController is
                 break;
             }
         }
-         _cachedAssetValue.timestamp = 0;
+         //_cachedAssetValue.timestamp = 0;
         emit AssetRemoved(token);
     }
 
@@ -379,7 +379,7 @@ contract AssetController is
             revert SwapHelperNotConfigured();
         }
         
-        _cachedAssetValue.timestamp = 0;
+       
         emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
     }
 
@@ -524,10 +524,10 @@ contract AssetController is
     /// @dev Uses cache mechanism to optimize frequent calls, recalculate when cache expires
     /// @return totalValue Total USDT value of all assets
     function calculateAssetValue() public view override returns (uint256 totalValue) {
-        if (_cachedAssetValue.timestamp != 0 && 
-            _cachedAssetValue.timestamp + PPTTypes.CACHE_DURATION > block.timestamp) {
-            return _cachedAssetValue.value;
-        }
+        // if (_cachedAssetValue.timestamp != 0 && 
+        //     _cachedAssetValue.timestamp + PPTTypes.CACHE_DURATION > block.timestamp) {
+        //     return _cachedAssetValue.value;
+        // }
         
         return _calculateAssetValueInternal();
     }
@@ -712,7 +712,7 @@ contract AssetController is
         emit PurchaseRouted(config.tokenAddress, config.tier, method, usdtAmount, tokensReceived);
 
         // Invalidate asset value cache (asset value changed after purchase)
-        _cachedAssetValue.timestamp = 0;
+      
     }
 
     /// @dev Execute waterfall liquidation (internal implementation)
@@ -741,7 +741,7 @@ contract AssetController is
             }
         }
         
-        _cachedAssetValue.timestamp = 0;
+      
         funded = amountNeeded - remaining;
     }
 
