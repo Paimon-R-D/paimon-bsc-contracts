@@ -358,28 +358,13 @@ contract AssetController is
         if (tokenAmount == 0) revert ZeroAmount();
         
         PPTTypes.AssetConfig memory config = _assetConfigs[index - 1];
-        address vaultAsset = _asset();
         
-        if (config.purchaseAdapter != address(0)) {
-            uint256 balanceBefore = IERC20(vaultAsset).balanceOf(address(vault));
-            
-            vault.approveAsset(token, config.purchaseAdapter, tokenAmount);
-            
-            (bool success,) = config.purchaseAdapter.call(
-                abi.encodeWithSignature("redeem(uint256)", tokenAmount)
-            );
-            require(success, "Adapter redeem failed");
-            
-            usdtReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balanceBefore;
-        } else if (address(swapHelper) != address(0)) {
-            vault.approveAsset(token, address(swapHelper), tokenAmount);
-            usdtReceived = swapHelper.sellRWAAsset(token, vaultAsset, tokenAmount, defaultSwapSlippage, address(vault));
-        } else {
-            emit SwapNotExisted(token);
+      bool success;
+           (usdtReceived, success) = _sellAsset(token, tokenAmount, config);
+       if (!success) {
+             emit SwapNotExisted(token);
             revert SwapHelperNotConfigured();
         }
-        
-       
         emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
     }
 
@@ -673,7 +658,7 @@ contract AssetController is
             // Call adapter's purchase method to execute purchase
             // Adapter internally: 1.Transfer USDT 2.Execute purchase logic 3.Transfer tokens to Vault
             (bool success,) = config.purchaseAdapter.call(
-                abi.encodeWithSignature("purchase(uint256)", usdtAmount)
+                abi.encodeWithSignature("purchase(address,uint256)", address(vault), usdtAmount)
             );
             require(success, "Adapter purchase failed");  // Revert if purchase failed
 
@@ -714,6 +699,51 @@ contract AssetController is
         // Invalidate asset value cache (asset value changed after purchase)
       
     }
+
+/// @dev Internal function: Execute asset sale (supports both Adapter and SwapHelper paths)
+/// @param token Asset address to sell
+/// @param tokenAmount Amount of tokens to sell
+/// @param config Asset configuration
+/// @return usdtReceived Amount of USDT received
+/// @return success Whether execution was successful
+
+function _sellAsset(
+    address token,
+    uint256 tokenAmount,
+    PPTTypes.AssetConfig memory config
+) internal returns (uint256 usdtReceived, bool success) {
+    address vaultAsset = _asset();
+
+    // Path 1: Prefer using purchaseAdapter (OTC method)
+    if (config.purchaseAdapter != address(0)) {
+        uint256 balanceBefore = IERC20(vaultAsset).balanceOf(address(vault));
+        vault.approveAsset(token, config.purchaseAdapter, tokenAmount);
+        (bool callSuccess,) = config.purchaseAdapter.call(
+            abi.encodeWithSignature("redeem(address,uint256)", address(vault), tokenAmount)
+        );
+        if (callSuccess) {
+            usdtReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balanceBefore;
+            return (usdtReceived, true);
+        }
+        // If Adapter fails, continue trying swapHelper
+    }
+
+    // Path 2: Use swapHelper (DEX method)
+    if (address(swapHelper) != address(0)) {
+        vault.approveAsset(token, address(swapHelper), tokenAmount);
+        try swapHelper.sellRWAAsset(
+            token, vaultAsset, tokenAmount, defaultSwapSlippage, address(vault)
+        ) returns (uint256 received) {
+            return (received, true);
+        } catch {
+            return (0, false);
+        }
+    }
+
+    return (0, false);
+}
+
+
 
     /// @dev Execute waterfall liquidation (internal implementation)
     /// @param amountNeeded USDT amount to raise
@@ -772,14 +802,15 @@ contract AssetController is
         
         if (tokensToSell == 0) return amountNeeded;
         
-        vault.approveAsset(token, address(swapHelper), tokensToSell);
+         PPTTypes.AssetConfig memory config = _assetConfigs[_assetIndex[token] - 1];
+        (uint256 received, bool success) = _sellAsset(token, tokensToSell, config);
 
-        try swapHelper.sellRWAAsset(token, _asset(), tokensToSell, defaultSwapSlippage, address(vault)) returns (uint256 received) {
-            emit WaterfallLiquidation(tier, token, tokensToSell, received);
-            return received >= amountNeeded ? 0 : amountNeeded - received;
-        } catch {
-            return amountNeeded;
+        if (success) {
+          emit WaterfallLiquidation(tier, token, tokensToSell, received);
+           return received >= amountNeeded ? 0 : amountNeeded - received;
         }
+
+        return amountNeeded;
     }
 
     
