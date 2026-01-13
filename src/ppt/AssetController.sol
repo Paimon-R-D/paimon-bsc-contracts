@@ -72,13 +72,13 @@ contract AssetController is
     uint256 public defaultSwapSlippage;
 
 
-    // /// @dev Cache structure - Used to optimize frequent asset value calculations
-    // struct CachedValue {
-    //     uint256 value;      // Cached total asset value
-    //     uint256 timestamp;  // Cache timestamp
-    // }
-    // /// @dev Asset value cache
-    // CachedValue private _cachedAssetValue;
+    /// @dev Cache structure - Used to optimize frequent asset value calculations
+    struct CachedValue {
+        uint256 value;      // Cached total asset value
+        uint256 timestamp;  // Cache timestamp
+    }
+    /// @dev Asset value cache
+    CachedValue private _cachedAssetValue;
 
     // =============================================================================
     // Event Definitions
@@ -113,6 +113,8 @@ contract AssetController is
     event SwapNotExisted(address indexed assert);
     event SwapSlippageUpdate(uint256 slippage);
     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
+    /// @notice Cache refreshed event
+    event CacheRefreshed(uint256 value, uint256 timestamp);
 
     // =============================================================================
     // Error Definitions
@@ -342,6 +344,9 @@ contract AssetController is
         tokensReceived = received;
         
         emit AssetPurchased(token, _assetConfigs[index - 1].tier, spent, received);
+
+        // Invalidate cache after asset purchase
+        _invalidateCache();
     }
 
     /// @notice Redeem specified asset
@@ -366,6 +371,9 @@ contract AssetController is
             revert SwapHelperNotConfigured();
         }
         emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
+
+        // Invalidate cache after asset redemption
+        _invalidateCache();
     }
 
     /// @notice Execute waterfall liquidation
@@ -377,7 +385,10 @@ contract AssetController is
         uint256 amountNeeded,
         PPTTypes.LiquidityTier maxTier
     ) external override onlyRole(REBALANCER_ROLE) nonReentrant returns (uint256 funded) {
-        return _executeWaterfallLiquidation(amountNeeded, maxTier);
+        funded = _executeWaterfallLiquidation(amountNeeded, maxTier);
+
+        // Invalidate cache after liquidation
+        _invalidateCache();
     }
 
 
@@ -509,12 +520,42 @@ contract AssetController is
     /// @dev Uses cache mechanism to optimize frequent calls, recalculate when cache expires
     /// @return totalValue Total USDT value of all assets
     function calculateAssetValue() public view override returns (uint256 totalValue) {
-        // if (_cachedAssetValue.timestamp != 0 && 
-        //     _cachedAssetValue.timestamp + PPTTypes.CACHE_DURATION > block.timestamp) {
-        //     return _cachedAssetValue.value;
-        // }
-        
+        // Check if cache is valid
+        if (_cachedAssetValue.timestamp != 0 &&
+            _cachedAssetValue.timestamp + PPTTypes.CACHE_DURATION > block.timestamp) {
+            return _cachedAssetValue.value;
+        }
+
         return _calculateAssetValueInternal();
+    }
+
+    /// @notice Force refresh and return latest asset value (for transaction operations)
+    /// @dev Non-view function, updates cache to prevent arbitrage
+    /// @return value Latest total asset value
+    function calculateAssetValueFresh() public override returns (uint256 value) {
+        value = _calculateAssetValueInternal();
+        _cachedAssetValue = CachedValue({
+            value: value,
+            timestamp: block.timestamp
+        });
+        emit CacheRefreshed(value, block.timestamp);
+    }
+
+    /// @notice Refresh cache externally
+    /// @dev Can be called by anyone to update cache
+    function refreshCache() external override {
+        uint256 value = _calculateAssetValueInternal();
+        _cachedAssetValue = CachedValue({
+            value: value,
+            timestamp: block.timestamp
+        });
+        emit CacheRefreshed(value, block.timestamp);
+    }
+
+    /// @notice Invalidate cache
+    /// @dev Internal function to invalidate cache when assets change
+    function _invalidateCache() internal {
+        _cachedAssetValue.timestamp = 0;
     }
 
     /// @dev Internal function: Calculate total value of all assets (without cache)

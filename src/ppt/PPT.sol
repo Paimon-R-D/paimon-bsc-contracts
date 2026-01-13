@@ -247,6 +247,11 @@ contract PPT is
         if (assets < PPTTypes.MIN_DEPOSIT) revert DepositBelowMinimum(assets, PPTTypes.MIN_DEPOSIT);
         if (receiver == address(0)) revert ZeroAddress();
 
+        // Force refresh NAV to prevent arbitrage attacks
+        if (address(assetController) != address(0)) {
+            assetController.calculateAssetValueFresh();
+        }
+
         shares = previewDeposit(assets);
 
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
@@ -265,6 +270,11 @@ contract PPT is
     ) public override nonReentrant whenNotPaused returns (uint256 assets) {
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+
+        // Force refresh NAV to prevent arbitrage attacks
+        if (address(assetController) != address(0)) {
+            assetController.calculateAssetValueFresh();
+        }
 
         assets = previewMint(shares);
         if (assets < PPTTypes.MIN_DEPOSIT) revert DepositBelowMinimum(assets, PPTTypes.MIN_DEPOSIT);

@@ -237,6 +237,11 @@ contract RedemptionManager is
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
 
+        // Force refresh NAV to prevent arbitrage attacks
+        if (address(assetController) != address(0)) {
+            assetController.calculateAssetValueFresh();
+        }
+
         address owner = msg.sender;
         // Since pending approval and locked shares are transferred to vault, user balanceOf is available balance
         uint256 availableShares = IERC20(address(vault)).balanceOf(owner);
@@ -257,9 +262,14 @@ contract RedemptionManager is
         uint256 shares,
         address receiver
     ) external override nonReentrant returns (uint256 requestId) {
-      
+
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+
+        // Force refresh NAV to prevent arbitrage attacks
+        if (address(assetController) != address(0)) {
+            assetController.calculateAssetValueFresh();
+        }
 
         address owner = msg.sender;
         // Since pending approval and locked shares are transferred to vault, user balanceOf is available balance

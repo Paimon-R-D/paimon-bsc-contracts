@@ -136,11 +136,16 @@ interface IAssetController {
     function getLayerValue(PPTTypes.LiquidityTier tier) external view returns (uint256);
     function calculateAssetValue() external view returns (uint256);
 
+    // ========== Cache Management ==========
+    /// @notice Force refresh and return latest asset value (for transaction operations)
+    function calculateAssetValueFresh() external returns (uint256);
+    /// @notice Refresh cache externally
+    function refreshCache() external;
+
     // ========== External Contract Settings (ADMIN Call) ==========
     function setOracleAdapter(address oracle) external;
     function setSwapHelper(address helper) external;
     function setDefaultSwapSlippage(uint256 slippage) external;
-    // function refreshCache() external;
 }
 
 /// @title IOracleAdapter
