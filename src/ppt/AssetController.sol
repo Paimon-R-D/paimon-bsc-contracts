@@ -367,7 +367,6 @@ contract AssetController is
       bool success;
            (usdtReceived, success) = _sellAsset(token, tokenAmount, config);
        if (!success) {
-             emit SwapNotExisted(token);
             revert SwapHelperNotConfigured();
         }
         emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
