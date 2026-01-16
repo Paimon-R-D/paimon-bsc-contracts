@@ -221,7 +221,7 @@ contract PPT is
         if(supply>0){
             require(totalAsset>0, "totalAsset is not 0");
         }
-        return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAsset, rounding);
+        return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAsset+1, rounding);
     }
 
     /// @notice Override asset conversion, using effectiveSupply to maintain consistency with sharePrice
