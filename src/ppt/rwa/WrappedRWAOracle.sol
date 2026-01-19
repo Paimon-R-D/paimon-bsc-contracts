@@ -47,6 +47,8 @@ contract WrappedRWAOracle is AccessControl {
 
     error ZeroAddress();
     error NotRegistered(address wrapper);
+    error OracleCallFailed(address oracle, address token);
+    error OracleNotConfigured(address token);
 
     // =============================================================================
     // Constructor
@@ -68,6 +70,7 @@ contract WrappedRWAOracle is AccessControl {
     /// @notice 获取资产价格
     /// @dev 如果是注册的 wrapper，返回 share 价格
     ///      否则使用 fallback oracle
+    ///      不再静默回退到默认值，失败时会 revert
     /// @param token 资产地址
     /// @return price 价格（1e18 精度，表示 1 个 token 值多少 USDT）
     function getPrice(address token) external view returns (uint256 price) {
@@ -76,37 +79,36 @@ contract WrappedRWAOracle is AccessControl {
         }
 
         // 使用 fallback oracle
-        if (fallbackOracle != address(0)) {
-            (bool success, bytes memory data) =
-                fallbackOracle.staticcall(abi.encodeWithSignature("getPrice(address)", token));
-            if (success && data.length >= 32) {
-                return abi.decode(data, (uint256));
-            }
+        if (fallbackOracle == address(0)) {
+            revert OracleNotConfigured(token);
         }
 
-        // 默认返回 1:1
-        return PRECISION;
+        (bool success, bytes memory data) =
+            fallbackOracle.staticcall(abi.encodeWithSignature("getPrice(address)", token));
+
+        if (!success || data.length < 32) {
+            revert OracleCallFailed(fallbackOracle, token);
+        }
+
+        return abi.decode(data, (uint256));
     }
 
     /// @notice 获取 wrapper 的 share 价格
     /// @param wrapper WrappedRWA 地址
-    /// @return price 每个 share 的 USDT 价值
+    /// @return price 每个 share 的 USDT 价值（1e18 精度）
     function _getWrapperPrice(address wrapper) internal view returns (uint256 price) {
         IERC4626 w = IERC4626(wrapper);
 
-        uint256 totalAssets = w.totalAssets();
-        uint256 totalSupply = w.totalSupply();
+        uint256 totalAssets_ = w.totalAssets();
+        uint256 totalSupply_ = w.totalSupply();
 
-        if (totalSupply == 0) {
+        if (totalSupply_ == 0) {
             return PRECISION; // 1:1
         }
 
         // 价格 = totalAssets / totalSupply
         // 注意：totalAssets 已经包含 pendingPurchaseUSDT
-        uint8 decimals = IERC20Metadata(wrapper).decimals();
-
-        // 标准化到 1e18 精度
-        price = (totalAssets * PRECISION) / totalSupply;
+        price = (totalAssets_ * PRECISION) / totalSupply_;
 
         return price;
     }
@@ -181,6 +183,8 @@ contract CompositeOracle is AccessControl {
     event DefaultOracleSet(address indexed oracle);
 
     error ZeroAddress();
+    error OracleNotConfigured(address token);
+    error OracleCallFailed(address oracle, address token);
 
     constructor(address admin_, address defaultOracle_) {
         if (admin_ == address(0)) revert ZeroAddress();
@@ -192,6 +196,7 @@ contract CompositeOracle is AccessControl {
     }
 
     /// @notice 获取价格
+    /// @dev 不再静默回退到默认值，失败时会 revert
     function getPrice(address token) external view returns (uint256) {
         address oracle = assetOracle[token];
         if (oracle == address(0)) {
@@ -199,16 +204,16 @@ contract CompositeOracle is AccessControl {
         }
 
         if (oracle == address(0)) {
-            return PRECISION;
+            revert OracleNotConfigured(token);
         }
 
         (bool success, bytes memory data) = oracle.staticcall(abi.encodeWithSignature("getPrice(address)", token));
 
-        if (success && data.length >= 32) {
-            return abi.decode(data, (uint256));
+        if (!success || data.length < 32) {
+            revert OracleCallFailed(oracle, token);
         }
 
-        return PRECISION;
+        return abi.decode(data, (uint256));
     }
 
     /// @notice 设置资产的 Oracle

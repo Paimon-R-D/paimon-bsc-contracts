@@ -7,11 +7,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-/// @title WrappedRWAAdapter
+/// @title WrappedRWASingleAdapter
 /// @author Paimon Yield Protocol
-/// @notice AssetController 与 WrappedRWA 之间的桥接适配器
-/// @dev 实现 AssetController 期望的 purchase/redeem 接口
-///      内部将调用转发给 WrappedRWA
+/// @notice 单个 WrappedRWA 的专用适配器
+/// @dev 每个 WrappedRWA 部署一个此适配器，作为 AssetController 的 purchaseAdapter
 ///
 /// 集成架构：
 /// ```
@@ -19,7 +18,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///      │
 ///      │ purchaseAsset(wrappedToken, usdtAmount)
 ///      ▼
-/// WrappedRWAAdapter (作为 purchaseAdapter)
+/// WrappedRWASingleAdapter (作为 purchaseAdapter)
 ///      │
 ///      │ wrapper.deposit(usdtAmount, vault)
 ///      ▼
@@ -29,121 +28,6 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///      ▼
 /// Underlying RWA Token
 /// ```
-contract WrappedRWAAdapter is AccessControl, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
-    // =============================================================================
-    // Roles
-    // =============================================================================
-
-    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-
-    // =============================================================================
-    // State Variables
-    // =============================================================================
-
-    /// @notice USDT 地址
-    IERC20 public immutable usdt;
-
-    /// @notice WrappedRWA 地址映射：underlying => wrapper
-    mapping(address => address) public wrappers;
-
-    /// @notice Vault 地址（PPT）
-    address public vault;
-
-    // =============================================================================
-    // Events
-    // =============================================================================
-
-    event WrapperRegistered(address indexed underlying, address indexed wrapper);
-    event WrapperRemoved(address indexed underlying);
-    event VaultUpdated(address indexed oldVault, address indexed newVault);
-    event Purchase(address indexed wrapper, uint256 usdtAmount, uint256 sharesReceived);
-    event Redeem(address indexed wrapper, uint256 sharesAmount, uint256 usdtExpected);
-
-    // =============================================================================
-    // Errors
-    // =============================================================================
-
-    error ZeroAddress();
-    error WrapperNotFound(address underlying);
-    error OnlyVault();
-
-    // =============================================================================
-    // Constructor
-    // =============================================================================
-
-    constructor(address usdt_, address admin_) {
-        if (usdt_ == address(0) || admin_ == address(0)) revert ZeroAddress();
-
-        usdt = IERC20(usdt_);
-
-        _grantRole(DEFAULT_ADMIN_ROLE, admin_);
-        _grantRole(ADMIN_ROLE, admin_);
-    }
-
-    // =============================================================================
-    // AssetController 接口 - purchase/redeem
-    // =============================================================================
-
-    /// @notice 购买 RWA（被 AssetController 调用）
-    /// @dev AssetController 会先 approve USDT 给本合约
-    /// @param vault_ Vault 地址（用于接收 WrappedRWA）
-    /// @param usdtAmount 购买金额
-    function purchase(address vault_, uint256 usdtAmount) external nonReentrant {
-        // 这个函数会被 AssetController 通过 call 调用
-        // msg.sender 是 AssetController（或任何被授权的调用者）
-
-        // 从 Vault 转入 USDT（AssetController 已经 approve）
-        usdt.safeTransferFrom(vault_, address(this), usdtAmount);
-
-        // 找到对应的 wrapper（需要通过某种方式知道是哪个 wrapper）
-        // 这里有个设计问题：AssetController.purchaseAsset 传入的是 token 地址
-        // 我们需要通过上下文知道是哪个 wrapper
-
-        // 解决方案：这个 adapter 是针对特定 wrapper 的
-        // 每个 WrappedRWA 有自己的 adapter 实例
-        // 或者：使用 delegatecall 上下文
-
-        // 简化设计：这个 adapter 对应单个 wrapper
-        revert("Use WrappedRWASingleAdapter instead");
-    }
-
-    /// @notice 赎回 RWA（被 AssetController 调用）
-    /// @param vault_ Vault 地址
-    /// @param sharesAmount WrappedRWA 数量
-    function redeem(address vault_, uint256 sharesAmount) external nonReentrant {
-        revert("Use WrappedRWASingleAdapter instead");
-    }
-
-    // =============================================================================
-    // Admin Functions
-    // =============================================================================
-
-    /// @notice 注册 wrapper
-    function registerWrapper(address underlying, address wrapper) external onlyRole(ADMIN_ROLE) {
-        if (underlying == address(0) || wrapper == address(0)) revert ZeroAddress();
-        wrappers[underlying] = wrapper;
-        emit WrapperRegistered(underlying, wrapper);
-    }
-
-    /// @notice 移除 wrapper
-    function removeWrapper(address underlying) external onlyRole(ADMIN_ROLE) {
-        delete wrappers[underlying];
-        emit WrapperRemoved(underlying);
-    }
-
-    /// @notice 设置 vault
-    function setVault(address vault_) external onlyRole(ADMIN_ROLE) {
-        address old = vault;
-        vault = vault_;
-        emit VaultUpdated(old, vault_);
-    }
-}
-
-/// @title WrappedRWASingleAdapter
-/// @notice 单个 WrappedRWA 的专用适配器
-/// @dev 每个 WrappedRWA 部署一个此适配器，作为 AssetController 的 purchaseAdapter
 contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -152,6 +36,7 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     // =============================================================================
 
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant CALLER_ROLE = keccak256("CALLER_ROLE");
 
     // =============================================================================
     // State Variables
@@ -172,6 +57,9 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
 
     event Purchase(address indexed vault, uint256 usdtAmount, uint256 sharesReceived);
     event Redeem(address indexed vault, uint256 sharesAmount, uint256 assetsReceived);
+    event CallerRoleGranted(address indexed caller);
+    event CallerRoleRevoked(address indexed caller);
+    event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
 
     // =============================================================================
     // Errors
@@ -179,6 +67,8 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
 
     error ZeroAddress();
     error ZeroAmount();
+    error WrapperCallFailed(address wrapper);
+    error InvalidWrapperResponse(address wrapper, uint256 dataLength);
 
     // =============================================================================
     // Constructor
@@ -198,7 +88,12 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
         // 获取底层资产（WrappedRWA 的 underlying）
         // 注意：WrappedRWA 的 asset() 返回 USDT，underlying() 返回实际 RWA
         (bool success, bytes memory data) = wrapper_.staticcall(abi.encodeWithSignature("underlying()"));
-        require(success && data.length >= 32, "Invalid wrapper");
+        if (!success) {
+            revert WrapperCallFailed(wrapper_);
+        }
+        if (data.length < 32) {
+            revert InvalidWrapperResponse(wrapper_, data.length);
+        }
         underlying = IERC20(abi.decode(data, (address)));
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
@@ -215,9 +110,10 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     /// @notice 购买 RWA
     /// @dev 被 AssetController.purchaseAsset 通过 call 调用
     ///      AssetController 会先调用 vault.approveAsset(usdt, adapter, amount)
+    ///      只有被授权的 CALLER_ROLE 可以调用
     /// @param vault_ Vault 地址（USDT 来源，也是 shares 接收方）
     /// @param usdtAmount 购买金额
-    function purchase(address vault_, uint256 usdtAmount) external nonReentrant {
+    function purchase(address vault_, uint256 usdtAmount) external nonReentrant onlyRole(CALLER_ROLE) {
         if (usdtAmount == 0) revert ZeroAmount();
 
         // 1. 从 Vault 转入 USDT
@@ -237,9 +133,10 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     /// @notice 赎回 RWA
     /// @dev 被 AssetController.redeemAsset 通过 call 调用
     ///      AssetController 会先调用 vault.approveAsset(wrapper, adapter, amount)
+    ///      只有被授权的 CALLER_ROLE 可以调用
     /// @param vault_ Vault 地址（shares 来源，也是 USDT 接收方）
     /// @param sharesAmount WrappedRWA 数量
-    function redeem(address vault_, uint256 sharesAmount) external nonReentrant {
+    function redeem(address vault_, uint256 sharesAmount) external nonReentrant onlyRole(CALLER_ROLE) {
         if (sharesAmount == 0) revert ZeroAmount();
 
         // 1. 从 Vault 转入 WrappedRWA shares
@@ -270,9 +167,26 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     // Admin Functions
     // =============================================================================
 
+    /// @notice 授权调用者角色
+    /// @param caller 调用者地址（通常是 AssetController）
+    function grantCallerRole(address caller) external onlyRole(ADMIN_ROLE) {
+        if (caller == address(0)) revert ZeroAddress();
+        _grantRole(CALLER_ROLE, caller);
+        emit CallerRoleGranted(caller);
+    }
+
+    /// @notice 撤销调用者角色
+    /// @param caller 调用者地址
+    function revokeCallerRole(address caller) external onlyRole(ADMIN_ROLE) {
+        _revokeRole(CALLER_ROLE, caller);
+        emit CallerRoleRevoked(caller);
+    }
+
     /// @notice 紧急提取
     function emergencyWithdraw(address token, uint256 amount, address to) external onlyRole(ADMIN_ROLE) {
+        if (to == address(0)) revert ZeroAddress();
         IERC20(token).safeTransfer(to, amount);
+        emit EmergencyWithdraw(token, amount, to);
     }
 
     /// @notice 重新 approve（如果需要）

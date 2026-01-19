@@ -85,6 +85,8 @@ contract WrappedRWATest is Test {
         wrapper.grantRole(wrapper.KEEPER_ROLE(), keeper);
         wrapper.grantRole(wrapper.VAULT_ROLE(), vault);
         wrapperOracle.registerWrapper(address(wrapper));
+        // 为 adapter 授权 CALLER_ROLE（允许 test 合约调用）
+        adapter.grantCallerRole(address(this));
         vm.stopPrank();
 
         // 给 vault 一些 USDT

@@ -66,7 +66,7 @@ interface IWrappedRWA is IERC4626 {
     event PurchaseCompleted(uint256 indexed txId, uint256 actualTokensReceived, uint256 actualPrice, int256 priceDelta);
 
     /// @notice 购买取消
-    event PurchaseCancelled(uint256 indexed txId, string reason);
+    event PurchaseCancelled(uint256 indexed txId, uint256 sharesBurned, string reason);
 
     /// @notice 赎回发起
     event RedemptionInitiated(
@@ -77,19 +77,36 @@ interface IWrappedRWA is IERC4626 {
     event RedemptionCompleted(uint256 indexed txId, uint256 actualUsdtReceived, uint256 actualPrice, int256 priceDelta);
 
     /// @notice 赎回取消
-    event RedemptionCancelled(uint256 indexed txId, string reason);
+    event RedemptionCancelled(uint256 indexed txId, uint256 sharesReturned, string reason);
+
+    /// @notice Oracle 更新
+    event OracleUpdated(address indexed oldOracle, address indexed newOracle);
+
+    /// @notice Vault 角色授予
+    event VaultRoleGranted(address indexed vault);
+
+    /// @notice 紧急提取
+    event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
+
+    /// @notice 交易过期处理
+    event TransactionExpiredAndProcessed(uint256 indexed txId, TransactionType txType);
 
     // =============================================================================
     // 错误
     // =============================================================================
 
     error ZeroAmount();
+    error ZeroAddress();
     error InsufficientBalance(uint256 available, uint256 required);
+    error InsufficientShares(address holder, uint256 available, uint256 required);
     error TransactionNotFound(uint256 txId);
     error InvalidTransactionStatus(uint256 txId);
     error TransactionExpired(uint256 txId);
     error PriceDeviationTooHigh(uint256 expected, uint256 actual, uint256 maxBps);
     error Unauthorized();
+    error OracleCallFailed(address oracle, address asset);
+    error OraclePriceZero(address oracle, address asset);
+    error OracleNotSet();
 
     // =============================================================================
     // 核心查询函数

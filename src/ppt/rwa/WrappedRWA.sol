@@ -88,6 +88,15 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     /// @notice 赎回者地址映射（txId => receiver）
     mapping(uint256 => address) private _redemptionReceivers;
 
+    /// @notice 购买交易的原始 shares 数量（txId => shares）
+    mapping(uint256 => uint256) private _purchaseShares;
+
+    /// @notice 购买交易的 shares 接收者（txId => receiver）
+    mapping(uint256 => address) private _purchaseReceivers;
+
+    /// @notice 赎回交易的原始 shares 数量（txId => shares）
+    mapping(uint256 => uint256) private _redemptionShares;
+
     // =============================================================================
     // Configuration
     // =============================================================================
@@ -117,7 +126,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         address admin_
     ) ERC4626(IERC20(usdt_)) ERC20(name_, symbol_) {
         if (underlying_ == address(0) || usdt_ == address(0) || admin_ == address(0)) {
-            revert ZeroAmount();
+            revert ZeroAddress();
         }
 
         underlyingAsset = IERC20(underlying_);
@@ -144,9 +153,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     ///      3. 这确保了在 RWA 到账但还没 confirm 时，NAV 保持稳定
     function totalAssets() public view override(ERC4626, IERC4626) returns (uint256) {
         // 1. 已确认 tokens 的市场价值（扣除已锁定待赎回的）
-        uint256 availableConfirmed =
-            confirmedTokenBalance > pendingRedemptionTokens ? confirmedTokenBalance - pendingRedemptionTokens : 0;
-        uint256 confirmedValue = _tokenToUsdt(availableConfirmed);
+        uint256 confirmedValue = _tokenToUsdt(_availableConfirmedTokens());
 
         // 2. pending 购买的 USDT（成本价，确定的）
         return confirmedValue + pendingPurchaseUSDT;
@@ -174,6 +181,10 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
 
         // 记录 pending 购买
         uint256 txId = _createPurchaseTransaction(assets, msg.sender);
+
+        // 记录原始 shares 和 receiver（用于取消时销毁）
+        _purchaseShares[txId] = shares;
+        _purchaseReceivers[txId] = receiver;
 
         // 更新 pending 状态
         pendingPurchaseUSDT += assets;
@@ -208,14 +219,16 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         uint256 tokensToLock = _usdtToToken(assets);
 
         // 检查可用的已确认 token（不含已锁定待赎回的）
-        uint256 available =
-            confirmedTokenBalance > pendingRedemptionTokens ? confirmedTokenBalance - pendingRedemptionTokens : 0;
+        uint256 available = _availableConfirmedTokens();
         if (available < tokensToLock) {
             revert InsufficientBalance(available, tokensToLock);
         }
 
         // 记录 pending 赎回
         uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, msg.sender);
+
+        // 记录原始 shares 数量（用于取消时退还相同数量）
+        _redemptionShares[txId] = shares;
 
         // 更新 pending 状态
         pendingRedemptionTokens += tokensToLock;
@@ -246,13 +259,15 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         _burn(owner, shares);
 
         uint256 tokensToLock = _usdtToToken(assets);
-        uint256 available =
-            confirmedTokenBalance > pendingRedemptionTokens ? confirmedTokenBalance - pendingRedemptionTokens : 0;
+        uint256 available = _availableConfirmedTokens();
         if (available < tokensToLock) {
             revert InsufficientBalance(available, tokensToLock);
         }
 
         uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, msg.sender);
+
+        // 记录原始 shares 数量（用于取消时退还相同数量）
+        _redemptionShares[txId] = shares;
 
         pendingRedemptionTokens += tokensToLock;
         pendingRedemptionUSDT += assets;
@@ -280,6 +295,10 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
 
         uint256 txId = _createPurchaseTransaction(assets, msg.sender);
 
+        // 记录原始 shares 和 receiver（用于取消时销毁）
+        _purchaseShares[txId] = shares;
+        _purchaseReceivers[txId] = receiver;
+
         pendingPurchaseUSDT += assets;
 
         emit Deposit(msg.sender, receiver, assets, shares);
@@ -306,6 +325,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         if (tx_.status != TransactionStatus.PENDING) revert InvalidTransactionStatus(txId);
         if (tx_.txType != TransactionType.PURCHASE) revert InvalidTransactionStatus(txId);
         if (block.timestamp > tx_.expiresAt) revert TransactionExpired(txId);
+        if (actualTokensReceived == 0) revert ZeroAmount();
 
         // 计算实际价格
         uint256 actualPrice = (tx_.usdtAmount * PRECISION) / actualTokensReceived;
@@ -332,13 +352,24 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         emit PurchaseCompleted(txId, actualTokensReceived, actualPrice, priceDelta);
     }
 
-    /// @notice 取消购买（退还 USDT）
+    /// @notice 取消购买（退还 USDT，销毁 shares）
+    /// @dev 要求 receiver 持有足够的原始 shares 来销毁
     function cancelPurchase(uint256 txId, string calldata reason) external override onlyRole(KEEPER_ROLE) nonReentrant {
         Transaction storage tx_ = _transactions[txId];
 
         if (tx_.txId == 0) revert TransactionNotFound(txId);
         if (tx_.status != TransactionStatus.PENDING) revert InvalidTransactionStatus(txId);
         if (tx_.txType != TransactionType.PURCHASE) revert InvalidTransactionStatus(txId);
+
+        // 获取原始 shares 数量和 receiver
+        uint256 originalShares = _purchaseShares[txId];
+        address receiver = _purchaseReceivers[txId];
+
+        // 检查 receiver 是否持有足够的 shares
+        uint256 receiverBalance = balanceOf(receiver);
+        if (receiverBalance < originalShares) {
+            revert InsufficientShares(receiver, receiverBalance, originalShares);
+        }
 
         tx_.status = TransactionStatus.CANCELLED;
         tx_.completedAt = block.timestamp;
@@ -347,20 +378,19 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         pendingPurchaseUSDT -= tx_.usdtAmount;
         pendingPurchaseTokens -= tx_.tokenAmount;
 
-        // 计算应退还的 shares（按当前价格）
-        uint256 sharesToBurn = previewDeposit(tx_.usdtAmount);
+        // 销毁 receiver 的原始 shares（保持 totalAssets/totalSupply 一致）
+        _burn(receiver, originalShares);
 
-        // 这里有个问题：shares 已经铸造给了 receiver
-        // 取消时需要从某处回收或记录为损失
-        // 简化处理：退还 USDT 给 initiator，shares 保持不变（协议承担损失）
-        // 或者：要求 initiator 持有足够的 shares 来销毁
-
-        // 退还 USDT
+        // 退还 USDT 给 initiator
         usdt.safeTransfer(tx_.initiator, tx_.usdtAmount);
+
+        // 清理映射
+        delete _purchaseShares[txId];
+        delete _purchaseReceivers[txId];
 
         _removeActiveTransaction(txId);
 
-        emit PurchaseCancelled(txId, reason);
+        emit PurchaseCancelled(txId, originalShares, reason);
     }
 
     /// @notice 确认赎回完成（USDT 已收到）
@@ -376,6 +406,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         if (tx_.status != TransactionStatus.PENDING) revert InvalidTransactionStatus(txId);
         if (tx_.txType != TransactionType.REDEMPTION) revert InvalidTransactionStatus(txId);
         if (block.timestamp > tx_.expiresAt) revert TransactionExpired(txId);
+        if (actualUsdtReceived == 0) revert ZeroAmount();
 
         // 计算实际价格
         uint256 actualPrice = (actualUsdtReceived * PRECISION) / tx_.tokenAmount;
@@ -383,18 +414,25 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         // 检查价格偏差
         _validatePriceDeviation(tx_.lockedPrice, actualPrice);
 
+        // 保存原始预期 USDT 值用于 pending 状态计算
+        uint256 expectedUsdt = tx_.usdtAmount;
+
         tx_.usdtAmount = actualUsdtReceived;
         tx_.status = TransactionStatus.COMPLETED;
         tx_.completedAt = block.timestamp;
 
-        // 清除 pending 状态，减少已确认余额（tokens 被卖出）
+        // 清除 pending 状态（使用原始 expectedUsdt），减少已确认余额（tokens 被卖出）
         pendingRedemptionTokens -= tx_.tokenAmount;
-        pendingRedemptionUSDT -= tx_.usdtAmount;
+        pendingRedemptionUSDT -= expectedUsdt;
         confirmedTokenBalance -= tx_.tokenAmount;
 
         // 转 USDT 给 receiver
         address receiver = _redemptionReceivers[txId];
         usdt.safeTransfer(receiver, actualUsdtReceived);
+
+        // 清理映射
+        delete _redemptionReceivers[txId];
+        delete _redemptionShares[txId];
 
         _removeActiveTransaction(txId);
 
@@ -403,7 +441,8 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         emit RedemptionCompleted(txId, actualUsdtReceived, actualPrice, priceDelta);
     }
 
-    /// @notice 取消赎回（退还 token）
+    /// @notice 取消赎回（退还原始 shares）
+    /// @dev 使用原始 shares 数量而非当前价格计算，避免套利
     function cancelRedemption(uint256 txId, string calldata reason)
         external
         override
@@ -423,14 +462,18 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         pendingRedemptionTokens -= tx_.tokenAmount;
         pendingRedemptionUSDT -= tx_.usdtAmount;
 
-        // 重新铸造 shares 给 receiver（补偿）
+        // 重新铸造原始 shares 给 receiver（使用原始数量，避免套利）
         address receiver = _redemptionReceivers[txId];
-        uint256 sharesToMint = previewDeposit(tx_.usdtAmount);
-        _mint(receiver, sharesToMint);
+        uint256 originalShares = _redemptionShares[txId];
+        _mint(receiver, originalShares);
+
+        // 清理映射
+        delete _redemptionReceivers[txId];
+        delete _redemptionShares[txId];
 
         _removeActiveTransaction(txId);
 
-        emit RedemptionCancelled(txId, reason);
+        emit RedemptionCancelled(txId, originalShares, reason);
     }
 
     // =============================================================================
@@ -459,7 +502,86 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
 
     /// @notice 可用于赎回的 token 数量（已确认余额减去已锁定待赎回的）
     function availableTokens() external view returns (uint256) {
+        return _availableConfirmedTokens();
+    }
+
+    /// @notice 内部函数：获取可用的已确认 token
+    function _availableConfirmedTokens() internal view returns (uint256) {
         return confirmedTokenBalance > pendingRedemptionTokens ? confirmedTokenBalance - pendingRedemptionTokens : 0;
+    }
+
+    // =============================================================================
+    // Expired Transaction Handling
+    // =============================================================================
+
+    /// @notice 处理过期交易（任何人可调用）
+    /// @dev 过期的购买交易：销毁 shares，退还 USDT
+    ///      过期的赎回交易：退还原始 shares
+    function expireTransaction(uint256 txId) external nonReentrant {
+        Transaction storage tx_ = _transactions[txId];
+
+        if (tx_.txId == 0) revert TransactionNotFound(txId);
+        if (tx_.status != TransactionStatus.PENDING) revert InvalidTransactionStatus(txId);
+        if (block.timestamp <= tx_.expiresAt) revert InvalidTransactionStatus(txId); // 尚未过期
+
+        tx_.status = TransactionStatus.EXPIRED;
+        tx_.completedAt = block.timestamp;
+
+        if (tx_.txType == TransactionType.PURCHASE) {
+            _handleExpiredPurchase(txId, tx_);
+        } else {
+            _handleExpiredRedemption(txId, tx_);
+        }
+
+        _removeActiveTransaction(txId);
+
+        emit TransactionExpiredAndProcessed(txId, tx_.txType);
+    }
+
+    /// @notice 处理过期购买交易
+    function _handleExpiredPurchase(uint256 txId, Transaction storage tx_) internal {
+        uint256 originalShares = _purchaseShares[txId];
+        address receiver = _purchaseReceivers[txId];
+
+        // 清除 pending 状态
+        pendingPurchaseUSDT -= tx_.usdtAmount;
+        pendingPurchaseTokens -= tx_.tokenAmount;
+
+        // 尝试销毁 shares（如果 receiver 持有足够的）
+        uint256 receiverBalance = balanceOf(receiver);
+        uint256 sharesToBurn = receiverBalance >= originalShares ? originalShares : receiverBalance;
+
+        if (sharesToBurn > 0) {
+            _burn(receiver, sharesToBurn);
+        }
+
+        // 退还 USDT 给 initiator
+        usdt.safeTransfer(tx_.initiator, tx_.usdtAmount);
+
+        // 清理映射
+        delete _purchaseShares[txId];
+        delete _purchaseReceivers[txId];
+
+        emit PurchaseCancelled(txId, sharesToBurn, "Expired");
+    }
+
+    /// @notice 处理过期赎回交易
+    function _handleExpiredRedemption(uint256 txId, Transaction storage tx_) internal {
+        address receiver = _redemptionReceivers[txId];
+        uint256 originalShares = _redemptionShares[txId];
+
+        // 清除 pending 状态
+        pendingRedemptionTokens -= tx_.tokenAmount;
+        pendingRedemptionUSDT -= tx_.usdtAmount;
+
+        // 退还原始 shares
+        _mint(receiver, originalShares);
+
+        // 清理映射
+        delete _redemptionReceivers[txId];
+        delete _redemptionShares[txId];
+
+        emit RedemptionCancelled(txId, originalShares, "Expired");
     }
 
     // =============================================================================
@@ -479,18 +601,34 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     }
 
     /// @notice 设置价格预言机
+    /// @dev 验证新 Oracle 是否能正常工作
     function setOracle(address oracle_) external onlyRole(ADMIN_ROLE) {
+        if (oracle_ == address(0)) revert ZeroAddress();
+
+        // 验证 oracle 接口是否可调用
+        (bool success,) = oracle_.staticcall(abi.encodeWithSignature("getPrice(address)", address(underlyingAsset)));
+        if (!success) {
+            revert OracleCallFailed(oracle_, address(underlyingAsset));
+        }
+
+        address oldOracle = oracle;
         oracle = oracle_;
+
+        emit OracleUpdated(oldOracle, oracle_);
     }
 
     /// @notice 授权 Vault 角色
     function grantVaultRole(address vault) external onlyRole(ADMIN_ROLE) {
+        if (vault == address(0)) revert ZeroAddress();
         _grantRole(VAULT_ROLE, vault);
+        emit VaultRoleGranted(vault);
     }
 
     /// @notice 紧急提取
     function emergencyWithdraw(address token, uint256 amount, address to) external override onlyRole(ADMIN_ROLE) {
+        if (to == address(0)) revert ZeroAddress();
         IERC20(token).safeTransfer(to, amount);
+        emit EmergencyWithdraw(token, amount, to);
     }
 
     /// @notice 暂停
@@ -568,17 +706,26 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     }
 
     /// @notice 获取底层资产价格
+    /// @dev Oracle 失败时 revert，不再静默回退到默认值
     function _getUnderlyingPrice() internal view returns (uint256) {
         if (oracle == address(0)) {
-            return PRECISION; // 默认 1:1
+            revert OracleNotSet();
         }
+
         // 调用 oracle 获取价格
         (bool success, bytes memory data) =
             oracle.staticcall(abi.encodeWithSignature("getPrice(address)", address(underlyingAsset)));
-        if (success && data.length >= 32) {
-            return abi.decode(data, (uint256));
+
+        if (!success || data.length < 32) {
+            revert OracleCallFailed(oracle, address(underlyingAsset));
         }
-        return PRECISION;
+
+        uint256 price = abi.decode(data, (uint256));
+        if (price == 0) {
+            revert OraclePriceZero(oracle, address(underlyingAsset));
+        }
+
+        return price;
     }
 
     /// @notice Token 转换为 USDT
