@@ -233,9 +233,11 @@ contract WrappedRWATest is Test {
         uint256 assets = wrapper.redeem(redeemShares, vault, vault);
 
         // 验证状态
-        assertEq(wrapper.balanceOf(vault), 500_000e18, "Remaining shares");
+        assertEq(wrapper.balanceOf(vault), depositAmount, "Shares should remain (locked, not burned)");
+        assertEq(wrapper.lockedShares(vault), redeemShares, "Shares should be locked");
         assertEq(wrapper.pendingRedemptionTokens(), 500_000e18, "Pending tokens locked");
-        assertGt(wrapper.pendingRedemptionUSDT(), 0, "Pending USDT recorded");
+        assertEq(wrapper.pendingRedemptionUSDT(), assets, "Pending USDT recorded");
+        assertEq(wrapper.totalAssets(), depositAmount, "Total assets should remain stable");
     }
 
     function test_confirm_redemption() public {
@@ -258,6 +260,11 @@ contract WrappedRWATest is Test {
         uint256[] memory txIds = wrapper.getActiveTransactions();
         assertEq(txIds.length, 1, "Should have redemption transaction");
 
+        // 赎回发起后 shares 仍在 Vault（但被锁定）
+        assertEq(wrapper.balanceOf(vault), depositAmount, "Shares should remain (locked, not burned)");
+        assertEq(wrapper.lockedShares(vault), 500_000e18, "Shares should be locked");
+        assertEq(wrapper.totalAssets(), depositAmount, "Total assets should remain stable");
+
         // 记录 vault USDT 余额
         uint256 usdtBefore = usdt.balanceOf(vault);
 
@@ -275,6 +282,11 @@ contract WrappedRWATest is Test {
         // 验证 pending 清除
         assertEq(wrapper.pendingRedemptionTokens(), 0, "Pending tokens cleared");
         assertEq(wrapper.pendingRedemptionUSDT(), 0, "Pending USDT cleared");
+
+        // 结算时 burn 锁定的 shares
+        assertEq(wrapper.lockedShares(vault), 0, "Shares should be unlocked");
+        assertEq(wrapper.balanceOf(vault), 500_000e18, "Shares should be burned on confirm");
+        assertEq(wrapper.totalSupply(), 500_000e18, "Total supply reduced on confirm");
     }
 
     // ========== Oracle 测试 ==========

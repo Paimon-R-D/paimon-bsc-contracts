@@ -139,12 +139,9 @@ contract WrappedRWASingleAdapter is AccessControl, ReentrancyGuard {
     function redeem(address vault_, uint256 sharesAmount) external nonReentrant onlyRole(CALLER_ROLE) {
         if (sharesAmount == 0) revert ZeroAmount();
 
-        // 1. 从 Vault 转入 WrappedRWA shares
-        IERC20(address(wrapper)).safeTransferFrom(vault_, address(this), sharesAmount);
-
-        // 2. 调用 WrappedRWA.redeem，请求 USDT
-        // 注意：USDT 不会立即到账，而是在 Keeper 确认后发送
-        uint256 assets = wrapper.redeem(sharesAmount, vault_, address(this));
+        // 调用 WrappedRWA.redeem，锁定 shares 并创建 pending 赎回
+        // 注意：USDT 不会立即到账，而是在 Keeper 确认后发送；shares 会锁定在 Vault 内部以保持 NAV 稳定
+        uint256 assets = wrapper.redeem(sharesAmount, vault_, vault_);
 
         emit Redeem(vault_, sharesAmount, assets);
     }

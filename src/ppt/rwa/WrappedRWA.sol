@@ -97,6 +97,10 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     /// @notice 赎回交易的原始 shares 数量（txId => shares）
     mapping(uint256 => uint256) private _redemptionShares;
 
+    /// @notice 赎回锁定的 shares（owner => locked shares）
+    /// @dev 用于在赎回非原子化期间保持 Vault 持仓不变，避免 NAV 短时暴跌
+    mapping(address => uint256) public lockedShares;
+
     // =============================================================================
     // Configuration
     // =============================================================================
@@ -146,17 +150,18 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     // ERC4626 Overrides - 核心：对外原子化接口
     // =============================================================================
 
-    /// @notice 总资产 = 已确认 RWA 的市场价值 + pending 购买的 USDT（成本价）
+    /// @notice 总资产 = 已确认 RWA 的市场价值 + pending 购买的 USDT（成本价）+ pending 赎回的 USDT（成本价）
     /// @dev 关键设计：
     ///      1. pending 购买期间使用 USDT 成本价，而非预估 token 价值
     ///      2. 只计算已确认的 tokens（通过 confirmPurchase 确认的）
-    ///      3. 这确保了在 RWA 到账但还没 confirm 时，NAV 保持稳定
+    ///      3. pending 赎回期间使用 USDT 预期值（成本价）并锁定 shares（不 burn），NAV 保持稳定
     function totalAssets() public view override(ERC4626, IERC4626) returns (uint256) {
         // 1. 已确认 tokens 的市场价值（扣除已锁定待赎回的）
         uint256 confirmedValue = _tokenToUsdt(_availableConfirmedTokens());
 
         // 2. pending 购买的 USDT（成本价，确定的）
-        return confirmedValue + pendingPurchaseUSDT;
+        // 3. pending 赎回的 USDT（成本价，确定的，属于被锁定的 shares）
+        return confirmedValue + pendingPurchaseUSDT + pendingRedemptionUSDT;
     }
 
     /// @notice Vault 存入 USDT，获得 WrappedRWA
@@ -195,7 +200,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     }
 
     /// @notice Vault 赎回 WrappedRWA，获得 USDT
-    /// @dev 立即销毁 shares，USDT 在交易完成后支付
+    /// @dev 锁定 shares（不 burn），USDT 在交易完成后支付
     function withdraw(uint256 assets, address receiver, address owner)
         public
         override(ERC4626, IERC4626)
@@ -212,8 +217,14 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
             _spendAllowance(owner, msg.sender, shares);
         }
 
-        // 立即销毁 shares
-        _burn(owner, shares);
+        // 锁定 shares（不 burn），避免赎回非原子化期间 Vault 持仓减少导致 NAV 暴跌
+        uint256 ownerBalance = balanceOf(owner);
+        uint256 ownerLocked = lockedShares[owner];
+        uint256 unlockedShares = ownerBalance > ownerLocked ? ownerBalance - ownerLocked : 0;
+        if (unlockedShares < shares) {
+            revert InsufficientShares(owner, unlockedShares, shares);
+        }
+        lockedShares[owner] += shares;
 
         // 计算需要锁定的 token 数量
         uint256 tokensToLock = _usdtToToken(assets);
@@ -225,9 +236,9 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         }
 
         // 记录 pending 赎回
-        uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, msg.sender);
+        uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, owner);
 
-        // 记录原始 shares 数量（用于取消时退还相同数量）
+        // 记录锁定的 shares 数量（用于取消时解锁 / confirm 时 burn）
         _redemptionShares[txId] = shares;
 
         // 更新 pending 状态
@@ -256,7 +267,14 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
             _spendAllowance(owner, msg.sender, shares);
         }
 
-        _burn(owner, shares);
+        // 锁定 shares（不 burn），避免赎回非原子化期间 Vault 持仓减少导致 NAV 暴跌
+        uint256 ownerBalance = balanceOf(owner);
+        uint256 ownerLocked = lockedShares[owner];
+        uint256 unlockedShares = ownerBalance > ownerLocked ? ownerBalance - ownerLocked : 0;
+        if (unlockedShares < shares) {
+            revert InsufficientShares(owner, unlockedShares, shares);
+        }
+        lockedShares[owner] += shares;
 
         uint256 tokensToLock = _usdtToToken(assets);
         uint256 available = _availableConfirmedTokens();
@@ -264,9 +282,9 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
             revert InsufficientBalance(available, tokensToLock);
         }
 
-        uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, msg.sender);
+        uint256 txId = _createRedemptionTransaction(tokensToLock, assets, receiver, owner);
 
-        // 记录原始 shares 数量（用于取消时退还相同数量）
+        // 记录锁定的 shares 数量（用于取消时解锁 / confirm 时 burn）
         _redemptionShares[txId] = shares;
 
         pendingRedemptionTokens += tokensToLock;
@@ -353,7 +371,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     }
 
     /// @notice 取消购买（退还 USDT，销毁 shares）
-    /// @dev 要求 receiver 持有足够的原始 shares 来销毁
+    /// @dev 要求 receiver 持有足够的未锁定 shares 来销毁
     function cancelPurchase(uint256 txId, string calldata reason) external override onlyRole(KEEPER_ROLE) nonReentrant {
         Transaction storage tx_ = _transactions[txId];
 
@@ -365,10 +383,12 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         uint256 originalShares = _purchaseShares[txId];
         address receiver = _purchaseReceivers[txId];
 
-        // 检查 receiver 是否持有足够的 shares
+        // 检查 receiver 是否持有足够的未锁定 shares
         uint256 receiverBalance = balanceOf(receiver);
-        if (receiverBalance < originalShares) {
-            revert InsufficientShares(receiver, receiverBalance, originalShares);
+        uint256 receiverLocked = lockedShares[receiver];
+        uint256 receiverUnlocked = receiverBalance > receiverLocked ? receiverBalance - receiverLocked : 0;
+        if (receiverUnlocked < originalShares) {
+            revert InsufficientShares(receiver, receiverUnlocked, originalShares);
         }
 
         tx_.status = TransactionStatus.CANCELLED;
@@ -430,6 +450,14 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         address receiver = _redemptionReceivers[txId];
         usdt.safeTransfer(receiver, actualUsdtReceived);
 
+        // burn 已锁定 shares（原子化结算时同步移除 supply）
+        uint256 sharesToBurn = _redemptionShares[txId];
+        address shareOwner = tx_.initiator;
+        if (sharesToBurn > 0) {
+            lockedShares[shareOwner] -= sharesToBurn;
+            _burn(shareOwner, sharesToBurn);
+        }
+
         // 清理映射
         delete _redemptionReceivers[txId];
         delete _redemptionShares[txId];
@@ -441,8 +469,8 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         emit RedemptionCompleted(txId, actualUsdtReceived, actualPrice, priceDelta);
     }
 
-    /// @notice 取消赎回（退还原始 shares）
-    /// @dev 使用原始 shares 数量而非当前价格计算，避免套利
+    /// @notice 取消赎回（解锁原始 shares）
+    /// @dev 使用原始 shares 数量解锁，避免套利
     function cancelRedemption(uint256 txId, string calldata reason)
         external
         override
@@ -462,10 +490,12 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         pendingRedemptionTokens -= tx_.tokenAmount;
         pendingRedemptionUSDT -= tx_.usdtAmount;
 
-        // 重新铸造原始 shares 给 receiver（使用原始数量，避免套利）
-        address receiver = _redemptionReceivers[txId];
+        // 解锁原始 shares（不 mint）
+        address shareOwner = tx_.initiator;
         uint256 originalShares = _redemptionShares[txId];
-        _mint(receiver, originalShares);
+        if (originalShares > 0) {
+            lockedShares[shareOwner] -= originalShares;
+        }
 
         // 清理映射
         delete _redemptionReceivers[txId];
@@ -516,7 +546,7 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
 
     /// @notice 处理过期交易（任何人可调用）
     /// @dev 过期的购买交易：销毁 shares，退还 USDT
-    ///      过期的赎回交易：退还原始 shares
+    ///      过期的赎回交易：解锁原始 shares
     function expireTransaction(uint256 txId) external nonReentrant {
         Transaction storage tx_ = _transactions[txId];
 
@@ -547,9 +577,11 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
         pendingPurchaseUSDT -= tx_.usdtAmount;
         pendingPurchaseTokens -= tx_.tokenAmount;
 
-        // 尝试销毁 shares（如果 receiver 持有足够的）
+        // 尝试销毁 shares（仅销毁未锁定部分）
         uint256 receiverBalance = balanceOf(receiver);
-        uint256 sharesToBurn = receiverBalance >= originalShares ? originalShares : receiverBalance;
+        uint256 receiverLocked = lockedShares[receiver];
+        uint256 receiverUnlocked = receiverBalance > receiverLocked ? receiverBalance - receiverLocked : 0;
+        uint256 sharesToBurn = receiverUnlocked >= originalShares ? originalShares : receiverUnlocked;
 
         if (sharesToBurn > 0) {
             _burn(receiver, sharesToBurn);
@@ -567,15 +599,17 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
 
     /// @notice 处理过期赎回交易
     function _handleExpiredRedemption(uint256 txId, Transaction storage tx_) internal {
-        address receiver = _redemptionReceivers[txId];
+        address shareOwner = tx_.initiator;
         uint256 originalShares = _redemptionShares[txId];
 
         // 清除 pending 状态
         pendingRedemptionTokens -= tx_.tokenAmount;
         pendingRedemptionUSDT -= tx_.usdtAmount;
 
-        // 退还原始 shares
-        _mint(receiver, originalShares);
+        // 解锁原始 shares（不 mint）
+        if (originalShares > 0) {
+            lockedShares[shareOwner] -= originalShares;
+        }
 
         // 清理映射
         delete _redemptionReceivers[txId];
@@ -785,5 +819,20 @@ contract WrappedRWA is ERC4626, AccessControl, ReentrancyGuard, Pausable, IWrapp
     /// @notice 底层资产（对 ERC4626 来说是 USDT）
     function asset() public view override(ERC4626, IERC4626) returns (address) {
         return address(usdt);
+    }
+
+    /// @dev 阻止转移已锁定的 shares（仅限制 transfer/transferFrom，不影响 mint/burn）
+    function _update(address from, address to, uint256 value) internal override(ERC20) {
+        if (from != address(0) && to != address(0)) {
+            uint256 locked = lockedShares[from];
+            if (locked != 0) {
+                uint256 fromBalance = balanceOf(from);
+                uint256 unlocked = fromBalance > locked ? fromBalance - locked : 0;
+                if (unlocked < value) {
+                    revert InsufficientShares(from, unlocked, value);
+                }
+            }
+        }
+        super._update(from, to, value);
     }
 }
