@@ -2,7 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import {ERC721EnumerableUpgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
+import {
+    ERC721EnumerableUpgradeable
+} from "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721EnumerableUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -35,10 +37,10 @@ contract RedemptionVoucher is
     // =============================================================================
 
     struct VoucherInfo {
-        uint256 requestId;       // Associated redemption request ID
-        uint256 netAmount;     // Redemption amount (USDT, 18 decimals)
-        uint256 settlementTime;  // Settlement date (UNIX timestamp)
-        uint256 mintTime;        // Minting time (UNIX timestamp)
+        uint256 requestId; // Associated redemption request ID
+        uint256 netAmount; // Redemption amount (USDT, 18 decimals)
+        uint256 settlementTime; // Settlement date (UNIX timestamp)
+        uint256 mintTime; // Minting time (UNIX timestamp)
     }
 
     // =============================================================================
@@ -58,9 +60,15 @@ contract RedemptionVoucher is
     // Events
     // =============================================================================
 
-    event VoucherMinted(uint256 indexed tokenId, uint256 indexed requestId, address indexed to, uint256 netAmount, uint256 settlementTime);
+    event VoucherMinted(
+        uint256 indexed tokenId,
+        uint256 indexed requestId,
+        address indexed to,
+        uint256 netAmount,
+        uint256 settlementTime
+    );
     event VoucherBurned(uint256 indexed tokenId, uint256 indexed requestId);
-     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
+    event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
 
     // =============================================================================
     // Errors
@@ -81,7 +89,7 @@ contract RedemptionVoucher is
 
     /// @notice Initialize function (replaces constructor in proxy pattern)
     /// @param adminSig Admin address
-    function initialize(address adminSig,address timerlock) external initializer {
+    function initialize(address adminSig, address timerlock) external initializer {
         __ERC721_init("PPT Redemption Voucher", "PPT-RV");
         __ERC721Enumerable_init();
         __AccessControl_init();
@@ -89,8 +97,7 @@ contract RedemptionVoucher is
 
         _grantRole(DEFAULT_ADMIN_ROLE, adminSig);
         _grantRole(ADMIN_ROLE, adminSig);
-        _grantRole(UPGRADER_ROLE,timerlock);
-        
+        _grantRole(UPGRADER_ROLE, timerlock);
     }
 
     // =============================================================================
@@ -99,7 +106,7 @@ contract RedemptionVoucher is
 
     /// @notice Authorize upgrade (only ADMIN can call)
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(UPGRADER_ROLE) {
-         emit PPTUpgraded(newImplementation, block.timestamp, block.number);
+        emit PPTUpgraded(newImplementation, block.timestamp, block.number);
     }
 
     // =============================================================================
@@ -112,28 +119,23 @@ contract RedemptionVoucher is
     /// @param netAmount Redemption amount
     /// @param settlementTime Settlement time
     /// @return tokenId Minted NFT token ID
-    function mint(
-        address to,
-        uint256 requestId,
-        uint256 netAmount,
-        uint256 settlementTime
-    ) external onlyRole(MINTER_ROLE) returns (uint256 tokenId) {
+    function mint(address to, uint256 requestId, uint256 netAmount, uint256 settlementTime)
+        external
+        onlyRole(MINTER_ROLE)
+        returns (uint256 tokenId)
+    {
         if (requestId == 0) revert InvalidRequestId();
         if (_requestToToken[requestId] != 0) {
             revert RequestAlreadyHasVoucher(requestId);
         }
 
         tokenId = ++_tokenIdCounter;
-       
 
         _voucherInfo[tokenId] = VoucherInfo({
-            requestId: requestId,
-            netAmount: netAmount,
-            settlementTime: settlementTime,
-            mintTime: block.timestamp
+            requestId: requestId, netAmount: netAmount, settlementTime: settlementTime, mintTime: block.timestamp
         });
         _requestToToken[requestId] = tokenId;
-         _safeMint(to, tokenId);
+        _safeMint(to, tokenId);
 
         emit VoucherMinted(tokenId, requestId, to, netAmount, settlementTime);
     }
@@ -157,12 +159,11 @@ contract RedemptionVoucher is
 
     /// @notice Get voucher information
     /// @param tokenId NFT token ID
-    function voucherInfo(uint256 tokenId) external view returns (
-        uint256 requestId,
-        uint256 netAmount,
-        uint256 settlementTime,
-        uint256 mintTime
-    ) {
+    function voucherInfo(uint256 tokenId)
+        external
+        view
+        returns (uint256 requestId, uint256 netAmount, uint256 settlementTime, uint256 mintTime)
+    {
         VoucherInfo memory info = _voucherInfo[tokenId];
         return (info.requestId, info.netAmount, info.settlementTime, info.mintTime);
     }
@@ -175,10 +176,7 @@ contract RedemptionVoucher is
 
     /// @notice Get complete voucher information by requestId
     /// @param requestId Redemption request ID
-    function getVoucherByRequest(uint256 requestId) external view returns (
-        uint256 tokenId,
-        VoucherInfo memory info
-    ) {
+    function getVoucherByRequest(uint256 requestId) external view returns (uint256 tokenId, VoucherInfo memory info) {
         tokenId = _requestToToken[requestId];
         if (tokenId != 0) {
             info = _voucherInfo[tokenId];
@@ -214,18 +212,34 @@ contract RedemptionVoucher is
         string memory svg = _generateSVG(info);
         string memory amountStr = _formatAmount(info.netAmount);
 
-        string memory json = string(abi.encodePacked(
-            '{"name":"PPT Redemption Voucher #', tokenId.toString(),
-            '","description":"Redeemable for ', amountStr, ' USDT. Settlement timestamp: ',
-            info.settlementTime.toString(), '",',
-            '"attributes":[',
-                '{"trait_type":"Request ID","value":"', info.requestId.toString(), '"},',
-                '{"trait_type":"Net Amount (USDT)","value":"', amountStr, '"},',
-                '{"trait_type":"Settlement Time","value":"', info.settlementTime.toString(), '"},',
-                '{"trait_type":"Mint Time","value":"', info.mintTime.toString(), '"}',
-            '],',
-            '"image":"data:image/svg+xml;base64,', Base64.encode(bytes(svg)), '"}'
-        ));
+        string memory json = string(
+            abi.encodePacked(
+                '{"name":"PPT Redemption Voucher #',
+                tokenId.toString(),
+                '","description":"Redeemable for ',
+                amountStr,
+                " USDT. Settlement timestamp: ",
+                info.settlementTime.toString(),
+                '",',
+                '"attributes":[',
+                '{"trait_type":"Request ID","value":"',
+                info.requestId.toString(),
+                '"},',
+                '{"trait_type":"Net Amount (USDT)","value":"',
+                amountStr,
+                '"},',
+                '{"trait_type":"Settlement Time","value":"',
+                info.settlementTime.toString(),
+                '"},',
+                '{"trait_type":"Mint Time","value":"',
+                info.mintTime.toString(),
+                '"}',
+                "],",
+                '"image":"data:image/svg+xml;base64,',
+                Base64.encode(bytes(svg)),
+                '"}'
+            )
+        );
 
         return string(abi.encodePacked("data:application/json;base64,", Base64.encode(bytes(json))));
     }
@@ -234,23 +248,31 @@ contract RedemptionVoucher is
     function _generateSVG(VoucherInfo memory info) internal pure returns (string memory) {
         string memory amountStr = _formatAmount(info.netAmount);
 
-        return string(abi.encodePacked(
-            '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="250" viewBox="0 0 400 250">',
-            '<defs><linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">',
-            '<stop offset="0%" style="stop-color:#1a1a2e"/>',
-            '<stop offset="100%" style="stop-color:#16213e"/>',
-            '</linearGradient></defs>',
-            '<rect width="400" height="250" fill="url(#bg)" rx="15"/>',
-            '<text x="200" y="35" fill="#fff" font-size="18" text-anchor="middle" font-family="Arial" font-weight="bold">PNGY Redemption Voucher</text>',
-            '<line x1="40" y1="55" x2="360" y2="55" stroke="#4ade80" stroke-width="2"/>',
-            '<text x="200" y="110" fill="#4ade80" font-size="42" text-anchor="middle" font-family="Arial" font-weight="bold">', amountStr, '</text>',
-            '<text x="200" y="140" fill="#9ca3af" font-size="16" text-anchor="middle" font-family="Arial">USDT</text>',
-            '<text x="40" y="190" fill="#6b7280" font-size="12" font-family="Arial">Request #', info.requestId.toString(), '</text>',
-            '<text x="360" y="190" fill="#6b7280" font-size="12" text-anchor="end" font-family="Arial">Settlement: ', info.settlementTime.toString(), '</text>',
-            '<rect x="40" y="210" width="320" height="25" fill="#0f172a" rx="5"/>',
-            '<text x="200" y="227" fill="#94a3b8" font-size="10" text-anchor="middle" font-family="Arial">Transferable - Present to redeem USDT</text>',
-            '</svg>'
-        ));
+        return string(
+            abi.encodePacked(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="250" viewBox="0 0 400 250">',
+                '<defs><linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">',
+                '<stop offset="0%" style="stop-color:#1a1a2e"/>',
+                '<stop offset="100%" style="stop-color:#16213e"/>',
+                "</linearGradient></defs>",
+                '<rect width="400" height="250" fill="url(#bg)" rx="15"/>',
+                '<text x="200" y="35" fill="#fff" font-size="18" text-anchor="middle" font-family="Arial" font-weight="bold">PNGY Redemption Voucher</text>',
+                '<line x1="40" y1="55" x2="360" y2="55" stroke="#4ade80" stroke-width="2"/>',
+                '<text x="200" y="110" fill="#4ade80" font-size="42" text-anchor="middle" font-family="Arial" font-weight="bold">',
+                amountStr,
+                "</text>",
+                '<text x="200" y="140" fill="#9ca3af" font-size="16" text-anchor="middle" font-family="Arial">USDT</text>',
+                '<text x="40" y="190" fill="#6b7280" font-size="12" font-family="Arial">Request #',
+                info.requestId.toString(),
+                "</text>",
+                '<text x="360" y="190" fill="#6b7280" font-size="12" text-anchor="end" font-family="Arial">Settlement: ',
+                info.settlementTime.toString(),
+                "</text>",
+                '<rect x="40" y="210" width="320" height="25" fill="#0f172a" rx="5"/>',
+                '<text x="200" y="227" fill="#94a3b8" font-size="10" text-anchor="middle" font-family="Arial">Transferable - Present to redeem USDT</text>',
+                "</svg>"
+            )
+        );
     }
 
     /// @notice Format amount (18 decimals -> integer string)
@@ -262,24 +284,27 @@ contract RedemptionVoucher is
     // Required Overrides
     // =============================================================================
 
-    function _update(
-        address to,
-        uint256 tokenId,
-        address auth
-    ) internal override(ERC721Upgradeable, ERC721EnumerableUpgradeable) returns (address) {
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+        returns (address)
+    {
         return super._update(to, tokenId, auth);
     }
 
-    function _increaseBalance(
-        address account,
-        uint128 value
-    ) internal override(ERC721Upgradeable, ERC721EnumerableUpgradeable) {
+    function _increaseBalance(address account, uint128 value)
+        internal
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable)
+    {
         super._increaseBalance(account, value);
     }
 
-    function supportsInterface(
-        bytes4 interfaceId
-    ) public view override(ERC721Upgradeable, ERC721EnumerableUpgradeable, AccessControlUpgradeable) returns (bool) {
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC721Upgradeable, ERC721EnumerableUpgradeable, AccessControlUpgradeable)
+        returns (bool)
+    {
         return super.supportsInterface(interfaceId);
     }
 }
