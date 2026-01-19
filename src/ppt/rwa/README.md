@@ -46,7 +46,8 @@
 │     (ERC4626)            │    │     (ERC4626)            │
 │                          │    │                          │
 │ totalAssets() =          │    │ totalAssets() =          │
-│   heldTokens × price     │    │   heldTokens × price     │
+│   confirmedTokenBalance  │    │   confirmedTokenBalance  │
+│   × price                │    │   × price                │
 │   + pendingPurchaseUSDT  │    │   + pendingPurchaseUSDT  │
 └────────────┬─────────────┘    └────────────┬─────────────┘
              │                               │
@@ -58,43 +59,59 @@
 
 ## 三、关键设计：NAV 计算
 
-### 成本价模式（推荐）
+### 成本价模式 + 已确认余额追踪
 
-在 pending 期间使用 **USDT 成本价**，而非预估 token 价值：
+核心创新：使用 `confirmedTokenBalance` 追踪已确认的 token 余额，而非实时读取合约余额。
 
 ```solidity
 // WrappedRWA.totalAssets()
 function totalAssets() public view returns (uint256) {
-    // 1. 实际持有的 RWA token 价值
-    uint256 heldValue = underlyingAsset.balanceOf(address(this)) * price;
+    // 1. 已确认 tokens 的市场价值（扣除已锁定待赎回的）
+    uint256 availableConfirmed = confirmedTokenBalance > pendingRedemptionTokens
+        ? confirmedTokenBalance - pendingRedemptionTokens
+        : 0;
+    uint256 confirmedValue = _tokenToUsdt(availableConfirmed);
 
     // 2. pending 购买的 USDT（成本价，确定的）
-    return heldValue + pendingPurchaseUSDT;
+    return confirmedValue + pendingPurchaseUSDT;
 }
 ```
 
-### 为什么用成本价？
+### 关键状态变量
+
+| 变量 | 说明 |
+|------|------|
+| `pendingPurchaseUSDT` | 待完成购买的 USDT 总额 |
+| `pendingPurchaseTokens` | 预期收到的 token 数量（用于内部计算） |
+| `confirmedTokenBalance` | 已确认的 token 余额（通过 confirmPurchase 确认的） |
+| `pendingRedemptionTokens` | 已锁定待赎回的 token 数量 |
+| `pendingRedemptionUSDT` | 预期要支付的赎回 USDT |
+
+### 为什么用 confirmedTokenBalance？
 
 ```
 场景：购买 100万 T-Bill
 
 T0: 发起购买，价格 $1.00
-    如果用"预估 token 价值"：NAV = 100万 × $1.00 = 100万
-    如果用"成本价"：NAV = 100万 USDT = 100万
-    → 此时两者相同
+    pendingPurchaseUSDT = 100万
+    confirmedTokenBalance = 0
+    totalAssets = 0 + 100万 = 100万 ✓
 
-T+15min: 价格跌到 $0.95
-    如果用"预估 token 价值"：NAV = 100万 × $0.95 = 95万 ← 波动！
-    如果用"成本价"：NAV = 100万 USDT = 100万 ← 稳定！
+T+15min: 价格跌到 $0.95，RWA 到账（但还没 confirm）
+    实际收到 1,052,631 tokens（价格低买到更多）
+    pendingPurchaseUSDT = 100万（未变）
+    confirmedTokenBalance = 0（未 confirm）
+    totalAssets = 0 + 100万 = 100万 ✓ NAV 稳定！
 
-T+30min: 交易完成，实际收到 105万 T-Bill（因为价格低买到更多）
-    NAV = 105万 × $0.95 = 99.75万
+T+30min: Keeper 调用 confirmPurchase
+    pendingPurchaseUSDT = 0（清除）
+    confirmedTokenBalance = 1,052,631
+    totalAssets = 1,052,631 × $0.95 ≈ 99.75万
 
-    成本价模式的"跳变"：100万 → 99.75万（-0.25%）
-    实时价格模式的"跳变"：95万 → 99.75万（+5%）
+    NAV 变化：100万 → 99.75万（-0.25%）← 可接受的市场波动
 ```
 
-**结论**：成本价模式的跳变更小、更可预测。
+**对比实时余额模式**：如果使用 `underlyingAsset.balanceOf()`，RWA 到账时会立即影响 NAV，导致波动。
 
 ## 四、完整交易流程
 
@@ -115,9 +132,10 @@ REBALANCER                AssetController           Adapter              Wrapped
     │                           │                     │─────────────────────>│                     │
     │                           │                     │                      │                     │
     │                           │                     │                      │ mint shares to Vault│
-    │                           │                     │                      │ record pending      │
     │                           │                     │                      │ pendingPurchaseUSDT │
-    │                           │                     │<─────────────────────│   += usdtAmount     │
+    │                           │                     │                      │   += usdtAmount     │
+    │                           │                     │                      │ pendingPurchaseTokens│
+    │                           │                     │<─────────────────────│   += expectedTokens │
     │                           │                     │                      │                     │
     │<──────────────────────────│ return shares       │                      │                     │
     │                           │                     │                      │                     │
@@ -129,9 +147,10 @@ REBALANCER                AssetController           Adapter              Wrapped
     │                           │                     │                      │ confirmPurchase()   │
     │                           │                     │                      │<────────────────────│
     │                           │                     │                      │                     │
-    │                           │                     │                      │ clear pending       │
-    │                           │                     │                      │ verify token balance│
-    │                           │                     │                      │                     │
+    │                           │                     │                      │ pendingPurchaseUSDT │
+    │                           │                     │                      │   -= usdtAmount     │
+    │                           │                     │                      │ confirmedTokenBalance│
+    │                           │                     │                      │   += actualTokens   │
 ```
 
 ### 4.2 赎回流程
@@ -149,10 +168,9 @@ REBALANCER                AssetController           Adapter              Wrapped
     │                           │                     │─────────────────────>│                     │
     │                           │                     │                      │                     │
     │                           │                     │                      │ burn shares         │
-    │                           │                     │                      │ lock tokens         │
-    │                           │                     │                      │ record pending      │
     │                           │                     │                      │ pendingRedemption   │
-    │                           │                     │<─────────────────────│   Tokens += amt     │
+    │                           │                     │                      │   Tokens += amt     │
+    │                           │                     │<─────────────────────│                     │
     │                           │                     │                      │                     │
     │<──────────────────────────│ (USDT 会延迟到账)   │                      │                     │
     │                           │                     │                      │                     │
@@ -164,8 +182,11 @@ REBALANCER                AssetController           Adapter              Wrapped
     │                           │                     │                      │ confirmRedemption() │
     │                           │                     │                      │<────────────────────│
     │                           │                     │                      │                     │
+    │                           │                     │                      │ pendingRedemption   │
+    │                           │                     │                      │   Tokens -= amt     │
+    │                           │                     │                      │ confirmedTokenBalance│
+    │                           │                     │                      │   -= tokenAmount    │
     │                           │                     │                      │ transfer USDT       │
-    │                           │                     │                      │ clear pending       │
     │                           │                     │                      │─────────────────────>│ Vault
 ```
 
@@ -234,7 +255,7 @@ PPT.totalAssets()
                          │    price = oracle.getPrice(wrapper)
                          │    value = balance × price
                          │
-                         │    其中 wrapper.totalAssets() 已包含 pending
+                         │    其中 wrapper.totalAssets() 使用 confirmedTokenBalance
                          │
                          └─ 如果是普通资产：
                               balance × price
@@ -278,19 +299,24 @@ contract WrappedRWAOracle {
 ### 1. 价格偏差保护
 
 ```solidity
-// 确认交易时检查价格偏差
+// 确认交易时检查价格偏差（默认 5%）
 function confirmPurchase(uint256 txId, uint256 actualTokens) {
-    uint256 actualPrice = usdtAmount / actualTokens;
-    uint256 deviation = abs(actualPrice - lockedPrice) / lockedPrice;
+    uint256 actualPrice = usdtAmount * PRECISION / actualTokens;
+    _validatePriceDeviation(tx_.lockedPrice, actualPrice);
+}
 
-    require(deviation <= maxPriceDeviationBps, "Price deviation too high");
+function _validatePriceDeviation(uint256 expected, uint256 actual) {
+    uint256 deviation = abs(actual - expected) * BASIS_POINTS / expected;
+    if (deviation > maxPriceDeviationBps) {
+        revert PriceDeviationTooHigh(expected, actual, maxPriceDeviationBps);
+    }
 }
 ```
 
 ### 2. 过期保护
 
 ```solidity
-// 交易超时自动失效
+// 交易超时自动失效（默认 7 天）
 require(block.timestamp <= tx.expiresAt, "Transaction expired");
 ```
 
@@ -303,6 +329,10 @@ function cancelRedemption(uint256 txId, string reason) onlyKeeper;
 
 // 紧急提取
 function emergencyWithdraw(token, amount, to) onlyAdmin;
+
+// 暂停/恢复
+function pause() external onlyAdmin;
+function unpause() external onlyAdmin;
 ```
 
 ## 十、文件结构
@@ -312,38 +342,40 @@ src/ppt/rwa/
 ├── IWrappedRWA.sol          # 接口定义
 ├── WrappedRWA.sol           # 核心实现
 ├── WrappedRWAAdapter.sol    # AssetController 适配器
-├── WrappedRWAOracle.sol     # 价格预言机（可选）
+├── WrappedRWAOracle.sol     # 价格预言机
 └── README.md                # 本文档
+
+test/
+└── WrappedRWA.t.sol         # 测试套件
 ```
 
-## 十一、测试用例
+## 十一、测试覆盖
 
-```solidity
-// 1. 购买流程测试
-function test_purchase_flow() {
-    // deposit USDT, 立即获得 shares
-    // 验证 pendingPurchaseUSDT 增加
-    // 验证 totalAssets 包含 pending
-    // confirm 后验证 pending 清零
-}
+已实现的测试用例（全部通过）：
 
-// 2. NAV 稳定性测试
-function test_nav_stability_during_purchase() {
-    // 记录初始 NAV
-    // 执行购买
-    // 模拟价格波动
-    // 验证 NAV 保持稳定（成本价模式）
-}
+| 测试 | 说明 |
+|------|------|
+| `test_deposit_creates_pending_purchase` | 存款创建 pending 购买 |
+| `test_nav_stable_during_pending_purchase` | pending 期间 NAV 稳定 |
+| `test_confirm_purchase` | 确认购买流程 |
+| `test_nav_change_after_confirm_with_price_movement` | 确认后 NAV 变化（市场波动） |
+| `test_redeem_creates_pending_redemption` | 赎回创建 pending |
+| `test_confirm_redemption` | 确认赎回流程 |
+| `test_wrapper_oracle_price` | Oracle 价格计算 |
+| `test_adapter_purchase` | Adapter 购买集成 |
+| `test_cancel_purchase` | 取消购买 |
+| `test_price_deviation_check` | 价格偏差保护 |
+| `test_transaction_expiry` | 交易过期机制 |
 
-// 3. 赎回流程测试
-function test_redemption_flow() {
-    // redeem shares
-    // 验证 pendingRedemptionTokens 增加
-    // confirm 后验证 USDT 到账
-}
-
-// 4. 取消测试
-function test_cancel_purchase() {
-    // 取消购买，验证 USDT 返还
-}
+运行测试：
+```bash
+forge test --match-contract WrappedRWATest -vvv
 ```
+
+## 十二、角色权限
+
+| 角色 | 权限 |
+|------|------|
+| `ADMIN_ROLE` | 配置参数、设置 Oracle、授权角色、紧急提取、暂停/恢复 |
+| `KEEPER_ROLE` | confirmPurchase、confirmRedemption、cancelPurchase、cancelRedemption |
+| `VAULT_ROLE` | deposit、withdraw、redeem（可选，用于限制调用方） |
