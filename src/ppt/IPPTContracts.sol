@@ -14,7 +14,7 @@ interface IPPT {
     function totalRedemptionLiability() external view returns (uint256);
     function totalLockedShares() external view returns (uint256);
     function withdrawableRedemptionFees() external view returns (uint256);
-    function totalAccumulatedRedemptionFees()external view returns (uint256);
+    function totalAccumulatedRedemptionFees() external view returns (uint256);
     function lockedSharesOf(address owner) external view returns (uint256);
     function getVaultState() external view returns (PPTTypes.VaultState memory);
 
@@ -111,20 +111,21 @@ interface IAssetController {
     // ========== Asset Operations (REBALANCER Call) ==========
     function purchaseAsset(address token, uint256 usdtAmount) external returns (uint256 tokensReceived);
     function redeemAsset(address token, uint256 tokenAmount) external returns (uint256 usdtReceived);
-    function executeWaterfallLiquidation(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier) external returns (uint256 funded);
+    function executeWaterfallLiquidation(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier)
+        external
+        returns (uint256 funded);
 
     // ========== Layer Configuration (ADMIN Call) ==========
-    function setLayerConfig(
-        PPTTypes.LiquidityTier tier,
-        uint256 targetRatio,
-        uint256 minRatio,
-        uint256 maxRatio
-    ) external;
-    function getLayerConfigs() external view returns (
-        PPTTypes.LayerConfig memory layer1,
-        PPTTypes.LayerConfig memory layer2,
-        PPTTypes.LayerConfig memory layer3
-    );
+    function setLayerConfig(PPTTypes.LiquidityTier tier, uint256 targetRatio, uint256 minRatio, uint256 maxRatio)
+        external;
+    function getLayerConfigs()
+        external
+        view
+        returns (
+            PPTTypes.LayerConfig memory layer1,
+            PPTTypes.LayerConfig memory layer2,
+            PPTTypes.LayerConfig memory layer3
+        );
     function validateLayerRatios() external view returns (bool valid, uint256 totalRatio);
 
     // ========== Redemption Fee Management (ADMIN Call) ==========
@@ -155,13 +156,23 @@ interface IOracleAdapter {
 
 /// @title ISwapHelper
 interface ISwapHelper {
-    function buyRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient) external returns (uint256);
-    function sellRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient) external returns (uint256);
+    function buyRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient)
+        external
+        returns (uint256);
+    function sellRWAAsset(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps, address recipient)
+        external
+        returns (uint256);
 }
 
 /// @title IOTCManager
 interface IOTCManager {
-    function createOrder(address rwaToken, uint256 usdtAmount, uint256 expectedTokens, address counterparty, uint256 expiresIn) external returns (uint256);
+    function createOrder(
+        address rwaToken,
+        uint256 usdtAmount,
+        uint256 expectedTokens,
+        address counterparty,
+        uint256 expiresIn
+    ) external returns (uint256);
     function executePayment(uint256 orderId) external;
     function confirmDelivery(uint256 orderId, uint256 actualTokens) external;
 }
@@ -194,19 +205,24 @@ interface IAssetScheduler {
 /// @notice Redemption voucher NFT interface - Tradeable voucher for long-term redemptions
 interface IRedemptionVoucher {
     struct VoucherInfo {
-        uint256 requestId;       // Associated redemption request ID
-        uint256 netAmount;     // Redemption amount (USDT)
-        uint256 settlementTime;  // Settlement date
-        uint256 mintTime;        // Minting time
+        uint256 requestId; // Associated redemption request ID
+        uint256 netAmount; // Redemption amount (USDT)
+        uint256 settlementTime; // Settlement date
+        uint256 mintTime; // Minting time
     }
 
     // ========== Mint/Burn (RedemptionManager Only) ==========
-    function mint(address to, uint256 requestId, uint256 netAmount, uint256 settlementTime) external returns (uint256 tokenId);
+    function mint(address to, uint256 requestId, uint256 netAmount, uint256 settlementTime)
+        external
+        returns (uint256 tokenId);
     function burn(uint256 tokenId) external;
 
     // ========== Queries ==========
     function ownerOf(uint256 tokenId) external view returns (address);
-    function voucherInfo(uint256 tokenId) external view returns (uint256 requestId, uint256 netAmount, uint256 settlementTime, uint256 mintTime);
+    function voucherInfo(uint256 tokenId)
+        external
+        view
+        returns (uint256 requestId, uint256 netAmount, uint256 settlementTime, uint256 mintTime);
     function requestToToken(uint256 requestId) external view returns (uint256 tokenId);
     function getVoucherByRequest(uint256 requestId) external view returns (uint256 tokenId, VoucherInfo memory info);
 }
