@@ -58,6 +58,19 @@ library PPTTypes {
         SCHEDULED   // Large scheduled channel
     }
 
+    /// @notice Settlement type for delayed settlement tracking
+    enum SettlementType {
+        SALE,       // Selling asset, waiting for USDT to arrive
+        PURCHASE    // Purchasing asset, waiting for asset to arrive
+    }
+
+    /// @notice Settlement status for delayed settlement tracking
+    enum SettlementStatus {
+        PENDING,    // Waiting for settlement
+        SETTLED,    // Settlement completed
+        ABNORMAL    // Abnormal (timeout)
+    }
+
     // =============================================================================
     // Structs
     // =============================================================================

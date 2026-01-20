@@ -109,7 +109,11 @@ interface IAssetController {
     function setAssetActive(address token, bool active) external;
 
     // ========== Asset Operations (REBALANCER Call) ==========
-    function purchaseAsset(address token, uint256 usdtAmount) external returns (uint256 tokensReceived);
+    /// @notice Purchase asset with specified input token
+    /// @param tokenIn Input token address (address(0) = use vault's underlying asset/USDT)
+    /// @param tokenOut Output token address (asset to purchase)
+    /// @param amountIn Amount of input token to spend
+    function purchaseAsset(address tokenIn, address tokenOut, uint256 amountIn) external returns (uint256 tokensReceived);
     function redeemAsset(address token, uint256 tokenAmount) external returns (uint256 usdtReceived);
     function executeWaterfallLiquidation(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier) external returns (uint256 funded);
 
@@ -146,6 +150,29 @@ interface IAssetController {
     function setOracleAdapter(address oracle) external;
     function setSwapHelper(address helper) external;
     function setDefaultSwapSlippage(uint256 slippage) external;
+
+    // ========== Delayed Settlement Management ==========
+    /// @notice Set whether an asset uses delayed settlement (ADMIN Call)
+    function setDelayedSettlementAsset(address asset, bool isDelayed) external;
+    /// @notice Set default settlement timeout (ADMIN Call)
+    function setDefaultSettlementTimeout(uint256 timeout) external;
+    /// @notice Redeem delayed settlement asset (REBALANCER Call) - SALE type
+    function redeemDelayedAsset(address token, uint256 tokenAmount, uint256 expectedUsdt) external returns (uint256 settlementId);
+    /// @notice Purchase delayed settlement asset (REBALANCER Call) - PURCHASE type
+    /// @dev Used when buying assets with delayed settlement (e.g., CASH+). USDT is sent but asset not yet received.
+    function purchaseDelayedAsset(address token, uint256 usdtAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
+    /// @notice Confirm settlement completed (KEEPER Call)
+    function confirmSettlement(uint256 settlementId) external;
+    /// @notice Mark settlement as abnormal if timeout (Anyone can call)
+    function checkAndMarkAbnormal(uint256 settlementId) external;
+
+    // ========== Delayed Settlement Queries ==========
+    /// @notice Get total pending settlement value
+    function totalPendingValue() external view returns (uint256);
+    /// @notice Check if asset is delayed settlement type
+    function isDelayedSettlementAsset(address asset) external view returns (bool);
+    /// @notice Get default settlement timeout
+    function defaultSettlementTimeout() external view returns (uint256);
 }
 
 /// @title IOracleAdapter
