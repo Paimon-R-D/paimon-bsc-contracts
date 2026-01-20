@@ -526,7 +526,7 @@ contract PPT is
     }
 
     /// @notice Admin reset period locked assets (called on period refresh)
-    function resetLockedMintAssets() external override onlyRole(KEEPER_ROLE) {
+    function resetLockedMintAssets() external override onlyOperator{
         uint256 old = lockedMintAssets;
         lockedMintAssets = 0;
         emit LockedMintAssetsReset(old);

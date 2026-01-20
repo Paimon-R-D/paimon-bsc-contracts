@@ -195,7 +195,7 @@ contract RedemptionManager is
         redemptionVoucher = IRedemptionVoucher(redemptionVoucher_);
 
         // Initialize fee configuration
-        baseRedemptionFeeBps = 100; // 1%
+        baseRedemptionFeeBps = 50; // 0.5%
         emergencyPenaltyFeeBps = 100; // 1%
 
         // Initialize approval threshold configuration

@@ -398,6 +398,7 @@ contract AssetController is
 
         // If tokenIn is address(0), use vault's underlying asset (USDT)
         address actualTokenIn = tokenIn == address(0) ? _asset() : tokenIn;
+        vault.resetLockedMintAssets();
 
         (uint256 spent, uint256 received) = _executePurchase(index - 1, actualTokenIn, amountIn);
         tokensReceived = received;
