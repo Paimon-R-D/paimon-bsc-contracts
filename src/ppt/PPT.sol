@@ -143,7 +143,7 @@ contract PPT is
     function initialize(IERC20 asset_,  address adminsig_,address timerlock) external initializer {
         if (adminsig_ == address(0)||timerlock==address(0)) revert ZeroAddress();
         __ERC4626_init(asset_);
-        __ERC20_init("PPT Token", "PPT");
+        __ERC20_init("PP Token", "PP");
         __AccessControl_init();
         __Pausable_init();
         __ReentrancyGuard_init();
