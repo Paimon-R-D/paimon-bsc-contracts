@@ -10,7 +10,7 @@ library PPTTypes {
 
     uint256 constant PRECISION = 1e18;
     uint256 constant BASIS_POINTS = 10000;
-    uint256 constant MIN_DEPOSIT = 500e18;
+    uint256 constant MIN_DEPOSIT = 10e18;
 
     // Redemption delays
     uint256 constant STANDARD_REDEMPTION_DELAY = 7 days;
