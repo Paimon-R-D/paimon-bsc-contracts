@@ -188,6 +188,10 @@ contract AssetController is
     /// @notice Attempting to set same active status
     error SameActiveStatus(bool status);
     error AssetNotAllowed(address token);
+    /// @notice Output received is below the minimum required
+    error OutputBelowMinimum(uint256 actualReceived, uint256 minRequired);
+    /// @notice Reported output does not match actual balance change
+    error OutputMismatch(uint256 reported, uint256 actual);
 
     // ========== Pending Settlement Errors ==========
     /// @notice Asset is not configured as delayed settlement type
@@ -668,7 +672,80 @@ contract AssetController is
         return IERC4626(address(vault)).previewDeposit(assets);
     }
 
+    /// @dev Calculate minimum output amount based on Oracle price for purchase operations
+    /// @param tokenOut Target token address
+    /// @param amountIn Input amount (in input token units, assumed to be USD-denominated for vault asset)
+    /// @param maxSlippageBps Maximum slippage (basis points)
+    /// @return minOutput Minimum acceptable output amount
+    function _calculateMinOutput(
+        address tokenOut,
+        uint256 amountIn,
+        uint256 maxSlippageBps
+    ) internal view returns (uint256 minOutput) {
+        // Get Oracle price (18 decimals, represents USD value of 1 target token)
+        uint256 price = oracleAdapter.getPrice(tokenOut);
 
+        // Get target token decimals
+        uint8 decimals = _assetConfigs[_assetIndex[tokenOut] - 1].decimals;
+
+        // Get base asset (USDT) decimals
+        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
+
+        // Normalize amountIn to 18 decimals for calculation
+        uint256 amountIn18;
+        if (baseDecimals < 18) {
+            amountIn18 = amountIn * (10 ** (18 - baseDecimals));
+        } else if (baseDecimals > 18) {
+            amountIn18 = amountIn / (10 ** (baseDecimals - 18));
+        } else {
+            amountIn18 = amountIn;
+        }
+
+        // Calculate expected output: amountIn (in USD) / price (USD per token)
+        // expectedOutput = amountIn18 * 10^decimals / price
+        uint256 expectedOutput = (amountIn18 * (10 ** decimals)) / price;
+
+        // Apply slippage to calculate minimum output
+        // minOutput = expectedOutput * (10000 - maxSlippageBps) / 10000
+        minOutput = (expectedOutput * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
+    }
+
+    /// @dev Calculate minimum output amount based on Oracle price for sell operations
+    /// @param tokenIn Token address to sell
+    /// @param amountIn Amount of tokens to sell
+    /// @param maxSlippageBps Maximum slippage (basis points)
+    /// @return minOutput Minimum acceptable USDT output amount
+    function _calculateMinOutputForSell(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 maxSlippageBps
+    ) internal view returns (uint256 minOutput) {
+        // Get token Oracle price (18 decimals)
+        uint256 price = oracleAdapter.getPrice(tokenIn);
+
+        // Get token decimals
+        uint8 decimals = _assetConfigs[_assetIndex[tokenIn] - 1].decimals;
+
+        // Get base asset (USDT) decimals
+        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
+
+        // Calculate expected output (in USDT): amountIn * price / 10^decimals
+        // Result is in 18 decimals
+        uint256 expectedOutput18 = (amountIn * price) / (10 ** decimals);
+
+        // Adjust to base asset precision
+        uint256 expectedOutput;
+        if (baseDecimals < 18) {
+            expectedOutput = expectedOutput18 / (10 ** (18 - baseDecimals));
+        } else if (baseDecimals > 18) {
+            expectedOutput = expectedOutput18 * (10 ** (baseDecimals - 18));
+        } else {
+            expectedOutput = expectedOutput18;
+        }
+
+        // Apply slippage
+        minOutput = (expectedOutput * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
+    }
 
     /// @dev Execute asset purchase
     /// @param configIndex Asset config index
@@ -778,6 +855,16 @@ contract AssetController is
             tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - balBefore;
             spent = amountIn;  // Record token spent
 
+            // Only verify when balance actually changed (skip delayed settlement scenarios)
+            // Delayed settlement assets should use purchaseDelayedAsset() which creates PendingSettlement record
+            if (tokensReceived > 0 && address(oracleAdapter) != address(0)) {
+                uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
+                uint256 minOutput = _calculateMinOutput(config.tokenAddress, amountIn, slippageBps);
+                if (tokensReceived < minOutput) {
+                    revert OutputBelowMinimum(tokensReceived, minOutput);
+                }
+            }
+
         } else {
             // ---------- DEX SWAP mode ----------
             // Use cases: Tokens with on-chain liquidity (e.g., aUSDC, stETH)
@@ -796,9 +883,29 @@ contract AssetController is
             // Approve SwapHelper to use input token from Vault
             vault.approveAsset(tokenIn, address(swapHelper), amountIn);
 
+            // Record balance before swap (for independent verification)
+            uint256 balBefore = IERC20(config.tokenAddress).balanceOf(address(vault));
+
             // Execute swap on DEX via SwapHelper
             // SwapHelper internally selects optimal route (e.g., Uniswap/Curve)
-            tokensReceived = swapHelper.buyRWAAsset(tokenIn, config.tokenAddress, amountIn, slippageBps, address(vault));
+            uint256 reportedReceived = swapHelper.buyRWAAsset(tokenIn, config.tokenAddress, amountIn, slippageBps, address(vault));
+
+            // Independently verify actual amount received via balance difference
+            tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - balBefore;
+
+            // Check reported value matches actual balance (prevent malicious helper)
+            if (tokensReceived != reportedReceived) {
+                revert OutputMismatch(reportedReceived, tokensReceived);
+            }
+
+            // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
+            if (address(oracleAdapter) != address(0)) {
+                uint256 minOutput = _calculateMinOutput(config.tokenAddress, amountIn, slippageBps);
+                if (tokensReceived < minOutput) {
+                    revert OutputBelowMinimum(tokensReceived, minOutput);
+                }
+            }
+
             spent = amountIn;  // Record token spent
         }
 
@@ -835,6 +942,16 @@ function _sellAsset(
         );
         if (callSuccess) {
             usdtReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balanceBefore;
+
+            // Only verify when balance actually changed (skip delayed settlement scenarios)
+            if (usdtReceived > 0 && address(oracleAdapter) != address(0)) {
+                uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
+                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, slippageBps);
+                if (usdtReceived < minOutput) {
+                    revert OutputBelowMinimum(usdtReceived, minOutput);
+                }
+            }
+
             return (usdtReceived, true);
         }
         // If Adapter fails, continue trying swapHelper
@@ -842,11 +959,28 @@ function _sellAsset(
 
     // Path 2: Use swapHelper (DEX method)
     if (address(swapHelper) != address(0)) {
+        uint256 balBefore = IERC20(vaultAsset).balanceOf(address(vault));
         vault.approveAsset(token, address(swapHelper), tokenAmount);
+
         try swapHelper.sellRWAAsset(
             token, vaultAsset, tokenAmount, defaultSwapSlippage, address(vault)
-        ) returns (uint256 received) {
-            return (received, true);
+        ) returns (uint256 reported) {
+            uint256 actualReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balBefore;
+
+            // Verify reported value matches actual balance (prevent malicious helper)
+            if (actualReceived != reported) {
+                revert OutputMismatch(reported, actualReceived);
+            }
+
+            // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
+            if (address(oracleAdapter) != address(0)) {
+                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, defaultSwapSlippage);
+                if (actualReceived < minOutput) {
+                    revert OutputBelowMinimum(actualReceived, minOutput);
+                }
+            }
+
+            return (actualReceived, true);
         } catch {
             return (0, false);
         }
