@@ -38,6 +38,8 @@ contract AssetController is
     bytes32 public constant REBALANCER_ROLE = keccak256("REBALANCER_ROLE");
     bytes32 public constant UPGRADER_ROLE = keccak256("UPGRADER_ROLE");
     bytes32 public constant KEEPER_ROLE=keccak256("KEEPER_ROLE");
+    /// @notice Delayed adapter role - Only authorized adapters can register delayed settlements (prevents NAV inflation)
+    bytes32 public constant DELAYED_ADAPTER_ROLE = keccak256("DELAYED_ADAPTER_ROLE");
 
     // =============================================================================
     // External Contract References
@@ -1134,59 +1136,8 @@ function _sellAsset(
         emit DefaultSettlementTimeoutUpdated(oldTimeout, timeout);
     }
 
-    /// @notice Redeem delayed settlement asset (creates pending settlement record)
-    /// @dev REBALANCER calls this when selling assets with delayed settlement
-    /// @param token Asset to sell
-    /// @param tokenAmount Amount of tokens to sell
-    /// @param expectedUsdt Expected USDT value (calculated by caller based on current price)
-    /// @return settlementId The created settlement ID
-    function redeemDelayedAsset(
-        address token,
-        uint256 tokenAmount,
-        uint256 expectedUsdt
-    ) external override onlyRole(REBALANCER_ROLE) nonReentrant whenNotPaused returns (uint256 settlementId) {
-        if (!isDelayedSettlementAsset[token]) revert NotDelayedSettlementAsset(token);
-        if (tokenAmount == 0) revert ZeroAmount();
-
-        uint256 index = _assetIndex[token];
-        if (index == 0) revert AssetNotFound(token);
-
-        PPTTypes.AssetConfig memory config = _assetConfigs[index - 1];
-
-        // Execute asset transfer out (sell via adapter or swap)
-        (uint256 usdtReceived, bool success) = _sellAsset(token, tokenAmount, config);
-
-        // If direct sale succeeded, no need for pending settlement tracking
-        // This handles the case where the sale is immediate (e.g., DEX swap)
-        if (success && usdtReceived > 0) {
-            emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
-            _invalidateCache();
-            return 0; // No pending settlement needed
-        }
-
-        // For delayed settlement (asset transferred but USDT not yet received)
-        // Create pending settlement record
-        settlementId = ++settlementIdCounter;
-        pendingSettlements[settlementId] = PendingSettlement({
-            id: settlementId,
-            sType: PPTTypes.SettlementType.SALE,
-            asset: token,
-            assetAmount: tokenAmount,
-            expectedUsdtValue: expectedUsdt,
-            createdAt: block.timestamp,
-            deadline: block.timestamp + defaultSettlementTimeout,
-            status: PPTTypes.SettlementStatus.PENDING
-        });
-
-        // Add to total pending value (protects NAV)
-        totalPendingValue += expectedUsdt;
-
-        emit SettlementCreated(settlementId, PPTTypes.SettlementType.SALE, token, tokenAmount, expectedUsdt);
-        _invalidateCache();
-    }
-
     /// @notice Purchase delayed settlement asset (creates pending settlement record)
-    /// @dev REBALANCER calls this when buying assets with delayed settlement (e.g., CASH+)
+    /// @dev Only authorized adapters (e.g., CashPlusAdapter) can call this to prevent NAV inflation attacks.
     ///      USDT has been sent but asset tokens not yet received
     /// @param token Asset being purchased
     /// @param usdtAmount USDT amount spent on purchase
@@ -1196,7 +1147,7 @@ function _sellAsset(
         address token,
         uint256 usdtAmount,
         uint256 expectedTokenValue
-    ) external override onlyRole(REBALANCER_ROLE) nonReentrant whenNotPaused returns (uint256 settlementId) {
+    ) external override onlyRole(DELAYED_ADAPTER_ROLE) nonReentrant whenNotPaused returns (uint256 settlementId) {
         if (!isDelayedSettlementAsset[token]) revert NotDelayedSettlementAsset(token);
         if (usdtAmount == 0) revert ZeroAmount();
 

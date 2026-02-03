@@ -156,9 +156,7 @@ interface IAssetController {
     function setDelayedSettlementAsset(address asset, bool isDelayed) external;
     /// @notice Set default settlement timeout (ADMIN Call)
     function setDefaultSettlementTimeout(uint256 timeout) external;
-    /// @notice Redeem delayed settlement asset (REBALANCER Call) - SALE type
-    function redeemDelayedAsset(address token, uint256 tokenAmount, uint256 expectedUsdt) external returns (uint256 settlementId);
-    /// @notice Purchase delayed settlement asset (REBALANCER Call) - PURCHASE type
+    /// @notice Purchase delayed settlement asset (DELAYED_ADAPTER_ROLE Call) - PURCHASE type
     /// @dev Used when buying assets with delayed settlement (e.g., CASH+). USDT is sent but asset not yet received.
     function purchaseDelayedAsset(address token, uint256 usdtAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
     /// @notice Confirm settlement completed (KEEPER Call)
