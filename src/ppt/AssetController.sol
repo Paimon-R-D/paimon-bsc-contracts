@@ -192,6 +192,8 @@ contract AssetController is
     error OutputBelowMinimum(uint256 actualReceived, uint256 minRequired);
     /// @notice Reported output does not match actual balance change
     error OutputMismatch(uint256 reported, uint256 actual);
+    /// @notice Cannot remove or deactivate asset with non-zero balance
+    error AssetHasBalance(address token, uint256 balance);
 
     // ========== Pending Settlement Errors ==========
     /// @notice Asset is not configured as delayed settlement type
@@ -292,7 +294,11 @@ contract AssetController is
     function removeAsset(address token) external override onlyRole(KEEPER_ROLE) {
         uint256 index = _assetIndex[token];
         if (index == 0) revert AssetNotFound(token);
-        
+
+        // Check vault balance is zero before removal to prevent NAV crash and fund freezing
+        uint256 vaultBalance = IERC20(token).balanceOf(address(vault));
+        if (vaultBalance > 0) revert AssetHasBalance(token, vaultBalance);
+
         PPTTypes.LiquidityTier tier = _assetConfigs[index - 1].tier;
         
         uint256 lastIndex = _assetConfigs.length - 1;
@@ -375,6 +381,12 @@ contract AssetController is
 
         PPTTypes.AssetConfig storage config = _assetConfigs[index - 1];
         if (config.isActive == active) revert SameActiveStatus(active);
+
+        // Check vault balance is zero before deactivation to prevent NAV crash and fund freezing
+        if (!active) {
+            uint256 vaultBalance = IERC20(token).balanceOf(address(vault));
+            if (vaultBalance > 0) revert AssetHasBalance(token, vaultBalance);
+        }
 
         config.isActive = active;
         emit AssetActiveUpdated(token, active);
