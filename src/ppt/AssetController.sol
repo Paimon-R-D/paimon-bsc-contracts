@@ -1174,9 +1174,9 @@ function _sellAsset(
     }
 
     /// @notice Confirm settlement completed (USDT arrived)
-    /// @dev KEEPER calls this when USDT has arrived in vault
+    /// @dev Only authorized adapters can call this to ensure funds actually arrived before confirmation
     /// @param settlementId Settlement ID to confirm
-    function confirmSettlement(uint256 settlementId) external override onlyRole(KEEPER_ROLE) {
+    function confirmSettlement(uint256 settlementId) external override onlyRole(DELAYED_ADAPTER_ROLE) {
         PendingSettlement storage settlement = pendingSettlements[settlementId];
         if (settlement.id == 0) revert SettlementNotFound(settlementId);
         if (settlement.status != PPTTypes.SettlementStatus.PENDING) {
