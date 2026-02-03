@@ -1022,12 +1022,12 @@ function _sellAsset(
         }
 
         // Liquidate Layer2
-        if (maxTier >= PPTTypes.LiquidityTier.TIER_2_MMF) {
-            address[] storage l2Assets = _layerAssets[PPTTypes.LiquidityTier.TIER_2_MMF];
-            for (uint256 i = 0; i < l2Assets.length && remaining > 0; i++) {
-                remaining = _liquidateAsset(l2Assets[i], remaining, PPTTypes.LiquidityTier.TIER_2_MMF);
-            }
-        }
+        // if (maxTier >= PPTTypes.LiquidityTier.TIER_2_MMF) {
+        //     address[] storage l2Assets = _layerAssets[PPTTypes.LiquidityTier.TIER_2_MMF];
+        //     for (uint256 i = 0; i < l2Assets.length && remaining > 0; i++) {
+        //         remaining = _liquidateAsset(l2Assets[i], remaining, PPTTypes.LiquidityTier.TIER_2_MMF);
+        //     }
+        // }
         
       
         funded = amountNeeded - remaining;
