@@ -106,6 +106,13 @@ contract RedemptionManager is
     uint256 public voucherThreshold;
 
     // =============================================================================
+    // N15/N16 Fix: Liability Rollover State (added at end for upgrade compatibility)
+    // =============================================================================
+
+    /// @notice Last day index when rollover was performed
+    uint256 public lastRolloverDay;
+
+    // =============================================================================
     // Events
     // =============================================================================
     
@@ -150,7 +157,8 @@ contract RedemptionManager is
     event EmergencyApprovalQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
     event AdjustOverdueLiability(uint256 amount);
     event AdjustDailyLiability(uint256 dayIndex, uint256 amount);
-     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
+    event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
+    event LiabilityRolledOver(uint256 indexed dayIndex, uint256 amount);
 
     // =============================================================================
     // Errors
@@ -860,8 +868,39 @@ contract RedemptionManager is
         return timestamp / 1 days;
     }
 
+    /// @notice Roll over expired daily liabilities to overdueLiability
+    /// @dev Called automatically before liability operations to ensure accurate accounting
+    function _rolloverOverdueLiabilities() internal {
+        uint256 today = _getDayIndex(block.timestamp);
+
+        // Skip if already rolled over today or if this is first call
+        if (lastRolloverDay >= today) {
+            return;
+        }
+
+        // If lastRolloverDay is 0 (first call or post-upgrade), initialize to today
+        if (lastRolloverDay == 0) {
+            lastRolloverDay = today;
+            return;
+        }
+
+        // Roll over liabilities from lastRolloverDay to today-1
+        for (uint256 day = lastRolloverDay; day < today; day++) {
+            uint256 amount = dailyLiability[day];
+            if (amount > 0) {
+                overdueLiability += amount;
+                emit LiabilityRolledOver(day, amount);
+            }
+        }
+
+        lastRolloverDay = today;
+    }
+
     /// @notice Add liability for a specific day
     function _addDailyLiability(uint256 settlementTime, uint256 amount) internal {
+        // Ensure rollover is up-to-date before adding new liability
+        _rolloverOverdueLiabilities();
+
         uint256 dayIndex = _getDayIndex(settlementTime);
         dailyLiability[dayIndex] += amount;
         emit DailyLiabilityAdded(dayIndex, amount);
@@ -871,34 +910,43 @@ contract RedemptionManager is
     /// @dev Overdue: deduct from both dailyLiability[dayIndex] and overdueLiability (overdueLiability is cache)
     ///      Non-overdue: only deduct from dailyLiability[dayIndex]
     function _removeLiability(uint256 settlementTime, uint256 amount) internal {
+        // Ensure rollover is up-to-date before removing liability
+        _rolloverOverdueLiabilities();
+
         uint256 dayIndex = _getDayIndex(settlementTime);
         uint256 today = _getDayIndex(block.timestamp);
 
-        // Uniformly deduct from dailyLiability (regardless of whether overdue)
-
-
-        // If overdue, also deduct from overdueLiability (keep cache in sync)
+        // If overdue, deduct from overdueLiability (now guaranteed to be accurate after rollover)
         if (dayIndex < today) {
             uint256 toRemoveFromOverdue = overdueLiability >= amount ? amount : overdueLiability;
             overdueLiability -= toRemoveFromOverdue;
-        } 
+        }
+
         uint256 toRemove = dailyLiability[dayIndex] >= amount ? amount : dailyLiability[dayIndex];
         dailyLiability[dayIndex] -= toRemove;
         emit LiabilityRemoved(dayIndex, toRemove, dayIndex < today);
-        
     }
 
     /// @notice Calculate total liability for the next 7 days (for Vault to call)
     function getSevenDayLiability() public view returns (uint256 total) {
         uint256 today = _getDayIndex(block.timestamp);
-        for (uint256 i = 0; i <= 7; i++) {
+        for (uint256 i = 0; i < 7; i++) {
             total += dailyLiability[today + i];
         }
     }
 
-    /// @notice Get overdue unsettled liability
+    /// @notice Get overdue unsettled liability (includes pending rollover)
     function getOverdueLiability() public view returns (uint256) {
-        return overdueLiability;
+        uint256 today = _getDayIndex(block.timestamp);
+        uint256 total = overdueLiability;
+
+        // Add liabilities that haven't been rolled over yet
+        uint256 startDay = lastRolloverDay == 0 ? today : lastRolloverDay;
+        for (uint256 day = startDay; day < today; day++) {
+            total += dailyLiability[day];
+        }
+
+        return total;
     }
 
     /// @notice Get liability for a specific day (for external queries)
@@ -921,6 +969,11 @@ contract RedemptionManager is
             total += dailyLiability[today - i];
          }
       return total;
+    }
+
+    /// @notice Manually trigger rollover (for keeper to call if needed)
+    function rolloverLiabilities() external onlyRole(KEEPER_ROLE) {
+        _rolloverOverdueLiabilities();
     }
 
     /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
