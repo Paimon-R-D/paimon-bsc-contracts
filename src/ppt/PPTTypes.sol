@@ -15,6 +15,7 @@ library PPTTypes {
     // Redemption delays
     uint256 constant STANDARD_REDEMPTION_DELAY = 7 days;
     uint256 constant EMERGENCY_REDEMPTION_DELAY = 0 seconds;
+    uint256 constant DEFAULT_MAX_SETTLEMENT_DELAY = 30 days;
 
     // Fee related
     uint256 constant BASE_REDEMPTION_FEE = 10;      // 0.1%

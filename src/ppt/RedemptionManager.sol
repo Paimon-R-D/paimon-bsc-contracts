@@ -113,6 +113,13 @@ contract RedemptionManager is
     uint256 public lastRolloverDay;
 
     // =============================================================================
+    // N23 Fix: Max Settlement Delay (added at end for upgrade compatibility)
+    // =============================================================================
+
+    /// @notice Maximum settlement delay allowed (0 means use default 30 days)
+    uint256 public maxSettlementDelay;
+
+    // =============================================================================
     // Events
     // =============================================================================
     
@@ -159,6 +166,7 @@ contract RedemptionManager is
     event AdjustDailyLiability(uint256 dayIndex, uint256 amount);
     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
     event LiabilityRolledOver(uint256 indexed dayIndex, uint256 amount);
+    event MaxSettlementDelayUpdated(uint256 oldDelay, uint256 newDelay);
 
     // =============================================================================
     // Errors
@@ -174,6 +182,7 @@ contract RedemptionManager is
     error NotPendingApproval(uint256 requestId);
     error EmergencyQuotaExceeded(uint256 available, uint256 requested);
     error InvalidSettlementTime(uint256 provided, uint256 minimum);
+    error SettlementDelayTooLong(uint256 provided, uint256 maximum);
     error NotVoucherOwner(address caller, address owner);
     error CancellationDisabled();
 
@@ -469,6 +478,9 @@ contract RedemptionManager is
 
         // Determine settlement time
         uint256 settlementTime;
+        // N23 Fix: Calculate max delay (use configured value or default 30 days)
+        uint256 maxDelay = maxSettlementDelay > 0 ? maxSettlementDelay : PPTTypes.DEFAULT_MAX_SETTLEMENT_DELAY;
+
         if (customSettlementTime == 0) {
             // Use default delay
             settlementTime = block.timestamp + minDelay;
@@ -476,6 +488,10 @@ contract RedemptionManager is
             // Validate custom time >= minimum delay
             if (customSettlementTime < block.timestamp + minDelay) {
                 revert InvalidSettlementTime(customSettlementTime, block.timestamp + minDelay);
+            }
+            // N23 Fix: Validate custom time <= maximum delay
+            if (customSettlementTime > block.timestamp + maxDelay) {
+                revert SettlementDelayTooLong(customSettlementTime, block.timestamp + maxDelay);
             }
             settlementTime = customSettlementTime;
         }
@@ -1080,6 +1096,14 @@ contract RedemptionManager is
         uint256 old = emergencyApprovalQuotaRatio;
         emergencyApprovalQuotaRatio = ratio;
         emit EmergencyApprovalQuotaRatioUpdated(old, ratio);
+    }
+
+    /// @notice Set maximum settlement delay
+    /// @param delay Maximum delay in seconds (0 means use default 30 days)
+    function setMaxSettlementDelay(uint256 delay) external onlyRole(ADMIN_ROLE) {
+        uint256 old = maxSettlementDelay;
+        maxSettlementDelay = delay;
+        emit MaxSettlementDelayUpdated(old, delay);
     }
 
     function pause() external onlyRole(ADMIN_ROLE) {
