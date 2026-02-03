@@ -288,6 +288,9 @@ contract AssetController is
         _layerAssets[tier].push(token);
 
         emit AssetAdded(token, tier);
+
+        // N8 Fix: Invalidate cache to ensure NAV recalculation
+        _invalidateCache();
     }
 
     /// @notice Remove asset from configuration
@@ -320,8 +323,11 @@ contract AssetController is
                 break;
             }
         }
-         //_cachedAssetValue.timestamp = 0;
+
         emit AssetRemoved(token);
+
+        // N8 Fix: Invalidate cache to ensure NAV recalculation
+        _invalidateCache();
     }
 
     /// @notice Update asset configuration
@@ -392,6 +398,9 @@ contract AssetController is
 
         config.isActive = active;
         emit AssetActiveUpdated(token, active);
+
+        // N8 Fix: Invalidate cache to ensure NAV recalculation
+        _invalidateCache();
     }
 
     // =============================================================================
