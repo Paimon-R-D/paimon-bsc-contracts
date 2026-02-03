@@ -161,7 +161,7 @@ interface IAssetController {
     function purchaseDelayedAsset(address token, uint256 usdtAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
     /// @notice Confirm settlement completed (KEEPER Call)
     function confirmSettlement(uint256 settlementId) external;
-    /// @notice Mark settlement as abnormal if timeout (Anyone can call)
+    /// @notice Mark settlement as abnormal if timeout (KEEPER/REBALANCER/DELAYED_ADAPTER only)
     function checkAndMarkAbnormal(uint256 settlementId) external;
 
     // ========== Delayed Settlement Queries ==========

@@ -1180,9 +1180,12 @@ function _sellAsset(
     }
 
     /// @notice Check and mark settlement as abnormal if timed out
-    /// @dev Anyone can call this to mark timed out settlements
+    /// @dev Only KEEPER, REBALANCER, or DELAYED_ADAPTER can call this
     /// @param settlementId Settlement ID to check
     function checkAndMarkAbnormal(uint256 settlementId) external override {
+        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(REBALANCER_ROLE, msg.sender) && !hasRole(DELAYED_ADAPTER_ROLE, msg.sender)) {
+            revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
+        }
         PendingSettlement storage settlement = pendingSettlements[settlementId];
         if (settlement.id == 0) revert SettlementNotFound(settlementId);
         if (settlement.status != PPTTypes.SettlementStatus.PENDING) {
