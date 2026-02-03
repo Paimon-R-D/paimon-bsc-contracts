@@ -977,15 +977,35 @@ contract RedemptionManager is
     }
 
     /// @notice Admin adjust overdueLiability (for emergency/fix purposes)
+    /// @dev Also syncs with PPT's totalRedemptionLiability to maintain consistency
     function adjustOverdueLiability(uint256 amount) external onlyRole(KEEPER_ROLE) {
+        uint256 oldAmount = overdueLiability;
         overdueLiability = amount;
+
+        // Sync with PPT's totalRedemptionLiability
+        if (amount > oldAmount) {
+            vault.addRedemptionLiability(amount - oldAmount);
+        } else if (amount < oldAmount) {
+            vault.removeRedemptionLiability(oldAmount - amount);
+        }
+
         emit AdjustOverdueLiability(amount);
     }
 
     /// @notice Admin adjust liability for a specific day (for emergency/fix purposes)
+    /// @dev Also syncs with PPT's totalRedemptionLiability to maintain consistency
     function adjustDailyLiability(uint256 dayIndex, uint256 amount) external onlyRole(KEEPER_ROLE) {
+        uint256 oldAmount = dailyLiability[dayIndex];
         dailyLiability[dayIndex] = amount;
-         emit AdjustDailyLiability(dayIndex, amount);
+
+        // Sync with PPT's totalRedemptionLiability
+        if (amount > oldAmount) {
+            vault.addRedemptionLiability(amount - oldAmount);
+        } else if (amount < oldAmount) {
+            vault.removeRedemptionLiability(oldAmount - amount);
+        }
+
+        emit AdjustDailyLiability(dayIndex, amount);
     }
 
     // =============================================================================
