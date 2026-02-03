@@ -676,16 +676,6 @@ contract AssetController is
         return IERC4626(address(vault)).asset();
     }
 
-    /// @dev Get Vault total assets
-    function _totalAssets() internal view returns (uint256) {
-        return IERC4626(address(vault)).totalAssets();
-    }
-
-    /// @dev Preview shares obtainable from deposit
-    function _previewDeposit(uint256 assets) internal view returns (uint256) {
-        return IERC4626(address(vault)).previewDeposit(assets);
-    }
-
     /// @dev Calculate minimum output amount based on Oracle price for purchase operations
     /// @param tokenOut Target token address
     /// @param amountIn Input amount (in input token units, assumed to be USD-denominated for vault asset)
@@ -805,10 +795,7 @@ contract AssetController is
         // Check 1: Asset must be enabled, disabled assets cannot be purchased
         if (!config.isActive) revert AssetNotPurchasable(config.tokenAddress);
 
-        // Check 2: Purchase amount cannot be 0, return directly if 0
-        if (amountIn == 0) return (0, 0);
-
-        // Check 3: Vault token balance must be sufficient
+        // Check 2: Vault token balance must be sufficient
         uint256 vaultBalance = IERC20(tokenIn).balanceOf(address(vault));
 
         // For vault's underlying asset (USDT), need to check reserved amounts

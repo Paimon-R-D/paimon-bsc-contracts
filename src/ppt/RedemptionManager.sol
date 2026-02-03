@@ -793,19 +793,9 @@ contract RedemptionManager is
     // ERC4626 Helpers
     // =============================================================================
 
-    /// @dev Get user Vault share balance
-    function _balanceOf(address owner) internal view returns (uint256) {
-        return IERC4626(address(vault)).balanceOf(owner);
-    }
-
     /// @dev Get underlying asset address
     function _asset() internal view returns (address) {
         return IERC4626(address(vault)).asset();
-    }
-
-    /// @dev Get Vault total assets
-    function _totalAssets() internal view returns (uint256) {
-        return IERC4626(address(vault)).totalAssets();
     }
 
     // =============================================================================
