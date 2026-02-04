@@ -511,10 +511,9 @@ contract RedemptionManager is
         uint256 threshold = voucherThreshold;
 
         if (delay > threshold && address(redemptionVoucher) != address(0)) {
-            // Calculate net amount (netAmount = grossAmount - fee)
-            bool isEmergency = request.channel == PPTTypes.RedemptionChannel.EMERGENCY;
-            uint256 fee = _calculateRedemptionFee(request.grossAmount, isEmergency);
-            uint256 netAmount = request.grossAmount - fee;
+            // N22 Fix: Use stored estimatedFee for consistency with actual settlement
+            // This ensures NFT voucher face value matches the actual payout amount
+            uint256 netAmount = request.grossAmount - request.estimatedFee;
 
             // Generate NFT voucher (using net amount)
             uint256 tokenId = redemptionVoucher.mint(
