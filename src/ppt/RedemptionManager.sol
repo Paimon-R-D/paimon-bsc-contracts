@@ -501,7 +501,9 @@ contract RedemptionManager is
 
         // Calculate delay, decide whether to generate NFT
         uint256 delay = settlementTime - block.timestamp;
-        uint256 threshold = voucherThreshold > 0 ? voucherThreshold : 7 days;
+        // N19 Fix: Allow 0 threshold for immediate voucher minting strategy
+        // Default value (7 days) is set in initialize(), no fallback needed here
+        uint256 threshold = voucherThreshold;
 
         if (delay > threshold && address(redemptionVoucher) != address(0)) {
             // Calculate net amount (netAmount = grossAmount - fee)
