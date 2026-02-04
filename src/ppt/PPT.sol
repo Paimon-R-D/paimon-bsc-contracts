@@ -101,6 +101,10 @@ contract PPT is
     // event NavUpdated(uint256 oldNav, uint256 newNav, uint256 timestamp);
     event EmergencyQuotaRefreshed(uint256 amount);
     event EmergencyQuotaRestored(uint256 amount);
+    // N31 Fix: Add missing events for sensitive operations
+    event EmergencyQuotaReduced(uint256 amount);
+    event RedemptionLiabilityAdded(uint256 amount);
+    event RedemptionLiabilityRemoved(uint256 amount);
     event LockedMintAssetsReset(uint256 oldAmount);
     event RedemptionManagerUpdated(address indexed oldManager, address indexed newManager);
     event StandardQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
@@ -425,10 +429,12 @@ contract PPT is
     
     function addRedemptionLiability(uint256 amount) external override onlyOperator {
         totalRedemptionLiability += amount;
+        emit RedemptionLiabilityAdded(amount);
     }
-    
+
     function removeRedemptionLiability(uint256 amount) external override onlyOperator {
         totalRedemptionLiability -= amount;
+        emit RedemptionLiabilityRemoved(amount);
     }
     
     function addRedemptionFee(uint256 fee) external override onlyOperator {
@@ -458,6 +464,7 @@ contract PPT is
     /// @notice Reduce emergency application quota (called by RedemptionManager)
     function reduceEmergencyQuota(uint256 amount) external override onlyOperator {
         emergencyQuota -= amount;
+        emit EmergencyQuotaReduced(amount);
     }
 
     /// @notice Restore emergency application quota (called on cancel/reject)

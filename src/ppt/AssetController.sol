@@ -129,6 +129,8 @@ contract AssetController is
     event PurchaseRouted(address indexed token, PPTTypes.LiquidityTier indexed tier, PPTTypes.PurchaseMethod method, uint256 usdtAmount, uint256 tokensReceived);
     /// @notice Waterfall liquidation event - Liquidates assets from lower priority layers
     event WaterfallLiquidation(PPTTypes.LiquidityTier tier, address indexed token, uint256 amountLiquidated, uint256 usdtReceived);
+    // N31 Fix: Add event for executeWaterfallLiquidation
+    event WaterfallLiquidationExecuted(uint256 amountNeeded, PPTTypes.LiquidityTier maxTier, uint256 funded);
     /// @notice Layer config updated event
     event LayerConfigUpdated(PPTTypes.LiquidityTier indexed tier, uint256 targetRatio, uint256 minRatio, uint256 maxRatio);
     /// @notice Redemption fees withdrawn event
@@ -143,7 +145,6 @@ contract AssetController is
     event AssetTierUpdated(address indexed token, PPTTypes.LiquidityTier oldTier, PPTTypes.LiquidityTier newTier);
     /// @notice Asset config updated event
     event AssetConfigUpdated(address indexed token, PPTTypes.LiquidityTier tier, address purchaseAdapter, PPTTypes.PurchaseMethod method, uint256 maxSlippage);
-    event SwapNotExisted(address indexed assert);
     event SwapSlippageUpdate(uint256 slippage);
     event PPTUpgraded(address indexed newImplementation, uint256 timestamp, uint256 blockNumber);
     /// @notice Cache refreshed event
@@ -475,6 +476,9 @@ contract AssetController is
 
         // Invalidate cache after liquidation
         _invalidateCache();
+
+        // N31 Fix: Emit event for audit trail
+        emit WaterfallLiquidationExecuted(amountNeeded, maxTier, funded);
     }
 
 
