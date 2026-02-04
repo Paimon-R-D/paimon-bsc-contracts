@@ -392,8 +392,10 @@ contract RedemptionManager is
         preview.channel = PPTTypes.RedemptionChannel.STANDARD;
         preview.requiresApproval = _requiresStandardApproval(preview.grossAmount);
         preview.settlementDelay = PPTTypes.STANDARD_REDEMPTION_DELAY;
-        // Note: If approval required, actual settlement time starts from approval time
-        preview.estimatedSettlementTime = block.timestamp + PPTTypes.STANDARD_REDEMPTION_DELAY;
+        // N20 Fix: Return 0 if approval required (actual settlement time = approval time + delay)
+        preview.estimatedSettlementTime = preview.requiresApproval
+            ? 0
+            : block.timestamp + PPTTypes.STANDARD_REDEMPTION_DELAY;
 
         // T+7 settlement, do not use current liquidity to determine if can apply
         // Liquidity is checked at settlement time
@@ -420,7 +422,10 @@ contract RedemptionManager is
         preview.channel = PPTTypes.RedemptionChannel.EMERGENCY;
         preview.requiresApproval = _requiresEmergencyApproval(preview.grossAmount);
         preview.settlementDelay = PPTTypes.EMERGENCY_REDEMPTION_DELAY;
-        preview.estimatedSettlementTime = block.timestamp + PPTTypes.EMERGENCY_REDEMPTION_DELAY;
+        // N20 Fix: Return 0 if approval required (actual settlement time = approval time + delay)
+        preview.estimatedSettlementTime = preview.requiresApproval
+            ? 0
+            : block.timestamp + PPTTypes.EMERGENCY_REDEMPTION_DELAY;
 
         // Check emergency application quota (hard limit, deducted at application)
         uint256 quota = vault.emergencyQuota();
