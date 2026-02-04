@@ -1009,8 +1009,9 @@ function _sellAsset(
         uint256 amountNeeded,
         PPTTypes.LiquidityTier maxTier
     ) internal returns (uint256 funded) {
-        if (address(swapHelper) == address(0)) return 0;
-        
+        // N14 Fix: Removed strict swapHelper check
+        // Allow assets with purchaseAdapter to be liquidated even without swapHelper
+
         uint256 remaining = amountNeeded;
 
         // Liquidate Layer1 yield assets
