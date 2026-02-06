@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC4626Upgradeable.sol";
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -122,6 +121,10 @@ contract PPT is
     error DepositBelowMinimum(uint256 amount, uint256 minimum);
     error InsufficientShares(uint256 available, uint256 required);
     error OnlyOperator();
+    // N39 Fix: Block deposits when all shares are locked (effectiveSupply=0 but totalSupply>0)
+    error DepositsBlockedAllSharesLocked();
+    // N39 Fix: Backstop - never mint 0 shares for non-zero deposit
+    error ZeroSharesMinted();
 
     // =============================================================================
     // Modifiers
@@ -171,7 +174,7 @@ contract PPT is
     // =============================================================================
     // ERC4626 Core - View Functions
     // =============================================================================
-    
+
     /// @notice Calculate total assets (after deducting liabilities and fees)
     function totalAssets() public view override returns (uint256) {
         uint256 grossValue = _getGrossAssets();
@@ -196,7 +199,7 @@ contract PPT is
     function sharePrice() public view override returns (uint256) {
         uint256 supply = effectiveSupply();
         if (supply == 0) return PPTTypes.PRECISION;
-        return (totalAssets() * PPTTypes.PRECISION) / supply;
+        return ((totalAssets() + PPTTypes.VIRTUAL_OFFSET) * PPTTypes.PRECISION) / (supply + PPTTypes.VIRTUAL_OFFSET);
     }
 
     /// @notice Gross assets (without deducting liabilities)
@@ -225,7 +228,7 @@ contract PPT is
         if(supply>0){
             require(totalAsset>0, "totalAsset is not 0");
         }
-        return assets.mulDiv(supply + 10 ** _decimalsOffset(), totalAsset + 1, rounding);
+        return assets.mulDiv(supply + PPTTypes.VIRTUAL_OFFSET, totalAsset + PPTTypes.VIRTUAL_OFFSET, rounding);
     }
 
     /// @notice Override asset conversion, using effectiveSupply to maintain consistency with sharePrice
@@ -236,7 +239,7 @@ contract PPT is
         if(supply>0){
             require(totalAsset>0, "totalAsset is not 0");
         }
-        return shares.mulDiv(totalAsset + 1, supply + 10 ** _decimalsOffset(), rounding);
+        return shares.mulDiv(totalAsset + PPTTypes.VIRTUAL_OFFSET, supply + PPTTypes.VIRTUAL_OFFSET, rounding);
     }
 
     // =============================================================================
@@ -250,6 +253,8 @@ contract PPT is
         if (assets == 0) revert ZeroAmount();
         if (assets < PPTTypes.MIN_DEPOSIT) revert DepositBelowMinimum(assets, PPTTypes.MIN_DEPOSIT);
         if (receiver == address(0)) revert ZeroAddress();
+        // N39 Fix: Block deposits only when effectiveSupply=0 AND unaccounted assets exist (donation attack)
+        if (effectiveSupply() == 0 && totalAssets() > 0) revert DepositsBlockedAllSharesLocked();
 
         // Force refresh NAV to prevent arbitrage attacks
         if (address(assetController) != address(0)) {
@@ -257,6 +262,8 @@ contract PPT is
         }
 
         shares = previewDeposit(assets);
+        // N39 Fix: Backstop - never mint 0 shares for non-zero deposit
+        if (shares == 0) revert ZeroSharesMinted();
 
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), assets);
         _mint(receiver, shares);
@@ -267,13 +274,15 @@ contract PPT is
         emit Deposit(msg.sender, receiver, assets, shares);
         //emit DepositProcessed(msg.sender, receiver, assets, shares);
     }
-    
+
     function mint(
         uint256 shares,
         address receiver
     ) public override nonReentrant whenNotPaused returns (uint256 assets) {
         if (shares == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
+        // N39 Fix: Block deposits only when effectiveSupply=0 AND unaccounted assets exist (donation attack)
+        if (effectiveSupply() == 0 && totalAssets() > 0) revert DepositsBlockedAllSharesLocked();
 
         // Force refresh NAV to prevent arbitrage attacks
         if (address(assetController) != address(0)) {
