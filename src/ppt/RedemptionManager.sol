@@ -185,6 +185,7 @@ contract RedemptionManager is
     error SettlementDelayTooLong(uint256 provided, uint256 maximum);
     error NotVoucherOwner(address caller, address owner);
     error CancellationDisabled();
+    error LiabilityExceedsAssets(uint256 grossAssets, uint256 totalLiability);
 
     // =============================================================================
     // Constructor & Initializer
@@ -530,7 +531,9 @@ contract RedemptionManager is
         // After approval:
         // 1. Convert pending approval shares to locked shares (affects effectiveSupply)
         vault.convertPendingToLocked(request.owner, request.shares);
-        // 2. Add liability (affects totalAssets)
+        // 2. N40 Fix: Check solvency before adding liability
+        _checkSolvency(request.grossAmount);
+        // 3. Add liability (affects totalAssets)
         vault.addRedemptionLiability(request.grossAmount);
         // 3. Record daily liability (for quota calculation)
         _addDailyLiability(settlementTime, request.grossAmount);
@@ -621,6 +624,7 @@ contract RedemptionManager is
             totalPendingApprovalAmount += grossAmount;
         } else {
             // No approval needed: lock shares + add liability + daily liability
+            _checkSolvency(grossAmount);
             vault.lockShares(owner, shares);
             vault.addRedemptionLiability(grossAmount);
             _addDailyLiability(settlementTime, grossAmount);
@@ -691,6 +695,7 @@ contract RedemptionManager is
             totalPendingApprovalAmount += grossAmount;
         } else {
             // No approval needed: lock shares + add liability + daily liability
+            _checkSolvency(grossAmount);
             vault.lockShares(owner, shares);
             vault.addRedemptionLiability(grossAmount);
             _addDailyLiability(settlementTime, grossAmount);
@@ -826,6 +831,19 @@ contract RedemptionManager is
     /// @dev Get underlying asset address
     function _asset() internal view returns (address) {
         return IERC4626(address(vault)).asset();
+    }
+
+    // =============================================================================
+    // N40 Fix: Solvency Check
+    // =============================================================================
+
+    /// @notice Prevent liability from exceeding gross assets (NAV crash protection)
+    function _checkSolvency(uint256 additionalLiability) internal view {
+        uint256 gross = vault.grossAssets();
+        uint256 newTotalLiability = vault.totalRedemptionLiability() + additionalLiability;
+        if (newTotalLiability > gross) {
+            revert LiabilityExceedsAssets(gross, newTotalLiability);
+        }
     }
 
     // =============================================================================

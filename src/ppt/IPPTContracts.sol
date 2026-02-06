@@ -11,6 +11,7 @@ interface IPPT {
     function effectiveSupply() external view returns (uint256);
 
     // ========== State Queries ==========
+    function grossAssets() external view returns (uint256);
     function totalRedemptionLiability() external view returns (uint256);
     function totalLockedShares() external view returns (uint256);
     function withdrawableRedemptionFees() external view returns (uint256);
