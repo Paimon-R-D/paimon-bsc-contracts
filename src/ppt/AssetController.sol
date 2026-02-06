@@ -594,7 +594,7 @@ contract AssetController is
         if (tier == PPTTypes.LiquidityTier.TIER_1_CASH) {
             total = IERC20(_asset()).balanceOf(address(vault));
         }
-        
+
         address[] storage assets = _layerAssets[tier];
         for (uint256 i = 0; i < assets.length; i++) {
             address token = assets[i];
@@ -602,7 +602,8 @@ contract AssetController is
             if (balance > 0 && address(oracleAdapter) != address(0)) {
                 uint256 price = oracleAdapter.getPrice(token);
                 uint8 decimals = _assetConfigs[_assetIndex[token] - 1].decimals;
-                total += (balance * price) / (10 ** decimals);
+                // N10 Fix: normalize to baseDecimals
+                total += _toBaseDecimals((balance * price) / (10 ** decimals));
             }
         }
     }
@@ -654,8 +655,6 @@ contract AssetController is
     function _calculateAssetValueInternal() internal view returns (uint256 totalValue) {
         if (address(oracleAdapter) == address(0)) return totalPendingValue;
 
-        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
-
         // 1. Calculate vault's held assets (existing logic)
         for (uint256 i = 0; i < _assetConfigs.length; i++) {
             PPTTypes.AssetConfig memory config = _assetConfigs[i];
@@ -665,15 +664,7 @@ contract AssetController is
             if (balance == 0) continue;
 
             uint256 price = oracleAdapter.getPrice(config.tokenAddress);
-            uint256 value = (balance * price) / (10 ** config.decimals);
-
-            if (baseDecimals < 18) {
-                value = value / (10 ** (18 - baseDecimals));
-            } else if (baseDecimals > 18) {
-                value = value * (10 ** (baseDecimals - 18));
-            }
-
-            totalValue += value;
+            totalValue += _toBaseDecimals((balance * price) / (10 ** config.decimals));
         }
 
         // 2. Add pending settlement receivable value (KEY ADDITION for NAV protection!)
@@ -684,6 +675,28 @@ contract AssetController is
     // =============================================================================
     // Internal Helper Functions
     // =============================================================================
+
+    /// @dev Normalize an 18-decimal value to baseDecimals (e.g., 6 for USDT)
+    function _toBaseDecimals(uint256 value18) internal view returns (uint256) {
+        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
+        if (baseDecimals < 18) {
+            return value18 / (10 ** (18 - baseDecimals));
+        } else if (baseDecimals > 18) {
+            return value18 * (10 ** (baseDecimals - 18));
+        }
+        return value18;
+    }
+
+    /// @dev Scale a baseDecimals value up to 18 decimals
+    function _to18Decimals(uint256 valueBase) internal view returns (uint256) {
+        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
+        if (baseDecimals < 18) {
+            return valueBase * (10 ** (18 - baseDecimals));
+        } else if (baseDecimals > 18) {
+            return valueBase / (10 ** (baseDecimals - 18));
+        }
+        return valueBase;
+    }
 
     /// @dev Get underlying asset address (via IERC4626)
     function _asset() internal view returns (address) {
@@ -1060,16 +1073,19 @@ function _sellAsset(
         uint256 balance = IERC20(token).balanceOf(address(vault));
         if (balance == 0) return amountNeeded;
         if (address(oracleAdapter) == address(0)) return amountNeeded;
-        
+
         uint256 price = oracleAdapter.getPrice(token);
         uint8 decimals = _assetConfigs[_assetIndex[token] - 1].decimals;
-        uint256 tokenValue = (balance * price) / (10 ** decimals);
-        
+
+        // N10 Fix: normalize tokenValue to baseDecimals to match amountNeeded
+        uint256 tokenValue = _toBaseDecimals((balance * price) / (10 ** decimals));
+
         uint256 tokensToSell;
         if (tokenValue <= amountNeeded) {
             tokensToSell = balance;
         } else {
-            tokensToSell = (amountNeeded * (10 ** decimals)) / price;
+            // N10 Fix: scale amountNeeded to 18 decimals before dividing by 18-decimal price
+            tokensToSell = (_to18Decimals(amountNeeded) * (10 ** decimals)) / price;
         }
         
         if (tokensToSell == 0) return amountNeeded;
