@@ -7,7 +7,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 library OracleTyping{
-
+    
     enum PaimonOracle{
         chainlink,
         USDT
@@ -44,7 +44,7 @@ contract PaimonOracleAdapter is
     error ZeroAddress();
     error OracleNotFound();
     error InvalidValue(address asset, int256 value);
-
+ 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
@@ -97,7 +97,7 @@ contract PaimonOracleAdapter is
         emit RemoveOracleFeed(asset);
     }
 
-
+    
     function getPrice(address asset) external view override returns (uint256 price) {
         if (OracleRecord[asset].feed == address(0)) revert OracleNotFound();
         OracleTyping.OracleType memory oracleRecord = OracleRecord[asset];
@@ -171,8 +171,8 @@ contract PaimonOracleAdapter is
      *      If price is 0, revert
      */
     function _priceFormat(address asset, int256 price, uint8 decimals) internal pure returns (uint256) {
-        // uint256 is unsigned, minimum value is 0, so check == 0
-        if(price == 0){
+        // N36 Fix: reject zero and negative prices to prevent unsafe int256 -> uint256 cast
+        if(price <= 0){
             revert InvalidValue(asset, price);
         }
          uint256 rprice = uint256(price);
