@@ -40,6 +40,8 @@ contract AssetController is
     bytes32 public constant KEEPER_ROLE=keccak256("KEEPER_ROLE");
     /// @notice Delayed adapter role - Only authorized adapters can register delayed settlements (prevents NAV inflation)
     bytes32 public constant DELAYED_ADAPTER_ROLE = keccak256("DELAYED_ADAPTER_ROLE");
+    /// @notice Liquidator role - Only authorized contracts (e.g. RedemptionManager) can execute waterfall liquidation
+    bytes32 public constant LIQUIDATOR_ROLE = keccak256("LIQUIDATOR_ROLE");
 
     // =============================================================================
     // External Contract References
@@ -472,7 +474,7 @@ contract AssetController is
     function executeWaterfallLiquidation(
         uint256 amountNeeded,
         PPTTypes.LiquidityTier maxTier
-    ) external override onlyRole(REBALANCER_ROLE) nonReentrant returns (uint256 funded) {
+    ) external override onlyRole(LIQUIDATOR_ROLE) nonReentrant returns (uint256 funded) {
         funded = _executeWaterfallLiquidation(amountNeeded, maxTier);
 
         // Invalidate cache after liquidation
