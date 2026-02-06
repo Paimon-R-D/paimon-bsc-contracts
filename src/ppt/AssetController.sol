@@ -983,8 +983,11 @@ function _sellAsset(
         uint256 balBefore = IERC20(vaultAsset).balanceOf(address(vault));
         vault.approveAsset(token, address(swapHelper), tokenAmount);
 
+        // N34 Fix: Use asset-specific slippage, consistent with OTC path
+        uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
+
         try swapHelper.sellRWAAsset(
-            token, vaultAsset, tokenAmount, defaultSwapSlippage, address(vault)
+            token, vaultAsset, tokenAmount, slippageBps, address(vault)
         ) returns (uint256 reported) {
             uint256 actualReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balBefore;
 
@@ -995,7 +998,7 @@ function _sellAsset(
 
             // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
             if (address(oracleAdapter) != address(0)) {
-                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, defaultSwapSlippage);
+                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, slippageBps);
                 if (actualReceived < minOutput) {
                     revert OutputBelowMinimum(actualReceived, minOutput);
                 }
