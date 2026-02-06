@@ -690,40 +690,47 @@ contract AssetController is
     }
 
     /// @dev Calculate minimum output amount based on Oracle price for purchase operations
+    /// @param tokenIn Input token address (may be non-USD token like WBTC)
     /// @param tokenOut Target token address
-    /// @param amountIn Input amount (in input token units, assumed to be USD-denominated for vault asset)
+    /// @param amountIn Input amount (in input token units)
     /// @param maxSlippageBps Maximum slippage (basis points)
     /// @return minOutput Minimum acceptable output amount
     function _calculateMinOutput(
+        address tokenIn,
         address tokenOut,
         uint256 amountIn,
         uint256 maxSlippageBps
     ) internal view returns (uint256 minOutput) {
-        // Get Oracle price (18 decimals, represents USD value of 1 target token)
+        // Get Oracle price for target token (18 decimals, represents USD value of 1 target token)
         uint256 price = oracleAdapter.getPrice(tokenOut);
 
         // Get target token decimals
         uint8 decimals = _assetConfigs[_assetIndex[tokenOut] - 1].decimals;
 
-        // Get base asset (USDT) decimals
-        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
+        // Get input token decimals
+        uint8 inDecimals = IERC20Metadata(tokenIn).decimals();
 
         // Normalize amountIn to 18 decimals for calculation
         uint256 amountIn18;
-        if (baseDecimals < 18) {
-            amountIn18 = amountIn * (10 ** (18 - baseDecimals));
-        } else if (baseDecimals > 18) {
-            amountIn18 = amountIn / (10 ** (baseDecimals - 18));
+        if (inDecimals < 18) {
+            amountIn18 = amountIn * (10 ** (18 - inDecimals));
+        } else if (inDecimals > 18) {
+            amountIn18 = amountIn / (10 ** (inDecimals - 18));
         } else {
             amountIn18 = amountIn;
         }
 
-        // Calculate expected output: amountIn (in USD) / price (USD per token)
-        // expectedOutput = amountIn18 * 10^decimals / price
-        uint256 expectedOutput = (amountIn18 * (10 ** decimals)) / price;
+        // N33 Fix: If tokenIn is not the vault base asset (e.g. USDT), convert to USD value via oracle
+        uint256 amountInUSD18 = amountIn18;
+        if (tokenIn != _asset()) {
+            uint256 tokenInPrice = oracleAdapter.getPrice(tokenIn);
+            amountInUSD18 = (amountIn18 * tokenInPrice) / PPTTypes.PRECISION;
+        }
+
+        // Calculate expected output: amountInUSD (in USD) / price (USD per token)
+        uint256 expectedOutput = (amountInUSD18 * (10 ** decimals)) / price;
 
         // Apply slippage to calculate minimum output
-        // minOutput = expectedOutput * (10000 - maxSlippageBps) / 10000
         minOutput = (expectedOutput * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
     }
 
@@ -873,7 +880,7 @@ contract AssetController is
             // Delayed settlement assets should use purchaseDelayedAsset() which creates PendingSettlement record
             if (tokensReceived > 0 && address(oracleAdapter) != address(0)) {
                 uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
-                uint256 minOutput = _calculateMinOutput(config.tokenAddress, amountIn, slippageBps);
+                uint256 minOutput = _calculateMinOutput(tokenIn, config.tokenAddress, amountIn, slippageBps);
                 if (tokensReceived < minOutput) {
                     revert OutputBelowMinimum(tokensReceived, minOutput);
                 }
@@ -914,7 +921,7 @@ contract AssetController is
 
             // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
             if (address(oracleAdapter) != address(0)) {
-                uint256 minOutput = _calculateMinOutput(config.tokenAddress, amountIn, slippageBps);
+                uint256 minOutput = _calculateMinOutput(tokenIn, config.tokenAddress, amountIn, slippageBps);
                 if (tokensReceived < minOutput) {
                     revert OutputBelowMinimum(tokensReceived, minOutput);
                 }
