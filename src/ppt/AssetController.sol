@@ -432,6 +432,9 @@ contract AssetController is
         if (index == 0) revert AssetNotFound(tokenOut);
         if (amountIn == 0) revert ZeroAmount();
 
+
+        vault.resetLockedMintAssets();
+
         // If tokenIn is address(0), use vault's underlying asset (USDT)
         address actualTokenIn = tokenIn == address(0) ? _asset() : tokenIn;
         (uint256 spent, uint256 received) = _executePurchase(index - 1, actualTokenIn, amountIn);
@@ -439,8 +442,7 @@ contract AssetController is
 
         emit AssetPurchased(tokenOut, _assetConfigs[index - 1].tier, spent, received);
 
-        // N37 Fix: reset after _executePurchase so lock check inside is effective
-        vault.resetLockedMintAssets();
+       
 
         // Invalidate cache after asset purchase
         _invalidateCache();
