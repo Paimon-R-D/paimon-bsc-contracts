@@ -155,23 +155,24 @@ interface IAssetController {
     // ========== Delayed Settlement Management ==========
     /// @notice Set whether an asset uses delayed settlement (ADMIN Call)
     function setDelayedSettlementAsset(address asset, bool isDelayed) external;
-    /// @notice Set default settlement timeout (ADMIN Call)
-    function setDefaultSettlementTimeout(uint256 timeout) external;
+    /// @notice N12 Fix: Record vault balance snapshot before adapter transfers tokens out (DELAYED_ADAPTER_ROLE Call)
+    function snapshotVaultBalance(address token) external;
     /// @notice Purchase delayed settlement asset (DELAYED_ADAPTER_ROLE Call) - PURCHASE type
-    /// @dev Used when buying assets with delayed settlement (e.g., CASH+). USDT is sent but asset not yet received.
-    function purchaseDelayedAsset(address token, uint256 usdtAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
-    /// @notice Confirm settlement completed (KEEPER Call)
+    /// @dev Payment token sent but asset not yet received.
+    function purchaseDelayedAsset(address token, address payToken, uint256 payAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
+    /// @notice Redeem delayed settlement asset (DELAYED_ADAPTER_ROLE Call) - SALE type
+    /// @dev Asset sent but payment token not yet received.
+    function redeemDelayedAsset(address token, address payToken, uint256 tokenAmount, uint256 expectedPayValue) external returns (uint256 settlementId);
+    /// @notice Confirm settlement: callback adapter to claim + pull tokens to vault atomically (REBALANCER_ROLE Call)
     function confirmSettlement(uint256 settlementId) external;
-    /// @notice Mark settlement as abnormal if timeout (KEEPER/REBALANCER/DELAYED_ADAPTER only)
-    function checkAndMarkAbnormal(uint256 settlementId) external;
+    /// @notice Cancel settlement: callback adapter to cancel + pull returned assets to vault atomically (REBALANCER_ROLE Call)
+    function cancelSettlement(uint256 settlementId) external;
 
     // ========== Delayed Settlement Queries ==========
     /// @notice Get total pending settlement value
     function totalPendingValue() external view returns (uint256);
     /// @notice Check if asset is delayed settlement type
     function isDelayedSettlementAsset(address asset) external view returns (bool);
-    /// @notice Get default settlement timeout
-    function defaultSettlementTimeout() external view returns (uint256);
 }
 
 /// @title IOracleAdapter

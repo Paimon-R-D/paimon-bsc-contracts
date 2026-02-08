@@ -70,7 +70,7 @@ library PPTTypes {
     enum SettlementStatus {
         PENDING,    // Waiting for settlement
         SETTLED,    // Settlement completed
-        ABNORMAL    // Abnormal (timeout)
+        CANCELLED   // Cancelled by adapter
     }
 
     // =============================================================================

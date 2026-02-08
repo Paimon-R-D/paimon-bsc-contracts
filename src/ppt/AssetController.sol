@@ -12,6 +12,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
 import {IPPT, IAssetController, IOracleAdapter, ISwapHelper, IOTCManager, IAssetScheduler} from "./IPPTContracts.sol";
+import {IPaimonDelayAdapter} from "../adapters/IAaveV3Pool.sol";
 
 
 /// @title AssetController
@@ -92,9 +93,11 @@ contract AssetController is
     struct PendingSettlement {
         uint256 id;                         // Settlement ID
         PPTTypes.SettlementType sType;      // Settlement type (SALE/PURCHASE)
-        address asset;                      // Asset involved (sold asset for SALE, expected asset for PURCHASE)
+        address asset;                      // RWA asset involved (e.g., CASH+)
+        address paymentToken;               // Payment token (e.g., USDT, or other token used in trade)
+        address adapter;                    // Adapter address that created this settlement (for token pull)
         uint256 assetAmount;                // Asset amount
-        uint256 expectedUsdtValue;          // Expected USDT value (for NAV calculation)
+        uint256 expectedUsdtValue;          // Expected value in payment token terms (for NAV calculation)
         uint256 createdAt;                  // Creation timestamp
         uint256 deadline;                   // Settlement deadline
         PPTTypes.SettlementStatus status;   // Settlement status
@@ -114,6 +117,10 @@ contract AssetController is
 
     /// @notice Default settlement timeout (configurable)
     uint256 public defaultSettlementTimeout;
+
+    /// @dev N12 Fix: Vault balance snapshot for delayed settlement verification
+    /// @dev Encoded as balance + 1 to distinguish "valid snapshot with 0 balance" from "no snapshot"
+    mapping(address => mapping(address => uint256)) private _settlementSnapshot;
 
     // =============================================================================
     // Event Definitions
@@ -157,12 +164,10 @@ contract AssetController is
     event SettlementCreated(uint256 indexed id, PPTTypes.SettlementType sType, address indexed asset, uint256 amount, uint256 expectedValue);
     /// @notice Settlement confirmed event
     event SettlementConfirmed(uint256 indexed id, uint256 actualAmount);
-    /// @notice Settlement marked as abnormal event
-    event SettlementMarkedAbnormal(uint256 indexed id);
     /// @notice Delayed settlement asset configuration updated event
     event DelayedSettlementAssetUpdated(address indexed asset, bool isDelayed);
-    /// @notice Default settlement timeout updated event
-    event DefaultSettlementTimeoutUpdated(uint256 oldTimeout, uint256 newTimeout);
+    /// @notice Settlement cancelled event (adapter-initiated cancel, no timeout required)
+    event SettlementCancelled(uint256 indexed id);
 
     // =============================================================================
     // Error Definitions
@@ -207,8 +212,10 @@ contract AssetController is
     error SettlementNotFound(uint256 settlementId);
     /// @notice Invalid settlement status for operation
     error InvalidSettlementStatus(uint256 settlementId, PPTTypes.SettlementStatus currentStatus);
-    /// @notice Settlement not yet timed out
-    error SettlementNotTimedOut(uint256 settlementId, uint256 deadline, uint256 currentTime);
+    /// @notice N12 Fix: Snapshot must be taken before delayed settlement
+    error SnapshotRequired(address adapter, address token);
+    /// @notice N12 Fix: Vault balance did not decrease by expected amount
+    error InsufficientVaultOutflow(address token, uint256 expected, uint256 actual);
 
     // =============================================================================
     // Constructor & Initialization
@@ -233,7 +240,6 @@ contract AssetController is
 
         vault = IPPT(vault_);
         defaultSwapSlippage = 100; // 1%
-        defaultSettlementTimeout = 7 days; // Default 7 days settlement timeout
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(ADMIN_ROLE, admin_);
@@ -717,16 +723,14 @@ contract AssetController is
         uint256 amountIn,
         uint256 maxSlippageBps
     ) internal view returns (uint256 minOutput) {
-        // Get Oracle price for target token (18 decimals, represents USD value of 1 target token)
-        uint256 price = oracleAdapter.getPrice(tokenOut);
+        // Get input token decimals and normalize amountIn to 18 decimals
+        uint8 inDecimals;
+        if (_assetIndex[tokenIn] > 0) {
+            inDecimals = _assetConfigs[_assetIndex[tokenIn] - 1].decimals;
+        } else {
+            inDecimals = IERC20Metadata(tokenIn).decimals();
+        }
 
-        // Get target token decimals
-        uint8 decimals = _assetConfigs[_assetIndex[tokenOut] - 1].decimals;
-
-        // Get input token decimals
-        uint8 inDecimals = IERC20Metadata(tokenIn).decimals();
-
-        // Normalize amountIn to 18 decimals for calculation
         uint256 amountIn18;
         if (inDecimals < 18) {
             amountIn18 = amountIn * (10 ** (18 - inDecimals));
@@ -736,52 +740,26 @@ contract AssetController is
             amountIn18 = amountIn;
         }
 
-        // N33 Fix: If tokenIn is not the vault base asset (e.g. USDT), convert to USD value via oracle
+        // Convert input amount to USD value (18 decimals)
         uint256 amountInUSD18 = amountIn18;
         if (tokenIn != _asset()) {
             uint256 tokenInPrice = oracleAdapter.getPrice(tokenIn);
             amountInUSD18 = (amountIn18 * tokenInPrice) / PPTTypes.PRECISION;
         }
 
-        // Calculate expected output: amountInUSD (in USD) / price (USD per token)
-        uint256 expectedOutput = (amountInUSD18 * (10 ** decimals)) / price;
-
-        // Apply slippage to calculate minimum output
-        minOutput = (expectedOutput * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
-    }
-
-    /// @dev Calculate minimum output amount based on Oracle price for sell operations
-    /// @param tokenIn Token address to sell
-    /// @param amountIn Amount of tokens to sell
-    /// @param maxSlippageBps Maximum slippage (basis points)
-    /// @return minOutput Minimum acceptable USDT output amount
-    function _calculateMinOutputForSell(
-        address tokenIn,
-        uint256 amountIn,
-        uint256 maxSlippageBps
-    ) internal view returns (uint256 minOutput) {
-        // Get token Oracle price (18 decimals)
-        uint256 price = oracleAdapter.getPrice(tokenIn);
-
-        // Get token decimals
-        uint8 decimals = _assetConfigs[_assetIndex[tokenIn] - 1].decimals;
-
-        // Get base asset (USDT) decimals
-        uint8 baseDecimals = IERC20Metadata(_asset()).decimals();
-
-        // Calculate expected output (in USDT): amountIn * price / 10^decimals
-        // Result is in 18 decimals
-        uint256 expectedOutput18 = (amountIn * price) / (10 ** decimals);
-
-        // Adjust to base asset precision
-        uint256 expectedOutput;
-        if (baseDecimals < 18) {
-            expectedOutput = expectedOutput18 / (10 ** (18 - baseDecimals));
-        } else if (baseDecimals > 18) {
-            expectedOutput = expectedOutput18 * (10 ** (baseDecimals - 18));
+        // Get output token decimals and price (base asset = $1, skip oracle)
+        uint256 outPrice;
+        uint8 outDecimals;
+        if (tokenOut == _asset()) {
+            outPrice = PPTTypes.PRECISION;
+            outDecimals = IERC20Metadata(tokenOut).decimals();
         } else {
-            expectedOutput = expectedOutput18;
+            outPrice = oracleAdapter.getPrice(tokenOut);
+            outDecimals = _assetConfigs[_assetIndex[tokenOut] - 1].decimals;
         }
+
+        // Calculate expected output: amountInUSD (18 dec) / outPrice (18 dec) * 10^outDecimals
+        uint256 expectedOutput = (amountInUSD18 * (10 ** outDecimals)) / outPrice;
 
         // Apply slippage
         minOutput = (expectedOutput * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
@@ -868,6 +846,9 @@ contract AssetController is
 
         // ==================== Step 2: Execute purchase ====================
 
+        // Determine slippage: prefer asset custom slippage, otherwise use default
+        uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
+
         if (method == PPTTypes.PurchaseMethod.OTC) {
             // ---------- OTC mode ----------
             // Use cases: RWA assets, assets without on-chain liquidity, KYC required assets
@@ -890,17 +871,6 @@ contract AssetController is
 
             // Calculate actual tokens received via balance difference
             tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - balBefore;
-            spent = amountIn;  // Record token spent
-
-            // Only verify when balance actually changed (skip delayed settlement scenarios)
-            // Delayed settlement assets should use purchaseDelayedAsset() which creates PendingSettlement record
-            if (tokensReceived > 0 && address(oracleAdapter) != address(0)) {
-                uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
-                uint256 minOutput = _calculateMinOutput(tokenIn, config.tokenAddress, amountIn, slippageBps);
-                if (tokensReceived < minOutput) {
-                    revert OutputBelowMinimum(tokensReceived, minOutput);
-                }
-            }
 
         } else {
             // ---------- DEX SWAP mode ----------
@@ -908,9 +878,6 @@ contract AssetController is
 
             // Check SwapHelper is configured
             if (address(swapHelper) == address(0)) revert SwapHelperNotConfigured();
-
-            // Determine slippage: prefer asset custom slippage, otherwise use default
-            uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
 
             // Slippage safety check, prevent MEV attacks from high slippage
             if (slippageBps > PPTTypes.MAX_SLIPPAGE_BPS) {
@@ -934,17 +901,19 @@ contract AssetController is
             if (tokensReceived != reportedReceived) {
                 revert OutputMismatch(reportedReceived, tokensReceived);
             }
-
-            // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
-            if (address(oracleAdapter) != address(0)) {
-                uint256 minOutput = _calculateMinOutput(tokenIn, config.tokenAddress, amountIn, slippageBps);
-                if (tokensReceived < minOutput) {
-                    revert OutputBelowMinimum(tokensReceived, minOutput);
-                }
-            }
-
-            spent = amountIn;  // Record token spent
         }
+
+        // ==================== Step 2.5: Oracle price verification ====================
+        // Unified check for both OTC and SWAP paths
+        // Skip when: 1) no Oracle configured  2) tokensReceived == 0 (delayed settlement in OTC)
+        if (tokensReceived > 0 && address(oracleAdapter) != address(0)) {
+            uint256 minOutput = _calculateMinOutput(tokenIn, config.tokenAddress, amountIn, slippageBps);
+            if (tokensReceived < minOutput) {
+                revert OutputBelowMinimum(tokensReceived, minOutput);
+            }
+        }
+
+        spent = amountIn;
 
         // ==================== Step 3: Cleanup ====================
 
@@ -983,7 +952,7 @@ function _sellAsset(
             // Only verify when balance actually changed (skip delayed settlement scenarios)
             if (usdtReceived > 0 && address(oracleAdapter) != address(0)) {
                 uint256 slippageBps = config.maxSlippage > 0 ? config.maxSlippage : defaultSwapSlippage;
-                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, slippageBps);
+                uint256 minOutput = _calculateMinOutput(token, vaultAsset, tokenAmount, slippageBps);
                 if (usdtReceived < minOutput) {
                     revert OutputBelowMinimum(usdtReceived, minOutput);
                 }
@@ -1014,7 +983,7 @@ function _sellAsset(
 
             // Verify output meets minimum requirement based on Oracle price (only if Oracle available)
             if (address(oracleAdapter) != address(0)) {
-                uint256 minOutput = _calculateMinOutputForSell(token, tokenAmount, slippageBps);
+                uint256 minOutput = _calculateMinOutput(token, vaultAsset, tokenAmount, slippageBps);
                 if (actualReceived < minOutput) {
                     revert OutputBelowMinimum(actualReceived, minOutput);
                 }
@@ -1050,15 +1019,6 @@ function _sellAsset(
             remaining = _liquidateAsset(l1Assets[i], remaining, PPTTypes.LiquidityTier.TIER_1_CASH);
         }
 
-        // Liquidate Layer2
-        // if (maxTier >= PPTTypes.LiquidityTier.TIER_2_MMF) {
-        //     address[] storage l2Assets = _layerAssets[PPTTypes.LiquidityTier.TIER_2_MMF];
-        //     for (uint256 i = 0; i < l2Assets.length && remaining > 0; i++) {
-        //         remaining = _liquidateAsset(l2Assets[i], remaining, PPTTypes.LiquidityTier.TIER_2_MMF);
-        //     }
-        // }
-        
-      
         funded = amountNeeded - remaining;
     }
 
@@ -1135,14 +1095,7 @@ function _sellAsset(
         emit SwapSlippageUpdate(slippage);
     }
 
-    // /// @notice Refresh asset value cache
-    // /// @dev Force update asset value cache
-    // function refreshCache() external override {
-    //     _cachedAssetValue = CachedValue({
-    //         value: _calculateAssetValueInternal(),
-    //         timestamp: block.timestamp
-    //     });
-    // }
+
 
     // =============================================================================
     // Pending Settlement Functions (NAV Protection during settlement delay)
@@ -1157,94 +1110,202 @@ function _sellAsset(
         emit DelayedSettlementAssetUpdated(asset, isDelayed);
     }
 
-    /// @notice Set default settlement timeout
-    /// @dev Only ADMIN can set the timeout period
-    /// @param timeout Timeout in seconds
-    function setDefaultSettlementTimeout(uint256 timeout) external override onlyRole(ADMIN_ROLE) {
-        uint256 oldTimeout = defaultSettlementTimeout;
-        defaultSettlementTimeout = timeout;
-        emit DefaultSettlementTimeoutUpdated(oldTimeout, timeout);
+    /// @notice N12 Fix: Record vault balance snapshot before adapter transfers tokens out
+    /// @dev Must be called by adapter BEFORE transferFrom(vault). Encoded as balance+1 to distinguish from "no snapshot".
+    /// @param token Token address to snapshot (payToken for purchase, asset for redeem)
+    function snapshotVaultBalance(address token) external override onlyRole(DELAYED_ADAPTER_ROLE) {
+        _settlementSnapshot[msg.sender][token] = IERC20(token).balanceOf(address(vault)) + 1;
     }
 
     /// @notice Purchase delayed settlement asset (creates pending settlement record)
-    /// @dev Only authorized adapters (e.g., CashPlusAdapter) can call this to prevent NAV inflation attacks.
-    ///      USDT has been sent but asset tokens not yet received
-    /// @param token Asset being purchased
-    /// @param usdtAmount USDT amount spent on purchase
-    /// @param expectedTokenValue Expected value of tokens to receive (in USDT terms, for NAV calculation)
+    /// @dev Only authorized adapters can call. Payment token sent out, waiting for asset tokens to arrive.
+    /// @param token Asset being purchased (e.g., CASH+)
+    /// @param payToken Payment token used (e.g., USDT, or other token)
+    /// @param payAmount Payment amount spent
+    /// @param expectedTokenValue Expected value of tokens to receive (for NAV calculation)
     /// @return settlementId The created settlement ID
     function purchaseDelayedAsset(
         address token,
-        uint256 usdtAmount,
+        address payToken,
+        uint256 payAmount,
         uint256 expectedTokenValue
     ) external override onlyRole(DELAYED_ADAPTER_ROLE) nonReentrant whenNotPaused returns (uint256 settlementId) {
         if (!isDelayedSettlementAsset[token]) revert NotDelayedSettlementAsset(token);
-        if (usdtAmount == 0) revert ZeroAmount();
+        if (payAmount == 0) revert ZeroAmount();
 
-        // Create pending settlement record for PURCHASE type
-        // This tracks: USDT sent out, waiting for asset tokens to arrive
+        // N12 Fix: Verify vault balance actually decreased by at least payAmount
+        {
+            uint256 snapshot = _settlementSnapshot[msg.sender][payToken];
+            if (snapshot == 0) revert SnapshotRequired(msg.sender, payToken);
+            uint256 balBefore = snapshot - 1;
+            uint256 balAfter = IERC20(payToken).balanceOf(address(vault));
+            if (balBefore <= balAfter || balBefore - balAfter < payAmount) {
+                revert InsufficientVaultOutflow(payToken, payAmount, balBefore > balAfter ? balBefore - balAfter : 0);
+            }
+            delete _settlementSnapshot[msg.sender][payToken];
+        }
+
         settlementId = ++settlementIdCounter;
         pendingSettlements[settlementId] = PendingSettlement({
             id: settlementId,
             sType: PPTTypes.SettlementType.PURCHASE,
             asset: token,
-            assetAmount: usdtAmount,              // USDT amount spent
-            expectedUsdtValue: expectedTokenValue, // Expected value of tokens (protects NAV)
+            paymentToken: payToken,
+            adapter: msg.sender,
+            assetAmount: payAmount,
+            expectedUsdtValue: expectedTokenValue,
             createdAt: block.timestamp,
-            deadline: block.timestamp + defaultSettlementTimeout,
+            deadline: 0,
             status: PPTTypes.SettlementStatus.PENDING
         });
 
-        // Add to total pending value (protects NAV during settlement period)
-        // This compensates for the USDT that left the vault
         totalPendingValue += expectedTokenValue;
 
-        emit SettlementCreated(settlementId, PPTTypes.SettlementType.PURCHASE, token, usdtAmount, expectedTokenValue);
+        emit SettlementCreated(settlementId, PPTTypes.SettlementType.PURCHASE, token, payAmount, expectedTokenValue);
         _invalidateCache();
     }
 
-    /// @notice Confirm settlement completed (USDT arrived)
-    /// @dev Only authorized adapters can call this to ensure funds actually arrived before confirmation
-    /// @param settlementId Settlement ID to confirm
-    function confirmSettlement(uint256 settlementId) external override onlyRole(DELAYED_ADAPTER_ROLE) {
+    /// @notice Redeem delayed settlement asset (creates SALE pending settlement record)
+    /// @dev Only authorized adapters can call. Asset sent out, waiting for payment token to arrive.
+    /// @param token Asset being redeemed (e.g., CASH+)
+    /// @param payToken Payment token expected to receive (e.g., USDT)
+    /// @param tokenAmount Amount of asset tokens sent
+    /// @param expectedPayValue Expected payment token value to receive (for NAV protection)
+    /// @return settlementId The created settlement ID
+    function redeemDelayedAsset(
+        address token,
+        address payToken,
+        uint256 tokenAmount,
+        uint256 expectedPayValue
+    ) external override onlyRole(DELAYED_ADAPTER_ROLE) nonReentrant whenNotPaused returns (uint256 settlementId) {
+        if (!isDelayedSettlementAsset[token]) revert NotDelayedSettlementAsset(token);
+        if (tokenAmount == 0) revert ZeroAmount();
+
+        // N12 Fix: Verify vault balance actually decreased by at least tokenAmount
+        {
+            uint256 snapshot = _settlementSnapshot[msg.sender][token];
+            if (snapshot == 0) revert SnapshotRequired(msg.sender, token);
+            uint256 balBefore = snapshot - 1;
+            uint256 balAfter = IERC20(token).balanceOf(address(vault));
+            if (balBefore <= balAfter || balBefore - balAfter < tokenAmount) {
+                revert InsufficientVaultOutflow(token, tokenAmount, balBefore > balAfter ? balBefore - balAfter : 0);
+            }
+            delete _settlementSnapshot[msg.sender][token];
+        }
+
+        settlementId = ++settlementIdCounter;
+        pendingSettlements[settlementId] = PendingSettlement({
+            id: settlementId,
+            sType: PPTTypes.SettlementType.SALE,
+            asset: token,
+            paymentToken: payToken,
+            adapter: msg.sender,
+            assetAmount: tokenAmount,
+            expectedUsdtValue: expectedPayValue,
+            createdAt: block.timestamp,
+            deadline: 0,
+            status: PPTTypes.SettlementStatus.PENDING
+        });
+
+        // Add to total pending value (protects NAV: compensates for asset that left vault)
+        totalPendingValue += expectedPayValue;
+
+        emit SettlementCreated(settlementId, PPTTypes.SettlementType.SALE, token, tokenAmount, expectedPayValue);
+        _invalidateCache();
+    }
+
+    /// @notice Cancel settlement: callback adapter to cancel + pull returned assets to vault atomically
+    /// @dev V2: Single-tx atomic flow: controller → adapter.onCancelSettlement() → cancel + approve → transferFrom → vault
+    /// @param settlementId Settlement ID to cancel
+    function cancelSettlement(uint256 settlementId) external override onlyRole(REBALANCER_ROLE) nonReentrant {
         PendingSettlement storage settlement = pendingSettlements[settlementId];
         if (settlement.id == 0) revert SettlementNotFound(settlementId);
         if (settlement.status != PPTTypes.SettlementStatus.PENDING) {
             revert InvalidSettlementStatus(settlementId, settlement.status);
         }
 
-        // Remove from total pending value
-        totalPendingValue -= settlement.expectedUsdtValue;
+        // Step 1: Callback adapter — cancel + approve returned assets
+        uint256 returnedAmount = IPaimonDelayAdapter(settlement.adapter).onCancelSettlement(settlementId);
 
+        // Step 2: Pull returned assets to vault (if any)
+        if (returnedAmount > 0) {
+            if (settlement.sType == PPTTypes.SettlementType.PURCHASE) {
+                IERC20(settlement.paymentToken).safeTransferFrom(settlement.adapter, address(vault), returnedAmount);
+            } else {
+                IERC20(settlement.asset).safeTransferFrom(settlement.adapter, address(vault), returnedAmount);
+            }
+        }
+
+        // Step 3: Update state
+        totalPendingValue -= settlement.expectedUsdtValue;
+        settlement.status = PPTTypes.SettlementStatus.CANCELLED;
+
+        emit SettlementCancelled(settlementId);
+        _invalidateCache();
+    }
+
+    /// @notice Confirm settlement: callback adapter to claim + pull tokens to vault atomically
+    /// @dev V2: Single-tx atomic flow: controller → adapter.onConfirmSettlement() → claim + approve → transferFrom → vault
+    /// @param settlementId Settlement ID to confirm
+    function confirmSettlement(uint256 settlementId) external override onlyRole(REBALANCER_ROLE) nonReentrant {
+        PendingSettlement storage settlement = pendingSettlements[settlementId];
+        if (settlement.id == 0) revert SettlementNotFound(settlementId);
+        if (settlement.status != PPTTypes.SettlementStatus.PENDING) {
+            revert InvalidSettlementStatus(settlementId, settlement.status);
+        }
+
+        // Step 1: Callback adapter — claim + approve (atomic)
+        uint256 receivedAmount = IPaimonDelayAdapter(settlement.adapter).onConfirmSettlement(settlementId);
+        if (receivedAmount == 0) revert ZeroAmount();
+
+        // Step 2: Slippage validation
+        _validateSettlementSlippage(settlement, receivedAmount);
+
+        // Step 3: Pull tokens from adapter to vault (same tx, approve just set by callback)
+        if (settlement.sType == PPTTypes.SettlementType.PURCHASE) {
+            IERC20(settlement.asset).safeTransferFrom(settlement.adapter, address(vault), receivedAmount);
+        } else {
+            IERC20(settlement.paymentToken).safeTransferFrom(settlement.adapter, address(vault), receivedAmount);
+        }
+
+        // Step 4: Update state
+        totalPendingValue -= settlement.expectedUsdtValue;
         settlement.status = PPTTypes.SettlementStatus.SETTLED;
 
-        emit SettlementConfirmed(settlementId, settlement.expectedUsdtValue);
+        emit SettlementConfirmed(settlementId, receivedAmount);
         _invalidateCache();
     }
 
-    /// @notice Check and mark settlement as abnormal if timed out
-    /// @dev Only KEEPER, REBALANCER, or DELAYED_ADAPTER can call this
-    /// @param settlementId Settlement ID to check
-    function checkAndMarkAbnormal(uint256 settlementId) external override {
-        if (!hasRole(KEEPER_ROLE, msg.sender) && !hasRole(REBALANCER_ROLE, msg.sender) && !hasRole(DELAYED_ADAPTER_ROLE, msg.sender)) {
-            revert AccessControlUnauthorizedAccount(msg.sender, KEEPER_ROLE);
-        }
-        PendingSettlement storage settlement = pendingSettlements[settlementId];
-        if (settlement.id == 0) revert SettlementNotFound(settlementId);
-        if (settlement.status != PPTTypes.SettlementStatus.PENDING) {
-            revert InvalidSettlementStatus(settlementId, settlement.status);
-        }
-        if (block.timestamp <= settlement.deadline) {
-            revert SettlementNotTimedOut(settlementId, settlement.deadline, block.timestamp);
+    /// @dev Validate that received amount meets slippage tolerance relative to expected value
+    function _validateSettlementSlippage(PendingSettlement storage settlement, uint256 receivedAmount) internal view {
+        if (address(oracleAdapter) == address(0)) return;
+        uint256 assetIndex = _assetIndex[settlement.asset];
+        if (assetIndex == 0) return;
+
+        uint256 receivedValueInBase;
+        if (settlement.sType == PPTTypes.SettlementType.PURCHASE) {
+            // receivedAmount is asset tokens → convert to USD via oracle
+            uint256 price = oracleAdapter.getPrice(settlement.asset);
+            uint8 decimals = _assetConfigs[assetIndex - 1].decimals;
+            receivedValueInBase = _toBaseDecimals((receivedAmount * price) / (10 ** decimals));
+        } else {
+            // receivedAmount is payment tokens
+            if (settlement.paymentToken == _asset()) {
+                receivedValueInBase = receivedAmount;
+            } else {
+                uint256 price = oracleAdapter.getPrice(settlement.paymentToken);
+                uint8 decimals = IERC20Metadata(settlement.paymentToken).decimals();
+                receivedValueInBase = _toBaseDecimals((receivedAmount * price) / (10 ** decimals));
+            }
         }
 
-        // Remove from total pending value (abnormal settlements don't count in NAV)
-        totalPendingValue -= settlement.expectedUsdtValue;
+        uint256 maxSlippageBps = _assetConfigs[assetIndex - 1].maxSlippage;
+        if (maxSlippageBps == 0) maxSlippageBps = defaultSwapSlippage;
 
-        settlement.status = PPTTypes.SettlementStatus.ABNORMAL;
-
-        emit SettlementMarkedAbnormal(settlementId);
-        _invalidateCache();
+        uint256 minAcceptable = (settlement.expectedUsdtValue * (PPTTypes.BASIS_POINTS - maxSlippageBps)) / PPTTypes.BASIS_POINTS;
+        if (receivedValueInBase < minAcceptable) {
+            revert OutputBelowMinimum(receivedValueInBase, minAcceptable);
+        }
     }
 
     /// @notice Pause contract
