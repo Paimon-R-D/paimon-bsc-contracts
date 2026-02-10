@@ -111,6 +111,13 @@ library PPTTypes {
         string channelReason;           // Channel explanation (why this channel or why cannot process)
     }
     
+    /// @notice Delayed settlement configuration for an asset
+    /// @dev N11/N12 Fix: Separate configuration for purchase and redeem delayed settlement
+    struct DelayedConfig {
+        bool isPurchaseDelayed;  // Whether purchase uses delayed settlement
+        bool isRedeemDelayed;    // Whether redeem uses delayed settlement
+    }
+
     /// @notice Asset config struct
     /// @dev Configure asset info that Vault can invest in, including address, liquidity tier, purchase method, etc.
     struct AssetConfig {

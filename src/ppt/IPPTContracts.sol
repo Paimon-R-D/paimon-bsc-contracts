@@ -108,6 +108,11 @@ interface IAssetController {
         uint256 maxSlippage
     ) external;
     function setAssetActive(address token, bool active) external;
+    function updateAssetDelayedConfig(
+        address token,
+        bool isPurchaseDelayed,
+        bool isRedeemDelayed
+    ) external;
 
     // ========== Asset Operations (REBALANCER Call) ==========
     /// @notice Purchase asset with specified input token
@@ -155,14 +160,6 @@ interface IAssetController {
     // ========== Delayed Settlement Management ==========
     /// @notice Set whether an asset uses delayed settlement (ADMIN Call)
     function setDelayedSettlementAsset(address asset, bool isDelayed) external;
-    /// @notice N12 Fix: Record vault balance snapshot before adapter transfers tokens out (DELAYED_ADAPTER_ROLE Call)
-    function snapshotVaultBalance(address token) external;
-    /// @notice Purchase delayed settlement asset (DELAYED_ADAPTER_ROLE Call) - PURCHASE type
-    /// @dev Payment token sent but asset not yet received.
-    function purchaseDelayedAsset(address token, address payToken, uint256 payAmount, uint256 expectedTokenValue) external returns (uint256 settlementId);
-    /// @notice Redeem delayed settlement asset (DELAYED_ADAPTER_ROLE Call) - SALE type
-    /// @dev Asset sent but payment token not yet received.
-    function redeemDelayedAsset(address token, address payToken, uint256 tokenAmount, uint256 expectedPayValue) external returns (uint256 settlementId);
     /// @notice Confirm settlement: callback adapter to claim + pull tokens to vault atomically (REBALANCER_ROLE Call)
     function confirmSettlement(uint256 settlementId) external;
     /// @notice Cancel settlement: callback adapter to cancel + pull returned assets to vault atomically (REBALANCER_ROLE Call)
@@ -171,8 +168,6 @@ interface IAssetController {
     // ========== Delayed Settlement Queries ==========
     /// @notice Get total pending settlement value
     function totalPendingValue() external view returns (uint256);
-    /// @notice Check if asset is delayed settlement type
-    function isDelayedSettlementAsset(address asset) external view returns (bool);
 }
 
 /// @title IOracleAdapter
