@@ -454,17 +454,25 @@ contract AssetController is
         if (index == 0) revert AssetNotFound(tokenOut);
         if (amountIn == 0) revert ZeroAmount();
 
-
         vault.resetLockedMintAssets();
 
         // If tokenIn is address(0), use vault's underlying asset (USDT)
         address actualTokenIn = tokenIn == address(0) ? _asset() : tokenIn;
+
+        // Record payment token balance before purchase
+        uint256 paymentBalanceBefore = IERC20(actualTokenIn).balanceOf(address(vault));
+
         (uint256 spent, uint256 received) = _executePurchase(index - 1, actualTokenIn, amountIn);
         tokensReceived = received;
 
-        emit AssetPurchased(tokenOut, _assetConfigs[index - 1].tier, spent, received);
+        // Verify vault payment token balance decreased by expected amount
+        uint256 paymentBalanceAfter = IERC20(actualTokenIn).balanceOf(address(vault));
+        uint256 actualOutflow = paymentBalanceBefore - paymentBalanceAfter;
+        if (actualOutflow < amountIn) {
+            revert InsufficientVaultOutflow(actualTokenIn, amountIn, actualOutflow);
+        }
 
-       
+        emit AssetPurchased(tokenOut, _assetConfigs[index - 1].tier, spent, received);
 
         // Invalidate cache after asset purchase
         _invalidateCache();
@@ -482,14 +490,25 @@ contract AssetController is
         uint256 index = _assetIndex[token];
         if (index == 0) revert AssetNotFound(token);
         if (tokenAmount == 0) revert ZeroAmount();
-        
+
         PPTTypes.AssetConfig memory config = _assetConfigs[index - 1];
-        
-      bool success;
-           (usdtReceived, success) = _sellAsset(token, tokenAmount, config);
-       if (!success) {
+
+        // Record asset token balance before redeem
+        uint256 assetBalanceBefore = IERC20(token).balanceOf(address(vault));
+
+        bool success;
+        (usdtReceived, success) = _sellAsset(token, tokenAmount, config);
+        if (!success) {
             revert SwapHelperNotConfigured();
         }
+
+        // Verify vault asset token balance decreased by expected amount
+        uint256 assetBalanceAfter = IERC20(token).balanceOf(address(vault));
+        uint256 actualOutflow = assetBalanceBefore - assetBalanceAfter;
+        if (actualOutflow < tokenAmount) {
+            revert InsufficientVaultOutflow(token, tokenAmount, actualOutflow);
+        }
+
         emit AssetRedeemed(token, config.tier, tokenAmount, usdtReceived);
 
         // Invalidate cache after asset redemption
@@ -1025,8 +1044,8 @@ contract AssetController is
             } else {
                 // ========== Synchronous Settlement Path (existing logic) ==========
 
-                // Record token balance before purchase (to calculate actual amount received)
-                uint256 balBefore = IERC20(config.tokenAddress).balanceOf(address(vault));
+                // Record asset balance before purchase (to calculate received amount)
+                uint256 assetBalBefore = IERC20(config.tokenAddress).balanceOf(address(vault));
 
                 // Approve adapter to use input token from Vault
                 vault.approveAsset(tokenIn, config.purchaseAdapter, amountIn);
@@ -1039,7 +1058,7 @@ contract AssetController is
                 require(success, "Adapter purchase failed");  // Revert if purchase failed
 
                 // Calculate actual tokens received via balance difference
-                tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - balBefore;
+                tokensReceived = IERC20(config.tokenAddress).balanceOf(address(vault)) - assetBalBefore;
             }
 
         } else {
@@ -1141,13 +1160,14 @@ function _sellAsset(
         } else {
             // ========== Synchronous Redeem Path (existing logic) ==========
 
-            uint256 balanceBefore = IERC20(vaultAsset).balanceOf(address(vault));
+            uint256 paymentBalBefore = IERC20(vaultAsset).balanceOf(address(vault));
+
             vault.approveAsset(token, config.purchaseAdapter, tokenAmount);
             (bool callSuccess,) = config.purchaseAdapter.call(
                 abi.encodeWithSignature("redeem(address,uint256)", address(vault), tokenAmount)
             );
             if (callSuccess) {
-                usdtReceived = IERC20(vaultAsset).balanceOf(address(vault)) - balanceBefore;
+                usdtReceived = IERC20(vaultAsset).balanceOf(address(vault)) - paymentBalBefore;
 
                 // Only verify when balance actually changed (skip delayed settlement scenarios)
                 if (usdtReceived > 0 && address(oracleAdapter) != address(0)) {
