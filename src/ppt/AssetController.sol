@@ -221,6 +221,8 @@ contract AssetController is
     error SnapshotRequired(address adapter, address token);
     /// @notice N12 Fix: Vault balance did not decrease by expected amount
     error InsufficientVaultOutflow(address token, uint256 expected, uint256 actual);
+    /// @notice N9 Fix: Liquidation amount exceeds actual redemption deficit
+    error ExcessiveLiquidation(uint256 requested, uint256 maxAllowed);
 
     // =============================================================================
     // Constructor & Initialization
@@ -524,6 +526,12 @@ contract AssetController is
         uint256 amountNeeded,
         PPTTypes.LiquidityTier maxTier
     ) external override onlyRole(LIQUIDATOR_ROLE) nonReentrant returns (uint256 funded) {
+        // N9 Fix: Validate amountNeeded does not exceed actual redemption deficit
+        uint256 totalLiability = vault.totalRedemptionLiability();
+        uint256 existingCash = vault.getLayer1Cash();
+        uint256 maxAllowed = totalLiability > existingCash ? totalLiability - existingCash : 0;
+        if (amountNeeded > maxAllowed) revert ExcessiveLiquidation(amountNeeded, maxAllowed);
+
         funded = _executeWaterfallLiquidation(amountNeeded, maxTier);
 
         // Invalidate cache after liquidation
