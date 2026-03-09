@@ -134,17 +134,17 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 
         // Transfer USDT to composer and bridge
         asset.safeTransfer(hubStargateComposer, amount);
-        IHubStargateComposer(hubStargateComposer).bridgeAndDeploy{value: msg.value}(
+        uint256 bridgedAmount = IHubStargateComposer(hubStargateComposer).bridgeAndDeploy{value: msg.value}(
             dstEid, amount, protocol, protocolName
         );
 
         // Record accounting
-        pendingDeploys[dstEid] += amount;
-        _protocolAllocations[dstEid][protocol] += amount;
-        deployedAssets[dstEid] += amount;
-        totalDeployed += amount;
+        pendingDeploys[dstEid] += bridgedAmount;
+        _protocolAllocations[dstEid][protocol] += bridgedAmount;
+        deployedAssets[dstEid] += bridgedAmount;
+        totalDeployed += bridgedAmount;
 
-        emit AssetDeployed(dstEid, protocol, protocolName, amount, bytes32(0));
+        emit AssetDeployed(dstEid, protocol, protocolName, bridgedAmount, bytes32(0));
     }
 
     /// @notice Legacy deploy via OApp message only (no asset bridge)
@@ -316,5 +316,6 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 interface IHubStargateComposer {
     function bridgeAndDeploy(uint32 dstEid, uint256 amount, address protocol, string calldata protocolName)
         external
-        payable;
+        payable
+        returns (uint256 bridgedAmount);
 }

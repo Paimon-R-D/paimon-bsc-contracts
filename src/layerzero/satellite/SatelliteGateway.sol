@@ -102,41 +102,19 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
         address receiver,
         uint256 minShares
     ) external payable nonReentrant whenNotPaused {
-        if (assets == 0) revert ZeroAmount();
-        if (receiver == address(0)) revert ZeroAddress();
+        _depositFor(msg.sender, assets, receiver, minShares, msg.sender);
+    }
 
-        // Pull USDT from user
-        asset.safeTransferFrom(msg.sender, address(this), assets);
-
-        // Build compose message
-        bytes memory composeMsg = StargateComposeCodec.encodeDeposit(receiver, minShares);
-        bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_DEPOSIT);
-        uint256 minAmount = _calcMinAmount(assets);
-
-        // Approve and send via Stargate (forceApprove for USDT compatibility)
-        asset.forceApprove(stargatePool, assets);
-
-        IStargate.SendParam memory params = IStargate.SendParam({
-            dstEid: hubEid,
-            to: _addressToBytes32(hubComposer),
-            amountLD: assets,
-            minAmountLD: minAmount,
-            extraOptions: options,
-            composeMsg: composeMsg,
-            oftCmd: "" // Taxi mode for compose
-        });
-
-        // Quote and validate fee
-        MessagingFee memory fee = IStargate(stargatePool).quoteSend(params, false);
-        if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
-
-        IStargate(stargatePool).send{value: msg.value}(
-            params,
-            MessagingFee(msg.value, 0),
-            msg.sender // refund excess to user
-        );
-
-        emit DepositBridged(msg.sender, receiver, assets, minShares);
+    /// @notice Bridge USDT that has already been approved by `payer`
+    /// @dev Allows a forwarding contract to custody funds first and still keep Stargate refunds routed to the end user.
+    function depositFor(
+        address payer,
+        uint256 assets,
+        address receiver,
+        uint256 minShares,
+        address refundAddress
+    ) external payable nonReentrant whenNotPaused {
+        _depositFor(payer, assets, receiver, minShares, refundAddress);
     }
 
     // ========== Stargate Compose Callback ==========
@@ -219,6 +197,47 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
     function _calcMinAmount(uint256 amount) internal view returns (uint256) {
         uint256 slippage = slippageBps == 0 ? DEFAULT_SLIPPAGE_BPS : slippageBps;
         return amount * (BPS_DENOMINATOR - slippage) / BPS_DENOMINATOR;
+    }
+
+    function _depositFor(
+        address payer,
+        uint256 assets,
+        address receiver,
+        uint256 minShares,
+        address refundAddress
+    ) internal {
+        if (payer == address(0) || receiver == address(0) || refundAddress == address(0)) revert ZeroAddress();
+        if (assets == 0) revert ZeroAmount();
+
+        asset.safeTransferFrom(payer, address(this), assets);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeDeposit(receiver, minShares);
+        bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_DEPOSIT);
+        uint256 minAmount = _calcMinAmount(assets);
+
+        asset.forceApprove(stargatePool, assets);
+
+        IStargate.SendParam memory params = IStargate.SendParam({
+            dstEid: hubEid,
+            to: _addressToBytes32(hubComposer),
+            amountLD: assets,
+            minAmountLD: minAmount,
+            extraOptions: options,
+            composeMsg: composeMsg,
+            oftCmd: ""
+        });
+
+        MessagingFee memory fee = IStargate(stargatePool).quoteSend(params, false);
+        if (msg.value < fee.nativeFee) revert InsufficientFee(msg.value, fee.nativeFee);
+
+        IStargate(stargatePool).send{value: msg.value}(
+            params,
+            MessagingFee(msg.value, 0),
+            refundAddress
+        );
+        asset.forceApprove(stargatePool, 0);
+
+        emit DepositBridged(payer, receiver, assets, minShares);
     }
 
     function _addressToBytes32(address addr) internal pure returns (bytes32) {

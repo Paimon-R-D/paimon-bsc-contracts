@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
@@ -15,6 +14,7 @@ import {IStargate} from "../interfaces/IStargateIntegration.sol";
 import {StargateComposeCodec} from "../libraries/StargateComposeCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 import {ICrossChainNAVReporter} from "../interfaces/ICrossChainNAVReporter.sol";
+import {IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 
 /// @title HubStargateComposer
 /// @notice Coordinates USDT bridging + vault operations on the BSC Hub chain
@@ -57,11 +57,22 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     /// @notice CrossChainNAVReporter for updating remote balances
     address public navReporter;
 
+    /// @notice Redemption manager used for satellite standard withdrawals
+    address public redemptionManager;
+
     /// @notice Trusted gateway per remote chain (eid => gateway address)
     mapping(uint32 => address) public trustedGateways;
 
     /// @notice Slippage tolerance in basis points per chain
     mapping(uint32 => uint256) public slippageBps;
+
+    struct PendingSatelliteRedemption {
+        uint32 dstEid;
+        address receiver;
+        bool exists;
+    }
+
+    mapping(uint256 => PendingSatelliteRedemption) public pendingSatelliteRedemptions;
 
     // ========== Events ==========
 
@@ -74,6 +85,9 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     event VaultUpdated(address vault);
     event PptOftAdapterUpdated(address adapter);
     event NavReporterUpdated(address reporter);
+    event RedemptionManagerUpdated(address manager);
+    event SatelliteRedemptionRegistered(uint256 indexed requestId, uint32 indexed dstEid, address indexed receiver);
+    event SatelliteRedemptionSettled(uint256 indexed requestId, uint32 indexed dstEid, address indexed receiver, uint256 amount);
 
     // ========== Errors ==========
 
@@ -85,6 +99,8 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     error ZeroAmount();
     error SlippageTooHigh(uint256 sharesReceived, uint256 minShares);
     error InsufficientBalance(uint256 available, uint256 required);
+    error UnauthorizedRegistrar(address caller);
+    error UnknownSatelliteRedemption(uint256 requestId);
 
     // ========== Constructor ==========
 
@@ -161,14 +177,15 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     // ========== Internal Handlers ==========
 
     /// @notice Handle cross-chain deposit: USDT arrived → deposit to vault → send shares back
-    function _handleDeposit(uint32 srcEid, uint256 assets, bytes memory composeMsg, bytes32 guid) internal {
+    function _handleDeposit(uint32 srcEid, uint256 assets, bytes memory composeMsg, bytes32 /*guid*/) internal {
         (address receiver, uint256 minShares) = StargateComposeCodec.decodeDeposit(composeMsg);
         if (receiver == address(0)) revert ZeroAddress();
         if (assets == 0) revert ZeroAmount();
+        if (address(vault) == address(0) || pptOftAdapter == address(0)) revert ZeroAddress();
 
         // Deposit USDT into PPT vault (try/catch to prevent nonce blocking)
         asset.forceApprove(address(vault), assets);
-        try vault.deposit(assets, address(this)) returns (uint256 shares) {
+        try vault.deposit(assets, pptOftAdapter) returns (uint256 shares) {
             asset.forceApprove(address(vault), 0);
 
             if (minShares > 0 && shares < minShares) {
@@ -196,6 +213,9 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     /// @notice Handle return from remote deployment (withdraw or yield)
     function _handleReturn(uint256 amount, bytes memory composeMsg) internal {
         (uint32 srcEid, bool isYield) = StargateComposeCodec.decodeReturn(composeMsg);
+        if (address(vault) == address(0)) revert ZeroAddress();
+
+        asset.safeTransfer(address(vault), amount);
 
         // Update NAV reporter
         if (navReporter != address(0)) {
@@ -221,10 +241,46 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         if (receiver == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
 
-        bytes memory composeMsg = StargateComposeCodec.encodeSettlement(receiver, requestId);
-        _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_SETTLEMENT, msg.value);
+        _bridgeSettlement(dstEid, receiver, amount, requestId, msg.value);
+    }
 
-        emit SettlementBridged(dstEid, receiver, amount, requestId);
+    /// @notice Register a pending satellite redemption after PPTOFTAdapter creates the Hub request
+    function registerSatelliteRedemption(uint256 requestId, uint32 dstEid, address receiver)
+        external
+        whenNotPaused
+    {
+        if (msg.sender != pptOftAdapter) revert UnauthorizedRegistrar(msg.sender);
+        if (receiver == address(0)) revert ZeroAddress();
+
+        pendingSatelliteRedemptions[requestId] = PendingSatelliteRedemption({
+            dstEid: dstEid,
+            receiver: receiver,
+            exists: true
+        });
+
+        emit SatelliteRedemptionRegistered(requestId, dstEid, receiver);
+    }
+
+    /// @notice Settle a registered redemption on Hub and bridge the settled USDT back to the satellite chain
+    function settleSatelliteRedemption(uint256 requestId)
+        external
+        payable
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        PendingSatelliteRedemption memory pending = pendingSatelliteRedemptions[requestId];
+        if (!pending.exists) revert UnknownSatelliteRedemption(requestId);
+        if (redemptionManager == address(0)) revert ZeroAddress();
+
+        uint256 balanceBefore = asset.balanceOf(address(this));
+        IRedemptionManager(redemptionManager).settleRedemption(requestId);
+        uint256 settledAmount = asset.balanceOf(address(this)) - balanceBefore;
+
+        _bridgeSettlement(pending.dstEid, pending.receiver, settledAmount, requestId, msg.value);
+        delete pendingSatelliteRedemptions[requestId];
+
+        emit SatelliteRedemptionSettled(requestId, pending.dstEid, pending.receiver, settledAmount);
     }
 
     /// @notice Bridge USDT to remote chain for DeFi deployment
@@ -237,18 +293,18 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         uint256 amount,
         address protocol,
         string calldata protocolName
-    ) external payable onlyRole(KEEPER_ROLE) nonReentrant whenNotPaused {
+    ) external payable onlyRole(KEEPER_ROLE) nonReentrant whenNotPaused returns (uint256 bridgedAmount) {
         if (amount == 0) revert ZeroAmount();
 
         bytes memory composeMsg = StargateComposeCodec.encodeDeploy(protocol, protocolName);
-        _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_DEPLOY, msg.value);
+        bridgedAmount = _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_DEPLOY, msg.value);
 
         // Update NAV reporter
         if (navReporter != address(0)) {
-            ICrossChainNAVReporter(navReporter).recordDeploy(dstEid, amount);
+            ICrossChainNAVReporter(navReporter).recordDeploy(dstEid, bridgedAmount);
         }
 
-        emit DeployBridged(dstEid, protocol, amount);
+        emit DeployBridged(dstEid, protocol, bridgedAmount);
     }
 
     /// @notice Bridge USDT to replenish satellite LiquidityPool
@@ -319,7 +375,7 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         bytes memory composeMsg,
         uint128 composeGas,
         uint256 nativeFee
-    ) internal {
+    ) internal returns (uint256 amountReceivedLD) {
         uint256 balance = asset.balanceOf(address(this));
         if (balance < amount) revert InsufficientBalance(balance, amount);
 
@@ -341,12 +397,25 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
             oftCmd: "" // Taxi mode for compose support
         });
 
-        IStargate(stargatePool).send{value: nativeFee}(
+        (, IStargate.OFTReceipt memory oftReceipt) = IStargate(stargatePool).send{value: nativeFee}(
             params,
             MessagingFee(nativeFee, 0),
             address(this)
         );
         asset.forceApprove(stargatePool, 0);
+        return oftReceipt.amountReceivedLD;
+    }
+
+    function _bridgeSettlement(
+        uint32 dstEid,
+        address receiver,
+        uint256 amount,
+        uint256 requestId,
+        uint256 nativeFee
+    ) internal {
+        bytes memory composeMsg = StargateComposeCodec.encodeSettlement(receiver, requestId);
+        _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_SETTLEMENT, nativeFee);
+        emit SettlementBridged(dstEid, receiver, amount, requestId);
     }
 
     function _sendSharesBack(uint32 dstEid, address receiver, uint256 shares) internal {
@@ -385,6 +454,12 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     function setNavReporter(address _reporter) external onlyRole(DEFAULT_ADMIN_ROLE) {
         navReporter = _reporter;
         emit NavReporterUpdated(_reporter);
+    }
+
+    function setRedemptionManager(address _manager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_manager == address(0)) revert ZeroAddress();
+        redemptionManager = _manager;
+        emit RedemptionManagerUpdated(_manager);
     }
 
     function setTrustedGateway(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE) {

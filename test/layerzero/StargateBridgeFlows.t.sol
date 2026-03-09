@@ -50,6 +50,7 @@ contract MockStargatePool {
     uint256 public sendCount;
     IERC20 public token;
     uint256 public quoteFee = 0.01 ether;
+    uint256 public amountReceivedLD;
 
     constructor(address _token) {
         token = IERC20(_token);
@@ -71,7 +72,8 @@ contract MockStargatePool {
         });
         sendCount++;
         receipt = MessagingReceipt({guid: bytes32(sendCount), nonce: uint64(sendCount), fee: MessagingFee(msg.value, 0)});
-        oftReceipt = IStargate.OFTReceipt({amountSentLD: params.amountLD, amountReceivedLD: params.amountLD});
+        uint256 actualReceived = amountReceivedLD == 0 ? params.amountLD : amountReceivedLD;
+        oftReceipt = IStargate.OFTReceipt({amountSentLD: params.amountLD, amountReceivedLD: actualReceived});
     }
 
     function quoteSend(IStargate.SendParam calldata, bool) external view returns (MessagingFee memory) {
@@ -80,6 +82,10 @@ contract MockStargatePool {
 
     function setQuoteFee(uint256 _fee) external {
         quoteFee = _fee;
+    }
+
+    function setAmountReceivedLD(uint256 _amount) external {
+        amountReceivedLD = _amount;
     }
 
     function getLastSendDstEid() external view returns (uint32) {
@@ -155,15 +161,17 @@ contract MockProtocolImpl {
     uint256 public lastDeployAmount;
     uint256 public lastWithdrawAmount;
     uint256 public harvestReturn;
+    uint256 public deployReturn;
 
     constructor(address _asset) {
         asset = IERC20(_asset);
     }
 
     function deploy(address, address, uint256 amount) external returns (uint256) {
-        asset.transferFrom(msg.sender, address(this), amount);
-        lastDeployAmount = amount;
-        return amount;
+        uint256 deployedAmount = deployReturn == 0 ? amount : deployReturn;
+        asset.transferFrom(msg.sender, address(this), deployedAmount);
+        lastDeployAmount = deployedAmount;
+        return deployedAmount;
     }
 
     function withdraw(address, address, uint256 amount) external returns (uint256) {
@@ -181,6 +189,10 @@ contract MockProtocolImpl {
 
     function setHarvestReturn(uint256 _amount) external {
         harvestReturn = _amount;
+    }
+
+    function setDeployReturn(uint256 _amount) external {
+        deployReturn = _amount;
     }
 }
 
@@ -440,6 +452,18 @@ contract HubStargateComposerTest is Test {
         assertEq(navReporter.remoteDeployments(ETH_EID), 300e6);
     }
 
+    function test_BridgeAndDeploy_UsesActualReceivedAmountForNAV() public {
+        uint256 amount = 300e6;
+        uint256 actualReceived = 287e6;
+        usdt.mint(address(composer), amount);
+        stargatePool.setAmountReceivedLD(actualReceived);
+
+        vm.deal(address(this), 1 ether);
+        composer.bridgeAndDeploy{value: 0.01 ether}(ETH_EID, amount, address(0xA11CE), "aave");
+
+        assertEq(navReporter.remoteDeployments(ETH_EID), actualReceived);
+    }
+
     function test_ReplenishLiquidity_BridgesViaSargate() public {
         uint256 amount = 100e6;
         usdt.mint(address(composer), amount);
@@ -638,6 +662,27 @@ contract RemoteAssetGatewayTest is Test {
         assertEq(aaveImpl.lastDeployAmount(), amount);
         assertEq(gateway.protocolDeposits(AAVE_POOL), amount);
         assertEq(gateway.totalDeposited(), amount);
+    }
+
+    function test_HandleDeploy_PartialDeploy_ReturnsUndeployedRemainder() public {
+        uint256 amount = 1000e6;
+        uint256 deployedAmount = 700e6;
+        usdt.mint(address(gateway), amount);
+        aaveImpl.setDeployReturn(deployedAmount);
+        vm.deal(address(gateway), 1 ether);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID, amount, HUB_COMPOSER, composeMsg);
+
+        vm.prank(mockEndpoint);
+        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+
+        assertEq(aaveImpl.lastDeployAmount(), deployedAmount);
+        assertEq(gateway.protocolDeposits(AAVE_POOL), deployedAmount);
+        assertEq(gateway.totalDeposited(), deployedAmount);
+        assertEq(stargatePool.sendCount(), 1);
+        assertEq(stargatePool.getLastSendAmountLD(), amount - deployedAmount);
+        assertEq(stargatePool.getLastSendDstEid(), HUB_EID);
     }
 
     function test_WithdrawAndBridge_SendsBackToHub() public {

@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
 import {CreditManager} from "../../src/layerzero/hub/CreditManager.sol";
+import {CrossChainAssetController} from "../../src/layerzero/hub/CrossChainAssetController.sol";
 import {PPTOFTAdapter} from "../../src/layerzero/hub/PPTOFTAdapter.sol";
 import {PPTSatellite} from "../../src/layerzero/satellite/PPTSatellite.sol";
 import {PPTOFT} from "../../src/layerzero/satellite/PPTOFT.sol";
@@ -94,6 +95,30 @@ contract RecordingCreditManager is CreditManager {
         lastDstEid = _dstEid;
         lastPayload = _message;
         return MessagingReceipt({guid: bytes32(sendCount), nonce: uint64(sendCount), fee: _fee});
+    }
+}
+
+contract MockHubStargateComposer {
+    uint256 public bridgedAmount;
+    uint32 public lastDstEid;
+    uint256 public lastAmount;
+    address public lastProtocol;
+    string public lastProtocolName;
+
+    function setBridgedAmount(uint256 amount) external {
+        bridgedAmount = amount;
+    }
+
+    function bridgeAndDeploy(uint32 dstEid, uint256 amount, address protocol, string calldata protocolName)
+        external
+        payable
+        returns (uint256)
+    {
+        lastDstEid = dstEid;
+        lastAmount = amount;
+        lastProtocol = protocol;
+        lastProtocolName = protocolName;
+        return bridgedAmount == 0 ? amount : bridgedAmount;
     }
 }
 
@@ -238,6 +263,25 @@ contract LayerZeroRuntimeFixesTest is Test {
 
         assertEq(manager.sendCount(), 1);
         assertEq(_decodeAmount(manager.lastPayload()), 75);
+    }
+
+    function test_CrossChainAssetController_DeployViaBridge_RecordsActualBridgedAmount() public {
+        CrossChainAssetController controller = new CrossChainAssetController(address(endpoint), address(this), address(asset));
+        MockHubStargateComposer composer = new MockHubStargateComposer();
+        address protocol = address(0xA11CE);
+
+        controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
+        controller.setHubStargateComposer(address(composer));
+
+        asset.mint(address(controller), 100 ether);
+        composer.setBridgedAmount(82 ether);
+
+        controller.deployViaBridge(REMOTE_EID, 100 ether, protocol, "aave");
+
+        assertEq(controller.pendingDeploys(REMOTE_EID), 82 ether);
+        assertEq(controller.deployedAssets(REMOTE_EID), 82 ether);
+        assertEq(controller.protocolAllocation(REMOTE_EID, protocol), 82 ether);
+        assertEq(controller.getTotalDeployedAssets(), 82 ether);
     }
 
     function test_PPTSatellite_CreditUpdateSetsAbsoluteValue() public {

@@ -22,6 +22,9 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     /// @notice The PPTSatellite that can withdraw from this pool
     address public satellite;
 
+    /// @notice The SatelliteGateway allowed to replenish local liquidity
+    address public liquidityGateway;
+
     /// @notice Current credit allocation from Hub
     uint256 public credit;
 
@@ -43,6 +46,7 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Events ==========
 
     event SatelliteUpdated(address indexed oldSatellite, address indexed newSatellite);
+    event LiquidityGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event LiquidityWithdrawn(address indexed user, uint256 amount);
     event CreditUsed(uint256 amount, uint256 remainingCredit);
     event MinBufferUpdated(uint256 oldBuffer, uint256 newBuffer);
@@ -57,6 +61,11 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
 
     modifier onlySatelliteOrOwner() {
         if (msg.sender != satellite && msg.sender != owner()) revert OnlySatellite();
+        _;
+    }
+
+    modifier onlyLiquidityManagerOrOwner() {
+        if (msg.sender != satellite && msg.sender != liquidityGateway && msg.sender != owner()) revert OnlySatellite();
         _;
     }
 
@@ -106,7 +115,7 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
 
     /// @inheritdoc ILiquidityPool
     /// @dev Restrict top-ups to the operational owner/satellite pair until LP share accounting exists.
-    function addLiquidity(uint256 amount) external override onlySatelliteOrOwner nonReentrant whenNotPaused {
+    function addLiquidity(uint256 amount) external override onlyLiquidityManagerOrOwner nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
 
         _asset.safeTransferFrom(msg.sender, address(this), amount);
@@ -195,6 +204,12 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
         if (_satellite == address(0)) revert ZeroAddress();
         emit SatelliteUpdated(satellite, _satellite);
         satellite = _satellite;
+    }
+
+    function setLiquidityGateway(address _gateway) external onlyOwner {
+        if (_gateway == address(0)) revert ZeroAddress();
+        emit LiquidityGatewayUpdated(liquidityGateway, _gateway);
+        liquidityGateway = _gateway;
     }
 
     /// @inheritdoc ILiquidityPool

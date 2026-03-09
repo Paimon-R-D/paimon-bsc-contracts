@@ -124,11 +124,19 @@ interface IPPTSatellite {
     // ========== User Actions ==========
 
     /// @notice Deposit assets and receive PPT shares via cross-chain
-    /// @dev Assets stay on satellite, shares minted on Hub and sent via OFT
+    /// @dev When a Stargate gateway is configured, assets are bridged to Hub before shares are minted.
+    ///      Otherwise the legacy OApp-only path is used.
     /// @param assets Amount of assets to deposit
     /// @param receiver Address to receive shares
     /// @return shares Amount of shares to be received
     function deposit(uint256 assets, address receiver) external payable returns (uint256 shares);
+
+    /// @notice Deposit assets through the configured Stargate gateway
+    /// @param assets Amount of assets to bridge
+    /// @param receiver Address to receive PPTOFT shares on the satellite chain
+    /// @param minShares Minimum shares expected on Hub
+    /// @return shares Amount of shares to be received asynchronously
+    function depositViaBridge(uint256 assets, address receiver, uint256 minShares) external payable returns (uint256 shares);
 
     /// @notice Deposit with explicit parameters
     /// @param params Deposit parameters

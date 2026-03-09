@@ -101,6 +101,11 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     // ========== Quote Functions ==========
 
     function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
+        if (satelliteGateway != address(0)) {
+            (nativeFee,) = ISatelliteGateway(satelliteGateway).quoteDeposit(assets, receiver);
+            return (nativeFee, 0);
+        }
+
         bytes memory payload = MessageCodec.encodeDeposit(receiver, assets);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
@@ -123,15 +128,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         address receiver,
         uint256 minShares
     ) external payable nonReentrant whenNotPaused returns (uint256) {
-        if (assets == 0) revert InvalidAmount();
-        if (satelliteGateway == address(0)) revert ZeroAddress();
-
-        // Pull from user and forward to gateway
-        asset.safeTransferFrom(msg.sender, satelliteGateway, assets);
-        ISatelliteGateway(satelliteGateway).deposit{value: msg.value}(assets, receiver, minShares);
-
-        emit CrossChainDeposit(receiver, assets, 0, 0);
-        return 0; // Shares minted async via Hub + PPTOFT
+        return _depositThroughBridge(assets, receiver, minShares);
     }
 
     /// @notice Deposit USDT to local LiquidityPool + sends OApp message to Hub
@@ -140,6 +137,10 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         uint256 assets,
         address receiver
     ) external payable nonReentrant whenNotPaused returns (uint256 shares) {
+        if (satelliteGateway != address(0)) {
+            return _depositThroughBridge(assets, receiver, 0);
+        }
+
         if (assets == 0) revert InvalidAmount();
 
         asset.safeTransferFrom(msg.sender, address(this), assets);
@@ -256,6 +257,29 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         sharePrice = newPrice;
     }
 
+    function _depositThroughBridge(
+        uint256 assets,
+        address receiver,
+        uint256 minShares
+    ) internal returns (uint256) {
+        if (assets == 0) revert InvalidAmount();
+        if (satelliteGateway == address(0)) revert ZeroAddress();
+
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+        asset.forceApprove(satelliteGateway, assets);
+        ISatelliteGateway(satelliteGateway).depositFor{value: msg.value}(
+            address(this),
+            assets,
+            receiver,
+            minShares,
+            msg.sender
+        );
+        asset.forceApprove(satelliteGateway, 0);
+
+        emit CrossChainDeposit(receiver, assets, 0, 0);
+        return 0;
+    }
+
     // ========== Configuration ==========
 
     function setHubEid(uint32 /*_hubEid*/) external pure {
@@ -299,4 +323,12 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
 interface ISatelliteGateway {
     function deposit(uint256 assets, address receiver, uint256 minShares) external payable;
+    function depositFor(
+        address payer,
+        uint256 assets,
+        address receiver,
+        uint256 minShares,
+        address refundAddress
+    ) external payable;
+    function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 minReceive);
 }

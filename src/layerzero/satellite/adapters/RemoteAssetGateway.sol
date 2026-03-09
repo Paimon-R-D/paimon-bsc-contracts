@@ -60,11 +60,21 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
     /// @notice Slippage tolerance in basis points
     uint256 public slippageBps;
 
+    struct PendingReturn {
+        uint256 amount;
+        bool isYield;
+    }
+
+    mapping(uint256 => PendingReturn) public pendingReturns;
+    uint256 public pendingReturnCount;
+
     // ========== Events ==========
 
     event DeployReceived(address indexed protocol, string protocolName, uint256 amount);
     event WithdrawAndBridged(address indexed protocol, string protocolName, uint256 amount);
     event HarvestAndBridged(address indexed protocol, string protocolName, uint256 yieldAmount);
+    event PendingReturnStored(uint256 indexed returnId, uint256 amount, bool isYield);
+    event PendingReturnFlushed(uint256 indexed returnId, uint256 amount, bool isYield);
     event HubComposerUpdated(address oldComposer, address newComposer);
     event ProtocolUpdated(string protocolName, address implementation);
 
@@ -158,6 +168,11 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         protocolDeposits[protocol] += deployedAmount;
         totalDeposited += deployedAmount;
 
+        uint256 undeployedAmount = amount - deployedAmount;
+        if (undeployedAmount > 0) {
+            _bridgeOrQueueReturn(undeployedAmount, false);
+        }
+
         emit DeployReceived(protocol, protocolName, deployedAmount);
     }
 
@@ -214,6 +229,16 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         emit HarvestAndBridged(protocol, protocolName, yieldAmount);
     }
 
+    function flushPendingReturn(uint256 returnId) external payable onlyOwner nonReentrant whenNotPaused {
+        PendingReturn memory pending = pendingReturns[returnId];
+        if (pending.amount == 0) revert ZeroAmount();
+
+        delete pendingReturns[returnId];
+        _bridgeToHub(pending.amount, pending.isYield, msg.value);
+
+        emit PendingReturnFlushed(returnId, pending.amount, pending.isYield);
+    }
+
     // ========== Internal Functions ==========
 
     function _bridgeToHub(uint256 amount, bool isYield, uint256 nativeFee) internal {
@@ -242,6 +267,40 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
             address(this) // refund to this contract
         );
         asset.forceApprove(stargatePool, 0);
+    }
+
+    function _bridgeOrQueueReturn(uint256 amount, bool isYield) internal {
+        uint256 nativeFee = _quoteBridgeFee(amount, isYield);
+
+        if (address(this).balance >= nativeFee) {
+            _bridgeToHub(amount, isYield, nativeFee);
+            return;
+        }
+
+        uint256 returnId = pendingReturnCount++;
+        pendingReturns[returnId] = PendingReturn({amount: amount, isYield: isYield});
+        emit PendingReturnStored(returnId, amount, isYield);
+    }
+
+    function _quoteBridgeFee(uint256 amount, bool isYield) internal view returns (uint256 nativeFee) {
+        if (hubComposer == address(0)) revert ZeroAddress();
+
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(thisEid, isYield);
+        bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_RETURN);
+        uint256 minAmount = _calcMinAmount(amount);
+
+        IStargate.SendParam memory params = IStargate.SendParam({
+            dstEid: hubEid,
+            to: _addressToBytes32(hubComposer),
+            amountLD: amount,
+            minAmountLD: minAmount,
+            extraOptions: options,
+            composeMsg: composeMsg,
+            oftCmd: ""
+        });
+
+        MessagingFee memory fee = IStargate(stargatePool).quoteSend(params, false);
+        return fee.nativeFee;
     }
 
     function _calcMinAmount(uint256 amount) internal view returns (uint256) {

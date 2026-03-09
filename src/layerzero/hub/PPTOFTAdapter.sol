@@ -339,21 +339,27 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (receiver == address(0)) revert ZeroAddress();
         if (shares == 0) revert InvalidAmount();
 
-        // Process redemption via redemption manager
-        _requestRedemption(shares, receiver);
+        if (hubStargateComposer != address(0)) {
+            uint256 requestId = _requestSatelliteRedemption(_origin.srcEid, receiver, shares);
+            emit CrossChainRedemptionProcessed(bytes32(0), receiver, shares, requestId);
+        } else {
+            _requestRedemption(shares, receiver);
+        }
 
         emit SatelliteWithdrawProcessed(_origin.srcEid, receiver, shares);
     }
 
     /// @notice Handle satellite redemption request (PPTOFT.requestCrossChainRedemption)
     /// @dev Tokens were burned on remote chain; locked tokens on Hub are used for redemption
-    function _handleSatelliteRedemption(Origin calldata /*_origin*/, bytes calldata _payload) internal {
+    function _handleSatelliteRedemption(Origin calldata _origin, bytes calldata _payload) internal {
         (address owner, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
 
         if (owner == address(0)) revert ZeroAddress();
         if (shares == 0) revert InvalidAmount();
 
-        uint256 requestId = _requestRedemption(shares, owner);
+        uint256 requestId = hubStargateComposer != address(0)
+            ? _requestSatelliteRedemption(_origin.srcEid, owner, shares)
+            : _requestRedemption(shares, owner);
 
         emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, requestId);
     }
@@ -376,6 +382,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     function _requestRedemption(uint256 shares, address owner) internal returns (uint256) {
         if (redemptionManager == address(0)) revert InvalidComposeMessage();
         return IRedemptionManager(redemptionManager).requestRedemption(shares, owner);
+    }
+
+    function _requestSatelliteRedemption(uint32 srcEid, address receiver, uint256 shares) internal returns (uint256 requestId) {
+        requestId = _requestRedemption(shares, hubStargateComposer);
+        IHubStargateSettlementRegistrar(hubStargateComposer).registerSatelliteRedemption(requestId, srcEid, receiver);
     }
 
     /// @notice Handle cross-chain deposit
@@ -409,7 +420,13 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         MessagingFee memory fee = _quote(dstEid, payload, options, false);
-        _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+        if (address(this).balance >= fee.nativeFee) {
+            _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+        } else {
+            uint256 mintId = pendingMintCount++;
+            pendingMints[mintId] = PendingMint(dstEid, receiver, shares);
+            emit PendingMintStored(mintId, dstEid, receiver, shares);
+        }
     }
 
     function setHubStargateComposer(address _composer) external onlyOwner {
@@ -456,4 +473,8 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
     /// @notice Receive native token for cross-chain message fees
     receive() external payable {}
+}
+
+interface IHubStargateSettlementRegistrar {
+    function registerSatelliteRedemption(uint256 requestId, uint32 dstEid, address receiver) external;
 }
