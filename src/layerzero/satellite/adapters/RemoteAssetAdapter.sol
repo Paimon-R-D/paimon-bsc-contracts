@@ -7,15 +7,15 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IRemoteProtocolImplementation} from "../../interfaces/IRemoteProtocolImplementation.sol";
 import {MessageCodec} from "../../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../../libraries/LzOptionsLib.sol";
 import {LayerZeroErrors} from "../../libraries/LayerZeroErrors.sol";
 
 /// @title RemoteAssetAdapter
 /// @notice Receives commands from Hub and executes DeFi operations on remote chain
-/// @dev Deployed on each remote chain (ETH, ARB, Base, etc.)
-///      Subclass and override _executeDeployToProtocol/_executeWithdrawFromProtocol/_calculateYield
-///      for protocol-specific integrations.
+/// @dev Deployed on each remote chain (ETH, ARB, Base, etc.) and delegates protocol actions
+///      to owner-configured implementation contracts.
 contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -56,6 +56,7 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     error InvalidProtocol();
     error InsufficientDeposit();
     error ProtocolNotSupported();
+    error InvalidProtocolAmount(uint256 requested, uint256 actual);
     error UnknownMessageType(bytes1 msgType);
     error ZeroAddress();
 
@@ -108,46 +109,45 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
 
     // ========== Internal Handlers ==========
 
-    /// @notice Handle deploy command
-    /// @dev P1-4 FIX: Delegates actual asset deployment to virtual _executeDeployToProtocol
     function _handleDeploy(bytes calldata _payload) internal {
         (uint256 amount, address protocol, string memory protocolName) =
             MessageCodec.decodeDeployCommand(_payload);
 
-        address implementation = protocolImplementations[protocolName];
-        if (implementation == address(0)) revert ProtocolNotSupported();
+        address implementation = _getProtocolImplementation(protocolName);
 
-        _executeDeployToProtocol(protocol, implementation, amount);
+        // Approve protocol implementation to spend tokens (forceApprove for USDT compatibility)
+        asset.forceApprove(implementation, amount);
+        uint256 deployedAmount = IRemoteProtocolImplementation(implementation).deploy(address(asset), protocol, amount);
+        asset.forceApprove(implementation, 0);
+        if (deployedAmount > amount) revert InvalidProtocolAmount(amount, deployedAmount);
 
-        protocolDeposits[protocol] += amount;
-        totalDeposited += amount;
+        protocolDeposits[protocol] += deployedAmount;
+        totalDeposited += deployedAmount;
 
-        emit Deployed(protocol, protocolName, amount);
+        emit Deployed(protocol, protocolName, deployedAmount);
     }
 
-    /// @notice Handle withdraw command
-    /// @dev P1-4 FIX: Delegates actual asset withdrawal to virtual _executeWithdrawFromProtocol
     function _handleWithdraw(bytes calldata _payload) internal {
         (uint256 amount, address protocol, string memory protocolName) =
             MessageCodec.decodeDeployCommand(_payload);
 
         if (protocolDeposits[protocol] < amount) revert InsufficientDeposit();
+        address implementation = _getProtocolImplementation(protocolName);
+        uint256 withdrawnAmount = IRemoteProtocolImplementation(implementation).withdraw(address(asset), protocol, amount);
+        if (withdrawnAmount > amount) revert InvalidProtocolAmount(amount, withdrawnAmount);
 
-        _executeWithdrawFromProtocol(protocol, protocolImplementations[protocolName], amount);
+        protocolDeposits[protocol] -= withdrawnAmount;
+        totalDeposited -= withdrawnAmount;
 
-        protocolDeposits[protocol] -= amount;
-        totalDeposited -= amount;
+        emit Withdrawn(protocol, protocolName, withdrawnAmount);
 
-        emit Withdrawn(protocol, protocolName, amount);
-
-        _sendWithdrawConfirmation(amount);
+        _sendWithdrawConfirmation(withdrawnAmount);
     }
 
-    /// @notice Handle harvest command
     function _handleHarvest(bytes calldata _payload) internal {
         (address protocol, string memory protocolName) = MessageCodec.decodeHarvestCommand(_payload);
-
-        uint256 yieldAmount = _calculateYield(protocol);
+        address implementation = _getProtocolImplementation(protocolName);
+        uint256 yieldAmount = IRemoteProtocolImplementation(implementation).harvest(address(asset), protocol);
 
         emit Harvested(protocol, protocolName, yieldAmount);
 
@@ -156,25 +156,9 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
         }
     }
 
-    /// @notice Execute deployment to a DeFi protocol
-    /// @dev P1-4 FIX: Virtual stub - must be overridden by subclass for actual protocol integration
-    function _executeDeployToProtocol(address protocol, address implementation, uint256 amount) internal virtual {
-        (protocol, implementation, amount); // silence unused warnings
-        revert LayerZeroErrors.NotImplemented("_executeDeployToProtocol");
-    }
-
-    /// @notice Execute withdrawal from a DeFi protocol
-    /// @dev P1-4 FIX: Virtual stub - must be overridden by subclass for actual protocol integration
-    function _executeWithdrawFromProtocol(address protocol, address implementation, uint256 amount) internal virtual {
-        (protocol, implementation, amount); // silence unused warnings
-        revert LayerZeroErrors.NotImplemented("_executeWithdrawFromProtocol");
-    }
-
-    /// @notice Calculate yield from a protocol
-    /// @dev P0-10 FIX: Virtual stub that reverts instead of silently returning 0
-    function _calculateYield(address protocol) internal virtual returns (uint256) {
-        (protocol); // silence unused warning
-        revert LayerZeroErrors.NotImplemented("_calculateYield");
+    function _getProtocolImplementation(string memory protocolName) internal view returns (address implementation) {
+        implementation = protocolImplementations[protocolName];
+        if (implementation == address(0)) revert ProtocolNotSupported();
     }
 
     /// @notice Send withdrawal confirmation to Hub

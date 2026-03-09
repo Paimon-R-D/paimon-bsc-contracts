@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {OApp, Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
+import {OApp, Origin, MessagingFee} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICreditManager} from "../interfaces/ICreditManager.sol";
@@ -24,6 +24,7 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     error CannotReduceBelowUtilized(uint256 utilized, uint256 newCredit);
     error LengthMismatch(uint256 expected, uint256 actual);
     error EmptyArray();
+    error NoCreditChange();
     error UnknownMessageType(bytes1 msgType);
     error UnauthorizedSource(uint32 srcEid);
 
@@ -98,21 +99,16 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         if (!_isSupported[dstEid]) revert ChainNotSupported(dstEid);
 
         // Update local state
-        _chainCredits[dstEid].credit += amount;
+        uint256 oldCredit = _chainCredits[dstEid].credit;
+        uint256 newCredit = oldCredit + amount;
+        _chainCredits[dstEid].credit = newCredit;
         _chainCredits[dstEid].lastUpdate = block.timestamp;
         totalCredits += amount;
 
-        uint256 oldCredit = _chainCredits[dstEid].credit - amount;
-
-        // Build message payload using MessageCodec (MSG_CREDIT_UPDATE = 0x21)
-        bytes memory payload = MessageCodec.encodeCreditUpdate(amount);
-        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
-
-        // Send cross-chain message
-        _lzSend(dstEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));
+        _syncCreditAllocation(dstEid, newCredit, msg.value, msg.sender);
 
         emit CreditsSent(dstEid, amount);
-        emit CreditUpdated(dstEid, oldCredit, _chainCredits[dstEid].credit);
+        emit CreditUpdated(dstEid, oldCredit, newCredit);
     }
 
     /// @inheritdoc ICreditManager
@@ -139,42 +135,50 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         if (eids.length != amounts.length) revert LengthMismatch(eids.length, amounts.length);
         if (eids.length == 0) revert EmptyArray();
 
-        uint256 totalFee = msg.value;
-        uint256 feePerChain = totalFee / eids.length;
-        uint256 totalUsedFee = 0;
-
+        uint256 changedChains = 0;
         for (uint256 i = 0; i < eids.length; i++) {
             if (!_isSupported[eids[i]]) revert ChainNotSupported(eids[i]);
+            if (amounts[i] < _chainCredits[eids[i]].utilized) {
+                revert CannotReduceBelowUtilized(_chainCredits[eids[i]].utilized, amounts[i]);
+            }
+            if (amounts[i] != _chainCredits[eids[i]].credit) {
+                changedChains++;
+            }
+        }
 
+        if (changedChains == 0) {
+            if (msg.value > 0) revert NoCreditChange();
+            emit Rebalanced(eids, amounts);
+            return;
+        }
+
+        uint256 totalFee = msg.value;
+        uint256 feePerChangedChain = totalFee / changedChains;
+        uint256 totalUsedFee = 0;
+        uint256 processedChanges = 0;
+
+        for (uint256 i = 0; i < eids.length; i++) {
             uint256 oldCredit = _chainCredits[eids[i]].credit;
             uint256 newCredit = amounts[i];
+            if (newCredit == oldCredit) continue;
 
-            // Update credit
             if (newCredit > oldCredit) {
-                // Increasing credit - send message to remote
                 uint256 delta = newCredit - oldCredit;
-                _chainCredits[eids[i]].credit = newCredit;
                 totalCredits += delta;
-
-                bytes memory payload = MessageCodec.encodeCreditUpdate(delta);
-                bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
-
-                // Use remaining fee for last chain to avoid dust loss
-                uint256 fee = (i == eids.length - 1) ? (totalFee - totalUsedFee) : feePerChain;
-                _lzSend(eids[i], payload, options, MessagingFee(fee, 0), payable(msg.sender));
-                totalUsedFee += fee;
-
                 emit CreditsSent(eids[i], delta);
             } else if (newCredit < oldCredit) {
-                // Decreasing credit - just update locally
                 uint256 delta = oldCredit - newCredit;
-                uint256 available = _chainCredits[eids[i]].credit - _chainCredits[eids[i]].utilized;
-                if (available < delta) revert CannotReduceBelowUtilized(_chainCredits[eids[i]].utilized, newCredit);
-                _chainCredits[eids[i]].credit = newCredit;
                 totalCredits -= delta;
             }
 
+            _chainCredits[eids[i]].credit = newCredit;
             _chainCredits[eids[i]].lastUpdate = block.timestamp;
+
+            uint256 fee = processedChanges == changedChains - 1 ? (totalFee - totalUsedFee) : feePerChangedChain;
+            _syncCreditAllocation(eids[i], newCredit, fee, msg.sender);
+            totalUsedFee += fee;
+            processedChanges++;
+
             emit CreditUpdated(eids[i], oldCredit, newCredit);
         }
 
@@ -182,12 +186,16 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     }
 
     /// @inheritdoc ICreditManager
-    function setCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
+    function setCredit(uint32 eid, uint256 amount) external payable override onlyOwner whenNotPaused {
         if (!_isSupported[eid]) revert ChainNotSupported(eid);
         // Cannot set credit below current utilization
         if (amount < _chainCredits[eid].utilized) revert CannotReduceBelowUtilized(_chainCredits[eid].utilized, amount);
 
         uint256 oldCredit = _chainCredits[eid].credit;
+        if (amount == oldCredit) {
+            if (msg.value > 0) revert NoCreditChange();
+            return;
+        }
 
         if (amount > oldCredit) {
             totalCredits += (amount - oldCredit);
@@ -197,6 +205,7 @@ contract CreditManager is OApp, Pausable, ICreditManager {
 
         _chainCredits[eid].credit = amount;
         _chainCredits[eid].lastUpdate = block.timestamp;
+        _syncCreditAllocation(eid, amount, msg.value, msg.sender);
 
         emit CreditUpdated(eid, oldCredit, amount);
     }
@@ -266,7 +275,7 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     // ========== LayerZero Receive ==========
 
     /// @notice Handle incoming LayerZero messages
-    /// @dev Called when remote chain sends credit reduction message
+    /// @dev Called when remote chain sends credit utilization notification (MSG_CREDIT_USED)
     function _lzReceive(
         Origin calldata origin,
         bytes32 /*guid*/,
@@ -291,6 +300,18 @@ contract CreditManager is OApp, Pausable, ICreditManager {
 
     // ========== Internal Functions ==========
 
+    /// @notice Send the latest absolute credit allocation to a remote chain
+    function _syncCreditAllocation(
+        uint32 dstEid,
+        uint256 newCredit,
+        uint256 nativeFee,
+        address refundAddress
+    ) internal {
+        bytes memory payload = MessageCodec.encodeCreditUpdate(newCredit);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        _lzSend(dstEid, payload, options, MessagingFee(nativeFee, 0), payable(refundAddress));
+    }
+
     /// @notice Internal function to reduce credit (mark as utilized)
     /// @dev P0-7 FIX: Only increases utilized, does NOT reduce credit or totalCredits.
     ///      Credit represents allocation, utilized tracks usage within that allocation.
@@ -310,11 +331,12 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     }
 
     /// @notice Override _payNative to support multiple LZ sends in single tx
-    /// @dev Required for rebalance function which sends to multiple chains
+    /// @dev Uses address(this).balance instead of msg.value, since msg.value is constant
+    ///      across multiple _lzSend calls within rebalance()
     /// @param _nativeFee The native fee for this specific send
     /// @return nativeFee The fee amount paid
     function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
-        if (msg.value < _nativeFee) revert NotEnoughNative(msg.value);
+        if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
         return _nativeFee;
     }
 }

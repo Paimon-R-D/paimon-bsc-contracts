@@ -105,7 +105,8 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Liquidity Provider Functions ==========
 
     /// @inheritdoc ILiquidityPool
-    function addLiquidity(uint256 amount) external override nonReentrant whenNotPaused {
+    /// @dev Restrict top-ups to the operational owner/satellite pair until LP share accounting exists.
+    function addLiquidity(uint256 amount) external override onlySatelliteOrOwner nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
 
         _asset.safeTransferFrom(msg.sender, address(this), amount);

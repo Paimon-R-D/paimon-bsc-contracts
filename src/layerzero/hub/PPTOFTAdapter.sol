@@ -8,10 +8,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICreditManager} from "../interfaces/ICreditManager.sol";
-import {IPPTOFTAdapter} from "../interfaces/IPPTOFTAdapter.sol";
 import {ILayerZeroComposer} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroComposer.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 import {MessageCodec} from "../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 import {LayerZeroErrors} from "../libraries/LayerZeroErrors.sol";
@@ -44,6 +44,20 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     ICreditManager public creditManager;
     address public vault;
     address public redemptionManager;
+
+    // ========== Pending Mint Queue (ERR-002 fix) ==========
+
+    struct PendingMint {
+        uint32 dstEid;
+        address receiver;
+        uint256 shares;
+    }
+
+    mapping(uint256 => PendingMint) public pendingMints;
+    uint256 public pendingMintCount;
+
+    event PendingMintStored(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
+    event PendingMintFlushed(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
 
     // ========== Events ==========
 
@@ -273,6 +287,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     }
 
     /// @notice Handle satellite deposit: deposit to vault, send mint shares back
+    /// @dev Uses pending mint queue to prevent nonce blocking on insufficient gas
     function _handleSatelliteDeposit(Origin calldata _origin, bytes calldata _payload) internal {
         (address receiver, uint256 assets) = MessageCodec.decodeAddressAndAmount(_payload);
 
@@ -280,18 +295,41 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (receiver == address(0)) revert ZeroAddress();
         if (assets == 0) revert InvalidAmount();
 
-        // Approve vault and deposit
-        innerToken.approve(vault, assets);
+        // Approve vault and deposit (forceApprove for USDT compatibility)
+        innerToken.forceApprove(vault, assets);
         uint256 shares = IERC4626(vault).deposit(assets, address(this));
+        innerToken.forceApprove(vault, 0);
 
-        // Send mint shares message back to satellite
+        // Try to send mint shares message back to satellite
         bytes memory mintPayload = MessageCodec.encodeMintShares(receiver, shares);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         MessagingFee memory fee = _quote(_origin.srcEid, mintPayload, options, false);
-        _lzSend(_origin.srcEid, mintPayload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+
+        if (address(this).balance >= fee.nativeFee) {
+            _lzSend(_origin.srcEid, mintPayload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+        } else {
+            // Store for keeper retry to prevent nonce blocking
+            uint256 mintId = pendingMintCount++;
+            pendingMints[mintId] = PendingMint(_origin.srcEid, receiver, shares);
+            emit PendingMintStored(mintId, _origin.srcEid, receiver, shares);
+        }
 
         emit SatelliteDepositProcessed(_origin.srcEid, receiver, assets, shares);
+    }
+
+    /// @notice Flush a pending mint that was stored due to insufficient gas
+    function flushPendingMint(uint256 mintId) external payable whenNotPaused {
+        PendingMint memory pm = pendingMints[mintId];
+        if (pm.receiver == address(0)) revert ZeroAddress();
+
+        delete pendingMints[mintId];
+
+        bytes memory mintPayload = MessageCodec.encodeMintShares(pm.receiver, pm.shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        _lzSend(pm.dstEid, mintPayload, options, MessagingFee(msg.value, 0), payable(msg.sender));
+
+        emit PendingMintFlushed(mintId, pm.dstEid, pm.receiver, pm.shares);
     }
 
     /// @notice Handle satellite withdraw: process redemption on hub
@@ -309,15 +347,15 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
     /// @notice Handle satellite redemption request (PPTOFT.requestCrossChainRedemption)
     /// @dev Tokens were burned on remote chain; locked tokens on Hub are used for redemption
-    function _handleSatelliteRedemption(Origin calldata _origin, bytes calldata _payload) internal {
+    function _handleSatelliteRedemption(Origin calldata /*_origin*/, bytes calldata _payload) internal {
         (address owner, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
 
         if (owner == address(0)) revert ZeroAddress();
         if (shares == 0) revert InvalidAmount();
 
-        _requestRedemption(shares, owner);
+        uint256 requestId = _requestRedemption(shares, owner);
 
-        emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, 0);
+        emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, requestId);
     }
 
     /// @notice Handle cross-chain redemption request
@@ -334,11 +372,10 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         emit CrossChainRedemptionProcessed(_guid, owner, shares, requestId);
     }
 
-    /// @notice Internal function to request redemption
-    /// @dev P1-3 FIX: Virtual stub that reverts - must be overridden for production
-    function _requestRedemption(uint256 shares, address owner) internal virtual returns (uint256) {
-        (shares, owner); // silence unused warnings
-        revert LayerZeroErrors.NotImplemented("_requestRedemption");
+    /// @notice Internal function to request redemption through the configured manager
+    function _requestRedemption(uint256 shares, address owner) internal returns (uint256) {
+        if (redemptionManager == address(0)) revert InvalidComposeMessage();
+        return IRedemptionManager(redemptionManager).requestRedemption(shares, owner);
     }
 
     /// @notice Handle cross-chain deposit
@@ -349,10 +386,34 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (receiver == address(0)) revert ZeroAddress();
         if (assets == 0) revert InvalidAmount();
 
-        innerToken.approve(vault, assets);
+        innerToken.forceApprove(vault, assets);
         uint256 shares = IERC4626(vault).deposit(assets, receiver);
+        innerToken.forceApprove(vault, 0);
 
         emit CrossChainDepositProcessed(_guid, receiver, assets, shares);
+    }
+
+    // ========== Stargate Composer Integration ==========
+
+    /// @notice Hub Stargate Composer address (authorized to call mintSharesOnSatellite)
+    address public hubStargateComposer;
+
+    /// @notice Send PPT shares to a receiver on a satellite chain
+    /// @dev Called by HubStargateComposer after a bridged deposit is processed
+    function mintSharesOnSatellite(uint32 dstEid, address receiver, uint256 shares) external whenNotPaused {
+        if (msg.sender != hubStargateComposer) revert InvalidComposer();
+        if (receiver == address(0)) revert ZeroAddress();
+        if (shares == 0) revert InvalidAmount();
+
+        bytes memory payload = MessageCodec.encodeMintShares(receiver, shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+        _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+    }
+
+    function setHubStargateComposer(address _composer) external onlyOwner {
+        hubStargateComposer = _composer;
     }
 
     // ========== Configuration ==========

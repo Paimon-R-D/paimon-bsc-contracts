@@ -53,6 +53,9 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     /// @notice Chain support status
     mapping(uint32 => bool) internal _isChainSupported;
 
+    /// @notice Hub Stargate Composer for bridged deploys
+    address public hubStargateComposer;
+
     /// @notice Total deployed across all chains (for quick lookup)
     uint256 public totalDeployed;
 
@@ -112,8 +115,41 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 
     // ========== Keeper Functions ==========
 
-    /// @notice Deploy assets to a protocol on a remote chain
-    /// @dev P0-9 FIX: Records to pendingDeploys instead of directly updating deployedAssets
+    /// @notice Deploy assets via Stargate bridge (USDT + deploy command in single tx)
+    /// @dev Preferred method: bridges actual USDT to remote chain
+    function deployViaBridge(uint32 dstEid, uint256 amount, address protocol, string calldata protocolName)
+        external
+        payable
+        onlyRole(KEEPER_ROLE)
+        whenNotPaused
+    {
+        if (amount == 0) revert InvalidAmount();
+        if (!_isChainSupported[dstEid]) revert ChainNotSupported();
+        if (hubStargateComposer == address(0)) revert ChainNotSupported();
+
+        uint256 balance = asset.balanceOf(address(this));
+        if (balance < amount) {
+            revert InsufficientBalance(balance, amount);
+        }
+
+        // Transfer USDT to composer and bridge
+        asset.safeTransfer(hubStargateComposer, amount);
+        IHubStargateComposer(hubStargateComposer).bridgeAndDeploy{value: msg.value}(
+            dstEid, amount, protocol, protocolName
+        );
+
+        // Record accounting
+        pendingDeploys[dstEid] += amount;
+        _protocolAllocations[dstEid][protocol] += amount;
+        deployedAssets[dstEid] += amount;
+        totalDeployed += amount;
+
+        emit AssetDeployed(dstEid, protocol, protocolName, amount, bytes32(0));
+    }
+
+    /// @notice Legacy deploy via OApp message only (no asset bridge)
+    /// @dev DEPRECATED: Does not bridge actual assets. Prefer deployViaBridge.
+    ///      Only sends a command message; remote adapter must already have tokens.
     function deployToRemote(uint32 dstEid, uint256 amount, address protocol, string calldata protocolName)
         external
         payable
@@ -123,22 +159,15 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
         if (amount == 0) revert InvalidAmount();
         if (!_isChainSupported[dstEid]) revert ChainNotSupported();
 
-        uint256 balance = asset.balanceOf(address(this));
-        if (balance < amount) {
-            revert InsufficientBalance(balance, amount);
-        }
-
         bytes memory payload = MessageCodec.encodeDeploy(amount, protocol, protocolName);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         MessagingReceipt memory receipt =
             _lzSend(dstEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));
 
-        // Record as pending (optimistic accounting deferred until confirmation)
+        // Only record pending deploy (not yet confirmed)
         pendingDeploys[dstEid] += amount;
         _protocolAllocations[dstEid][protocol] += amount;
-        deployedAssets[dstEid] += amount;
-        totalDeployed += amount;
 
         emit AssetDeployed(dstEid, protocol, protocolName, amount, receipt.guid);
     }
@@ -214,14 +243,17 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
             emit YieldReceived(_origin.srcEid, yieldAmount);
         } else if (msgType == MessageCodec.MSG_WITHDRAW_CONFIRM) {
             uint256 amount = MessageCodec.decodeAmount(_payload);
-            // Settle pending withdrawal
+            // Settle pending withdrawal (safe subtraction to prevent nonce blocking)
             if (pendingWithdraws[_origin.srcEid] >= amount) {
                 pendingWithdraws[_origin.srcEid] -= amount;
             } else {
                 pendingWithdraws[_origin.srcEid] = 0;
             }
-            deployedAssets[_origin.srcEid] -= amount;
-            totalDeployed -= amount;
+            // Safe subtraction for deployedAssets
+            uint256 deployed = deployedAssets[_origin.srcEid];
+            uint256 deducted = deployed >= amount ? amount : deployed;
+            deployedAssets[_origin.srcEid] -= deducted;
+            totalDeployed = totalDeployed >= deducted ? totalDeployed - deducted : 0;
             emit WithdrawalConfirmed(_origin.srcEid, amount);
         } else {
             revert UnknownMessageType(msgType);
@@ -275,4 +307,14 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
     }
+
+    function setHubStargateComposer(address _composer) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        hubStargateComposer = _composer;
+    }
+}
+
+interface IHubStargateComposer {
+    function bridgeAndDeploy(uint32 dstEid, uint256 amount, address protocol, string calldata protocolName)
+        external
+        payable;
 }

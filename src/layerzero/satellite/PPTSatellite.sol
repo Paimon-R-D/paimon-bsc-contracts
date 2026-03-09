@@ -9,7 +9,6 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {PPTOFT} from "./PPTOFT.sol";
 import {LiquidityPool} from "./LiquidityPool.sol";
-import {IPPTSatellite} from "../interfaces/IPPTSatellite.sol";
 import {MessageCodec} from "../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 
@@ -32,6 +31,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     uint32 public immutable hubEid;
 
     address public hubAdapter;
+    address public satelliteGateway;
     uint256 public instantWithdrawFeeBps;
 
     /// @notice Current share price (from Hub, updated via cross-chain)
@@ -44,6 +44,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     event CrossChainWithdraw(address indexed user, uint256 shares, uint256 assets, uint64 nonce);
     event InstantWithdraw(address indexed user, uint256 shares, uint256 assets, uint256 fee);
     event HubAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
+    event SatelliteGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event InstantWithdrawFeeUpdated(uint256 oldFee, uint256 newFee);
     event SharePriceUpdated(uint256 oldPrice, uint256 newPrice);
 
@@ -115,6 +116,26 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     // ========== User Actions ==========
 
+    /// @notice Deposit USDT via Stargate bridge to Hub vault (recommended)
+    /// @dev Routes through SatelliteGateway for actual asset bridging
+    function depositViaBridge(
+        uint256 assets,
+        address receiver,
+        uint256 minShares
+    ) external payable nonReentrant whenNotPaused returns (uint256) {
+        if (assets == 0) revert InvalidAmount();
+        if (satelliteGateway == address(0)) revert ZeroAddress();
+
+        // Pull from user and forward to gateway
+        asset.safeTransferFrom(msg.sender, satelliteGateway, assets);
+        ISatelliteGateway(satelliteGateway).deposit{value: msg.value}(assets, receiver, minShares);
+
+        emit CrossChainDeposit(receiver, assets, 0, 0);
+        return 0; // Shares minted async via Hub + PPTOFT
+    }
+
+    /// @notice Deposit USDT to local LiquidityPool + sends OApp message to Hub
+    /// @dev Uses OApp messaging only (no asset bridging). Assets stay in local LiquidityPool.
     function deposit(
         uint256 assets,
         address receiver
@@ -123,7 +144,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
         asset.safeTransferFrom(msg.sender, address(this), assets);
 
-        asset.approve(address(liquidityPool), assets);
+        asset.forceApprove(address(liquidityPool), assets);
         liquidityPool.addLiquidity(assets);
 
         // Send cross-chain message to Hub using MessageCodec (MSG_DEPOSIT = 0x30)
@@ -216,9 +237,8 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
             uint256 newPrice = MessageCodec.decodeAmount(_payload);
             _updateSharePrice(newPrice);
         } else if (msgType == MessageCodec.MSG_CREDIT_UPDATE) {
-            // Hub sends delta (increment), not absolute value
-            uint256 creditDelta = MessageCodec.decodeAmount(_payload);
-            liquidityPool.increaseCredit(creditDelta);
+            uint256 newCredit = MessageCodec.decodeAmount(_payload);
+            liquidityPool.updateCredit(newCredit);
         } else if (msgType == MessageCodec.MSG_MINT_SHARES) {
             (address receiver, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
             // P0-6 FIX: Revert on invalid data instead of silently skipping
@@ -248,6 +268,12 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         hubAdapter = _hubAdapter;
     }
 
+    function setSatelliteGateway(address _gateway) external onlyOwner {
+        if (_gateway == address(0)) revert ZeroAddress();
+        emit SatelliteGatewayUpdated(satelliteGateway, _gateway);
+        satelliteGateway = _gateway;
+    }
+
     function setInstantWithdrawFee(uint256 _feeBps) external onlyOwner {
         if (_feeBps > MAX_INSTANT_WITHDRAW_FEE) revert FeeTooHigh();
         emit InstantWithdrawFeeUpdated(instantWithdrawFeeBps, _feeBps);
@@ -269,4 +295,8 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     }
 
     receive() external payable {}
+}
+
+interface ISatelliteGateway {
+    function deposit(uint256 assets, address receiver, uint256 minShares) external payable;
 }
