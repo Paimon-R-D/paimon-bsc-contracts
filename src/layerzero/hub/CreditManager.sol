@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {OApp, Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {ICreditManager} from "../interfaces/ICreditManager.sol";
+
+/// @title CreditManager
+/// @notice Manages cross-chain credit allocation using Delta algorithm
+/// @dev Deployed on BSC Hub chain, controls credit distribution to remote chains
+contract CreditManager is OApp, Pausable, ICreditManager {
+
+    // ========== Errors ==========
+
+    error InvalidAmount();
+    error ChainNotSupported(uint32 eid);
+    error ChainAlreadySupported(uint32 eid);
+    error ChainHasUtilizedCredit(uint32 eid);
+    error InsufficientCredit(uint256 available, uint256 required);
+    error RestoreExceedsUtilized(uint256 utilized, uint256 amount);
+    error CannotReduceBelowUtilized(uint256 utilized, uint256 newCredit);
+    error LengthMismatch(uint256 expected, uint256 actual);
+    error EmptyArray();
+    error UnknownMessageType(bytes1 msgType);
+    error UnauthorizedSource(uint32 srcEid);
+
+    // ========== Constants ==========
+
+    /// @notice Message type for sending credits to remote chain
+    bytes1 public constant MSG_SEND_CREDIT = 0x01;
+
+    /// @notice Message type for receiving credit reduction from remote chain
+    bytes1 public constant MSG_REDUCE_CREDIT = 0x02;
+
+    /// @notice Basis points denominator (100%)
+    uint256 public constant BPS_DENOMINATOR = 10000;
+
+    /// @notice Default gas limit for cross-chain messages
+    uint128 public constant DEFAULT_GAS_LIMIT = 200000;
+
+    // ========== State Variables ==========
+
+    /// @notice Credit allocation per chain (eid => ChainCredit)
+    mapping(uint32 => ChainCredit) internal _chainCredits;
+
+    /// @notice Array of supported chain endpoint IDs
+    uint32[] internal _supportedChains;
+
+    /// @notice Mapping to check if chain is supported
+    mapping(uint32 => bool) internal _isSupported;
+
+    /// @notice Total credits allocated across all chains
+    uint256 public override totalCredits;
+
+    // ========== Constructor ==========
+
+    /// @notice Initialize the CreditManager
+    /// @param _endpoint LayerZero endpoint address
+    /// @param _delegate Owner/delegate address
+    constructor(
+        address _endpoint,
+        address _delegate
+    ) OApp(_endpoint, _delegate) Ownable(_delegate) {}
+
+    // ========== View Functions ==========
+
+    /// @inheritdoc ICreditManager
+    function credits(uint32 eid) external view override returns (uint256) {
+        return _chainCredits[eid].credit;
+    }
+
+    /// @inheritdoc ICreditManager
+    function getCreditUtilization(uint32 eid) external view override returns (uint256) {
+        ChainCredit storage cc = _chainCredits[eid];
+        if (cc.credit == 0) return BPS_DENOMINATOR; // 100% utilized if no credit
+        return (cc.utilized * BPS_DENOMINATOR) / cc.credit;
+    }
+
+    /// @inheritdoc ICreditManager
+    function getAvailableCredit(uint32 eid) external view override returns (uint256) {
+        ChainCredit storage cc = _chainCredits[eid];
+        if (cc.credit <= cc.utilized) return 0;
+        return cc.credit - cc.utilized;
+    }
+
+    /// @inheritdoc ICreditManager
+    function getChainCredit(uint32 eid) external view override returns (ChainCredit memory) {
+        return _chainCredits[eid];
+    }
+
+    /// @inheritdoc ICreditManager
+    function getSupportedChains() external view override returns (uint32[] memory) {
+        return _supportedChains;
+    }
+
+    // ========== Credit Management ==========
+
+    /// @inheritdoc ICreditManager
+    function sendCredits(uint32 dstEid, uint256 amount) external payable override onlyOwner whenNotPaused {
+        if (amount == 0) revert InvalidAmount();
+        if (!_isSupported[dstEid]) revert ChainNotSupported(dstEid);
+
+        // Update local state
+        _chainCredits[dstEid].credit += amount;
+        _chainCredits[dstEid].lastUpdate = block.timestamp;
+        totalCredits += amount;
+
+        uint256 oldCredit = _chainCredits[dstEid].credit - amount;
+
+        // Build message payload
+        bytes memory payload = abi.encode(MSG_SEND_CREDIT, amount);
+        bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+
+        // Send cross-chain message
+        _lzSend(dstEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));
+
+        emit CreditsSent(dstEid, amount);
+        emit CreditUpdated(dstEid, oldCredit, _chainCredits[dstEid].credit);
+    }
+
+    /// @inheritdoc ICreditManager
+    function reduceCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
+        _reduceCredit(eid, amount);
+    }
+
+    /// @inheritdoc ICreditManager
+    function restoreCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
+        if (!_isSupported[eid]) revert ChainNotSupported(eid);
+        if (_chainCredits[eid].utilized < amount) revert RestoreExceedsUtilized(_chainCredits[eid].utilized, amount);
+
+        _chainCredits[eid].utilized -= amount;
+        _chainCredits[eid].lastUpdate = block.timestamp;
+
+        emit CreditUtilized(eid, _chainCredits[eid].utilized);
+    }
+
+    /// @inheritdoc ICreditManager
+    function rebalance(
+        uint32[] calldata eids,
+        uint256[] calldata amounts
+    ) external payable override onlyOwner whenNotPaused {
+        if (eids.length != amounts.length) revert LengthMismatch(eids.length, amounts.length);
+        if (eids.length == 0) revert EmptyArray();
+
+        uint256 totalFee = msg.value;
+        uint256 feePerChain = totalFee / eids.length;
+        uint256 totalUsedFee = 0;
+
+        for (uint256 i = 0; i < eids.length; i++) {
+            if (!_isSupported[eids[i]]) revert ChainNotSupported(eids[i]);
+
+            uint256 oldCredit = _chainCredits[eids[i]].credit;
+            uint256 newCredit = amounts[i];
+
+            // Update credit
+            if (newCredit > oldCredit) {
+                // Increasing credit - send message to remote
+                uint256 delta = newCredit - oldCredit;
+                _chainCredits[eids[i]].credit = newCredit;
+                totalCredits += delta;
+
+                bytes memory payload = abi.encode(MSG_SEND_CREDIT, delta);
+                bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+
+                // Use remaining fee for last chain to avoid dust loss
+                uint256 fee = (i == eids.length - 1) ? (totalFee - totalUsedFee) : feePerChain;
+                _lzSend(eids[i], payload, options, MessagingFee(fee, 0), payable(msg.sender));
+                totalUsedFee += fee;
+
+                emit CreditsSent(eids[i], delta);
+            } else if (newCredit < oldCredit) {
+                // Decreasing credit - just update locally
+                uint256 delta = oldCredit - newCredit;
+                uint256 available = _chainCredits[eids[i]].credit - _chainCredits[eids[i]].utilized;
+                if (available < delta) revert CannotReduceBelowUtilized(_chainCredits[eids[i]].utilized, newCredit);
+                _chainCredits[eids[i]].credit = newCredit;
+                totalCredits -= delta;
+            }
+
+            _chainCredits[eids[i]].lastUpdate = block.timestamp;
+            emit CreditUpdated(eids[i], oldCredit, newCredit);
+        }
+
+        emit Rebalanced(eids, amounts);
+    }
+
+    /// @inheritdoc ICreditManager
+    function setCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
+        if (!_isSupported[eid]) revert ChainNotSupported(eid);
+        // Cannot set credit below current utilization
+        if (amount < _chainCredits[eid].utilized) revert CannotReduceBelowUtilized(_chainCredits[eid].utilized, amount);
+
+        uint256 oldCredit = _chainCredits[eid].credit;
+
+        if (amount > oldCredit) {
+            totalCredits += (amount - oldCredit);
+        } else {
+            totalCredits -= (oldCredit - amount);
+        }
+
+        _chainCredits[eid].credit = amount;
+        _chainCredits[eid].lastUpdate = block.timestamp;
+
+        emit CreditUpdated(eid, oldCredit, amount);
+    }
+
+    // ========== Configuration ==========
+
+    /// @inheritdoc ICreditManager
+    function addChain(uint32 eid, uint256 initialCredit) external override onlyOwner {
+        if (_isSupported[eid]) revert ChainAlreadySupported(eid);
+
+        _isSupported[eid] = true;
+        _supportedChains.push(eid);
+        _chainCredits[eid] = ChainCredit({
+            credit: initialCredit,
+            utilized: 0,
+            lastUpdate: block.timestamp
+        });
+        totalCredits += initialCredit;
+
+        emit CreditUpdated(eid, 0, initialCredit);
+    }
+
+    /// @inheritdoc ICreditManager
+    function removeChain(uint32 eid) external override onlyOwner {
+        if (!_isSupported[eid]) revert ChainNotSupported(eid);
+        if (_chainCredits[eid].utilized > 0) revert ChainHasUtilizedCredit(eid);
+
+        totalCredits -= _chainCredits[eid].credit;
+        _isSupported[eid] = false;
+        delete _chainCredits[eid];
+
+        // Remove from array
+        for (uint256 i = 0; i < _supportedChains.length; i++) {
+            if (_supportedChains[i] == eid) {
+                _supportedChains[i] = _supportedChains[_supportedChains.length - 1];
+                _supportedChains.pop();
+                break;
+            }
+        }
+    }
+
+    // ========== Fee Quoting ==========
+
+    /// @inheritdoc ICreditManager
+    function quoteSendCredits(
+        uint32 dstEid,
+        uint256 amount
+    ) external view override returns (uint256 nativeFee, uint256 lzTokenFee) {
+        bytes memory payload = abi.encode(MSG_SEND_CREDIT, amount);
+        bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+        return (fee.nativeFee, fee.lzTokenFee);
+    }
+
+    // ========== Pausable ==========
+
+    /// @notice Pause the contract
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ========== LayerZero Receive ==========
+
+    /// @notice Handle incoming LayerZero messages
+    /// @dev Called when remote chain sends credit reduction message
+    function _lzReceive(
+        Origin calldata origin,
+        bytes32 /*guid*/,
+        bytes calldata payload,
+        address /*executor*/,
+        bytes calldata /*extraData*/
+    ) internal override whenNotPaused {
+        // Verify source is a supported chain
+        if (!_isSupported[origin.srcEid]) revert UnauthorizedSource(origin.srcEid);
+
+        bytes1 msgType = bytes1(payload[0]);
+
+        if (msgType == MSG_REDUCE_CREDIT) {
+            // Decode amount (skip first byte which is msgType)
+            uint256 amount = abi.decode(payload[1:], (uint256));
+            _reduceCredit(origin.srcEid, amount);
+            emit CreditsReceived(origin.srcEid, amount);
+        } else {
+            revert UnknownMessageType(msgType);
+        }
+    }
+
+    // ========== Internal Functions ==========
+
+    /// @notice Internal function to reduce credit
+    /// @param eid Chain endpoint ID
+    /// @param amount Amount to reduce
+    function _reduceCredit(uint32 eid, uint256 amount) internal {
+        if (!_isSupported[eid]) revert ChainNotSupported(eid);
+        if (_chainCredits[eid].credit < amount) revert InsufficientCredit(_chainCredits[eid].credit, amount);
+
+        uint256 oldCredit = _chainCredits[eid].credit;
+        _chainCredits[eid].credit -= amount;
+        _chainCredits[eid].utilized += amount;
+        _chainCredits[eid].lastUpdate = block.timestamp;
+        totalCredits -= amount;
+
+        emit CreditUpdated(eid, oldCredit, _chainCredits[eid].credit);
+        emit CreditUtilized(eid, _chainCredits[eid].utilized);
+    }
+
+    /// @notice Build LayerZero executor options for lzReceive
+    /// @dev Format: [type (uint16)][gas (uint128)][value (uint128)]
+    /// @param gasLimit Gas limit for the destination execution
+    /// @return options Encoded options bytes
+    function _buildLzReceiveOptions(uint128 gasLimit) internal pure returns (bytes memory) {
+        // Option type 3 = EXECUTOR_LZ_RECEIVE_OPTION
+        // Format: 0x0003 + gas (uint128) + value (uint128)
+        return abi.encodePacked(
+            uint16(3),      // EXECUTOR_LZ_RECEIVE_OPTION type
+            gasLimit,       // gas limit
+            uint128(0)      // msg.value (0 for no native transfer)
+        );
+    }
+
+    /// @notice Override _payNative to support multiple LZ sends in single tx
+    /// @dev Required for rebalance function which sends to multiple chains
+    /// @param _nativeFee The native fee for this specific send
+    /// @return nativeFee The fee amount paid
+    function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
+        if (msg.value < _nativeFee) revert NotEnoughNative(msg.value);
+        return _nativeFee;
+    }
+}
