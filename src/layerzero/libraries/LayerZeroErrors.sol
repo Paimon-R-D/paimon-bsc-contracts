@@ -37,4 +37,10 @@ library LayerZeroErrors {
 
     /// @notice Thrown when credit is insufficient
     error InsufficientCredit(uint256 available, uint256 required);
+
+    /// @notice Thrown when a stub function is called without being overridden
+    error NotImplemented(string functionName);
+
+    /// @notice Thrown when contract has insufficient gas balance for cross-chain message
+    error InsufficientGasBalance(uint256 available, uint256 required);
 }

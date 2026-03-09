@@ -109,7 +109,8 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ILiquidityPool
-    function removeLiquidity(uint256 amount) external override nonReentrant whenNotPaused {
+    /// @dev P1-1 FIX: Added onlyOwner to prevent unauthorized liquidity removal
+    function removeLiquidity(uint256 amount) external override onlyOwner nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
 
         uint256 poolBalance = _asset.balanceOf(address(this));

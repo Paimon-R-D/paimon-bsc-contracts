@@ -5,6 +5,8 @@ import {OApp, Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/c
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICreditManager} from "../interfaces/ICreditManager.sol";
+import {MessageCodec} from "../libraries/MessageCodec.sol";
+import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 
 /// @title CreditManager
 /// @notice Manages cross-chain credit allocation using Delta algorithm
@@ -26,12 +28,6 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     error UnauthorizedSource(uint32 srcEid);
 
     // ========== Constants ==========
-
-    /// @notice Message type for sending credits to remote chain
-    bytes1 public constant MSG_SEND_CREDIT = 0x01;
-
-    /// @notice Message type for receiving credit reduction from remote chain
-    bytes1 public constant MSG_REDUCE_CREDIT = 0x02;
 
     /// @notice Basis points denominator (100%)
     uint256 public constant BPS_DENOMINATOR = 10000;
@@ -108,9 +104,9 @@ contract CreditManager is OApp, Pausable, ICreditManager {
 
         uint256 oldCredit = _chainCredits[dstEid].credit - amount;
 
-        // Build message payload
-        bytes memory payload = abi.encode(MSG_SEND_CREDIT, amount);
-        bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        // Build message payload using MessageCodec (MSG_CREDIT_UPDATE = 0x21)
+        bytes memory payload = MessageCodec.encodeCreditUpdate(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         // Send cross-chain message
         _lzSend(dstEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));
@@ -160,8 +156,8 @@ contract CreditManager is OApp, Pausable, ICreditManager {
                 _chainCredits[eids[i]].credit = newCredit;
                 totalCredits += delta;
 
-                bytes memory payload = abi.encode(MSG_SEND_CREDIT, delta);
-                bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+                bytes memory payload = MessageCodec.encodeCreditUpdate(delta);
+                bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
                 // Use remaining fee for last chain to avoid dust loss
                 uint256 fee = (i == eids.length - 1) ? (totalFee - totalUsedFee) : feePerChain;
@@ -249,8 +245,8 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         uint32 dstEid,
         uint256 amount
     ) external view override returns (uint256 nativeFee, uint256 lzTokenFee) {
-        bytes memory payload = abi.encode(MSG_SEND_CREDIT, amount);
-        bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        bytes memory payload = MessageCodec.encodeCreditUpdate(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         MessagingFee memory fee = _quote(dstEid, payload, options, false);
         return (fee.nativeFee, fee.lzTokenFee);
     }
@@ -281,11 +277,11 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         // Verify source is a supported chain
         if (!_isSupported[origin.srcEid]) revert UnauthorizedSource(origin.srcEid);
 
-        bytes1 msgType = bytes1(payload[0]);
+        bytes1 msgType = MessageCodec.decodeMsgType(payload);
 
-        if (msgType == MSG_REDUCE_CREDIT) {
-            // Decode amount (skip first byte which is msgType)
-            uint256 amount = abi.decode(payload[1:], (uint256));
+        if (msgType == MessageCodec.MSG_CREDIT_USED) {
+            // Credit used notification from satellite (0x10)
+            uint256 amount = MessageCodec.decodeAmount(payload);
             _reduceCredit(origin.srcEid, amount);
             emit CreditsReceived(origin.srcEid, amount);
         } else {
@@ -295,35 +291,22 @@ contract CreditManager is OApp, Pausable, ICreditManager {
 
     // ========== Internal Functions ==========
 
-    /// @notice Internal function to reduce credit
+    /// @notice Internal function to reduce credit (mark as utilized)
+    /// @dev P0-7 FIX: Only increases utilized, does NOT reduce credit or totalCredits.
+    ///      Credit represents allocation, utilized tracks usage within that allocation.
     /// @param eid Chain endpoint ID
-    /// @param amount Amount to reduce
+    /// @param amount Amount to mark as utilized
     function _reduceCredit(uint32 eid, uint256 amount) internal {
         if (!_isSupported[eid]) revert ChainNotSupported(eid);
-        if (_chainCredits[eid].credit < amount) revert InsufficientCredit(_chainCredits[eid].credit, amount);
 
-        uint256 oldCredit = _chainCredits[eid].credit;
-        _chainCredits[eid].credit -= amount;
-        _chainCredits[eid].utilized += amount;
-        _chainCredits[eid].lastUpdate = block.timestamp;
-        totalCredits -= amount;
+        ChainCredit storage cc = _chainCredits[eid];
+        uint256 available = cc.credit > cc.utilized ? cc.credit - cc.utilized : 0;
+        if (available < amount) revert InsufficientCredit(available, amount);
 
-        emit CreditUpdated(eid, oldCredit, _chainCredits[eid].credit);
-        emit CreditUtilized(eid, _chainCredits[eid].utilized);
-    }
+        cc.utilized += amount;
+        cc.lastUpdate = block.timestamp;
 
-    /// @notice Build LayerZero executor options for lzReceive
-    /// @dev Format: [type (uint16)][gas (uint128)][value (uint128)]
-    /// @param gasLimit Gas limit for the destination execution
-    /// @return options Encoded options bytes
-    function _buildLzReceiveOptions(uint128 gasLimit) internal pure returns (bytes memory) {
-        // Option type 3 = EXECUTOR_LZ_RECEIVE_OPTION
-        // Format: 0x0003 + gas (uint128) + value (uint128)
-        return abi.encodePacked(
-            uint16(3),      // EXECUTOR_LZ_RECEIVE_OPTION type
-            gasLimit,       // gas limit
-            uint128(0)      // msg.value (0 for no native transfer)
-        );
+        emit CreditUtilized(eid, cc.utilized);
     }
 
     /// @notice Override _payNative to support multiple LZ sends in single tx

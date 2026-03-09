@@ -7,23 +7,17 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {MessageCodec} from "../../libraries/MessageCodec.sol";
+import {LzOptionsLib} from "../../libraries/LzOptionsLib.sol";
+import {LayerZeroErrors} from "../../libraries/LayerZeroErrors.sol";
 
 /// @title RemoteAssetAdapter
 /// @notice Receives commands from Hub and executes DeFi operations on remote chain
 /// @dev Deployed on each remote chain (ETH, ARB, Base, etc.)
+///      Subclass and override _executeDeployToProtocol/_executeWithdrawFromProtocol/_calculateYield
+///      for protocol-specific integrations.
 contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
-
-    // ========== Message Types (from Hub) ==========
-
-    bytes1 public constant MSG_DEPLOY = 0x01;
-    bytes1 public constant MSG_WITHDRAW = 0x02;
-    bytes1 public constant MSG_HARVEST = 0x03;
-
-    // ========== Message Types (to Hub) ==========
-
-    bytes1 public constant MSG_YIELD_REPORT = 0x10;
-    bytes1 public constant MSG_WITHDRAW_CONFIRM = 0x11;
 
     // ========== Constants ==========
 
@@ -48,17 +42,13 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
 
     // ========== Events ==========
 
-    /// @notice Emitted when assets are deployed to a protocol
     event Deployed(address indexed protocol, string protocolName, uint256 amount);
-
-    /// @notice Emitted when assets are withdrawn from a protocol
     event Withdrawn(address indexed protocol, string protocolName, uint256 amount);
-
-    /// @notice Emitted when yield is harvested
     event Harvested(address indexed protocol, string protocolName, uint256 yieldAmount);
-
-    /// @notice Emitted when protocol implementation is updated
     event ProtocolUpdated(string protocolName, address implementation);
+    event EmergencyWithdraw(address indexed to, uint256 amount);
+    event WithdrawConfirmationSent(uint256 amount, bytes32 guid);
+    event YieldReportSent(uint256 yieldAmount, bytes32 guid);
 
     // ========== Errors ==========
 
@@ -69,24 +59,8 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     error UnknownMessageType(bytes1 msgType);
     error ZeroAddress();
 
-    // ========== Additional Events ==========
-
-    /// @notice Emitted when emergency withdrawal is executed
-    event EmergencyWithdraw(address indexed to, uint256 amount);
-
-    /// @notice Emitted when withdrawal confirmation is sent
-    event WithdrawConfirmationSent(uint256 amount, bytes32 guid);
-
-    /// @notice Emitted when yield report is sent
-    event YieldReportSent(uint256 yieldAmount, bytes32 guid);
-
     // ========== Constructor ==========
 
-    /// @notice Initialize the RemoteAssetAdapter
-    /// @param _endpoint LayerZero endpoint address
-    /// @param _delegate Owner/delegate address
-    /// @param _asset Underlying asset address
-    /// @param _hubEid Hub chain endpoint ID
     constructor(address _endpoint, address _delegate, address _asset, uint32 _hubEid)
         OApp(_endpoint, _delegate)
         Ownable(_delegate)
@@ -97,9 +71,6 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
 
     // ========== View Functions ==========
 
-    /// @notice Get protocol implementation address
-    /// @param protocolName Protocol identifier
-    /// @return Implementation address
     function getProtocolImplementation(string calldata protocolName) external view returns (address) {
         return protocolImplementations[protocolName];
     }
@@ -107,6 +78,7 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     // ========== LayerZero Receive ==========
 
     /// @notice Handle messages from Hub
+    /// @dev P0-2 FIX: Uses MessageCodec for consistent decode (payload[1:] instead of abi.decode with bytes1)
     function _lzReceive(
         Origin calldata _origin,
         bytes32, /*_guid*/
@@ -119,16 +91,15 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
         whenNotPaused
         nonReentrant
     {
-        // Only accept messages from Hub
         if (_origin.srcEid != hubEid) revert OnlyHub();
 
-        bytes1 msgType = bytes1(_payload[0]);
+        bytes1 msgType = MessageCodec.decodeMsgType(_payload);
 
-        if (msgType == MSG_DEPLOY) {
+        if (msgType == MessageCodec.MSG_DEPLOY) {
             _handleDeploy(_payload);
-        } else if (msgType == MSG_WITHDRAW) {
+        } else if (msgType == MessageCodec.MSG_WITHDRAW_ASSET) {
             _handleWithdraw(_payload);
-        } else if (msgType == MSG_HARVEST) {
+        } else if (msgType == MessageCodec.MSG_HARVEST) {
             _handleHarvest(_payload);
         } else {
             revert UnknownMessageType(msgType);
@@ -138,15 +109,16 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     // ========== Internal Handlers ==========
 
     /// @notice Handle deploy command
+    /// @dev P1-4 FIX: Delegates actual asset deployment to virtual _executeDeployToProtocol
     function _handleDeploy(bytes calldata _payload) internal {
-        (, uint256 amount, address protocol, string memory protocolName) =
-            abi.decode(_payload, (bytes1, uint256, address, string));
+        (uint256 amount, address protocol, string memory protocolName) =
+            MessageCodec.decodeDeployCommand(_payload);
 
         address implementation = protocolImplementations[protocolName];
         if (implementation == address(0)) revert ProtocolNotSupported();
 
-        // Transfer assets to protocol (simplified - actual implementation would call protocol)
-        // In production, this would call the protocol's deposit function
+        _executeDeployToProtocol(protocol, implementation, amount);
+
         protocolDeposits[protocol] += amount;
         totalDeposited += amount;
 
@@ -154,92 +126,101 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
     }
 
     /// @notice Handle withdraw command
+    /// @dev P1-4 FIX: Delegates actual asset withdrawal to virtual _executeWithdrawFromProtocol
     function _handleWithdraw(bytes calldata _payload) internal {
-        (, uint256 amount, address protocol, string memory protocolName) =
-            abi.decode(_payload, (bytes1, uint256, address, string));
+        (uint256 amount, address protocol, string memory protocolName) =
+            MessageCodec.decodeDeployCommand(_payload);
 
         if (protocolDeposits[protocol] < amount) revert InsufficientDeposit();
 
-        // Withdraw from protocol (simplified)
+        _executeWithdrawFromProtocol(protocol, protocolImplementations[protocolName], amount);
+
         protocolDeposits[protocol] -= amount;
         totalDeposited -= amount;
 
         emit Withdrawn(protocol, protocolName, amount);
 
-        // Send confirmation back to Hub
         _sendWithdrawConfirmation(amount);
     }
 
     /// @notice Handle harvest command
     function _handleHarvest(bytes calldata _payload) internal {
-        (, address protocol, string memory protocolName) = abi.decode(_payload, (bytes1, address, string));
+        (address protocol, string memory protocolName) = MessageCodec.decodeHarvestCommand(_payload);
 
-        // Calculate yield (simplified - actual implementation would query protocol)
         uint256 yieldAmount = _calculateYield(protocol);
 
         emit Harvested(protocol, protocolName, yieldAmount);
 
-        // Send yield report back to Hub
         if (yieldAmount > 0) {
             _sendYieldReport(yieldAmount);
         }
     }
 
-    /// @notice Calculate yield from a protocol (placeholder)
-    function _calculateYield(
-        address /*protocol*/
-    )
-        internal
-        pure
-        returns (uint256)
-    {
-        // In production, this would query the protocol for accrued yield
-        return 0;
+    /// @notice Execute deployment to a DeFi protocol
+    /// @dev P1-4 FIX: Virtual stub - must be overridden by subclass for actual protocol integration
+    function _executeDeployToProtocol(address protocol, address implementation, uint256 amount) internal virtual {
+        (protocol, implementation, amount); // silence unused warnings
+        revert LayerZeroErrors.NotImplemented("_executeDeployToProtocol");
+    }
+
+    /// @notice Execute withdrawal from a DeFi protocol
+    /// @dev P1-4 FIX: Virtual stub - must be overridden by subclass for actual protocol integration
+    function _executeWithdrawFromProtocol(address protocol, address implementation, uint256 amount) internal virtual {
+        (protocol, implementation, amount); // silence unused warnings
+        revert LayerZeroErrors.NotImplemented("_executeWithdrawFromProtocol");
+    }
+
+    /// @notice Calculate yield from a protocol
+    /// @dev P0-10 FIX: Virtual stub that reverts instead of silently returning 0
+    function _calculateYield(address protocol) internal virtual returns (uint256) {
+        (protocol); // silence unused warning
+        revert LayerZeroErrors.NotImplemented("_calculateYield");
     }
 
     /// @notice Send withdrawal confirmation to Hub
+    /// @dev P0-5 FIX: Reverts on insufficient gas instead of silently skipping
     /// @param amount Amount that was withdrawn
     function _sendWithdrawConfirmation(uint256 amount) internal {
-        bytes memory payload = abi.encodePacked(MSG_WITHDRAW_CONFIRM, amount);
-        bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);
+        bytes memory payload = MessageCodec.encodeWithdrawConfirm(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
-        // Note: This requires the contract to have native balance for fees
-        // In production, fees should be pre-funded or use a fee management system
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
 
-        // Only send if we have enough balance
-        if (address(this).balance >= fee.nativeFee) {
-            MessagingReceipt memory receipt = _lzSend(
-                hubEid,
-                payload,
-                options,
-                MessagingFee(fee.nativeFee, 0),
-                payable(address(this))
-            );
-            emit WithdrawConfirmationSent(amount, receipt.guid);
+        if (address(this).balance < fee.nativeFee) {
+            revert LayerZeroErrors.InsufficientGasBalance(address(this).balance, fee.nativeFee);
         }
+
+        MessagingReceipt memory receipt = _lzSend(
+            hubEid,
+            payload,
+            options,
+            MessagingFee(fee.nativeFee, 0),
+            payable(address(this))
+        );
+        emit WithdrawConfirmationSent(amount, receipt.guid);
     }
 
     /// @notice Send yield report to Hub
+    /// @dev P0-5 FIX: Reverts on insufficient gas instead of silently skipping
     /// @param yieldAmount Amount of yield harvested
     function _sendYieldReport(uint256 yieldAmount) internal {
-        bytes memory payload = abi.encodePacked(MSG_YIELD_REPORT, yieldAmount);
-        bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);
+        bytes memory payload = MessageCodec.encodeYieldReport(yieldAmount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
-        // Note: This requires the contract to have native balance for fees
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
 
-        // Only send if we have enough balance
-        if (address(this).balance >= fee.nativeFee) {
-            MessagingReceipt memory receipt = _lzSend(
-                hubEid,
-                payload,
-                options,
-                MessagingFee(fee.nativeFee, 0),
-                payable(address(this))
-            );
-            emit YieldReportSent(yieldAmount, receipt.guid);
+        if (address(this).balance < fee.nativeFee) {
+            revert LayerZeroErrors.InsufficientGasBalance(address(this).balance, fee.nativeFee);
         }
+
+        MessagingReceipt memory receipt = _lzSend(
+            hubEid,
+            payload,
+            options,
+            MessagingFee(fee.nativeFee, 0),
+            payable(address(this))
+        );
+        emit YieldReportSent(yieldAmount, receipt.guid);
     }
 
     /// @notice Receive native token for gas fees
@@ -247,37 +228,23 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
 
     // ========== Admin Functions ==========
 
-    /// @notice Set protocol implementation
-    /// @param protocolName Protocol identifier
-    /// @param implementation Implementation address
     function setProtocolImplementation(string calldata protocolName, address implementation) external onlyOwner {
         if (implementation == address(0)) revert ZeroAddress();
         protocolImplementations[protocolName] = implementation;
         emit ProtocolUpdated(protocolName, implementation);
     }
 
-    /// @notice Pause the adapter
     function pause() external onlyOwner {
         _pause();
     }
 
-    /// @notice Unpause the adapter
     function unpause() external onlyOwner {
         _unpause();
     }
 
-    /// @notice Emergency withdraw
-    /// @param to Recipient address
-    /// @param amount Amount to withdraw
     function emergencyWithdraw(address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         asset.safeTransfer(to, amount);
         emit EmergencyWithdraw(to, amount);
-    }
-
-    // ========== Internal Functions ==========
-
-    function _buildOptions(uint128 gasLimit) internal pure returns (bytes memory) {
-        return abi.encodePacked(uint16(3), gasLimit, uint128(0));
     }
 }
