@@ -21,9 +21,10 @@ library MessageCodec {
     bytes1 internal constant MSG_CREDIT_UPDATE = 0x21;
     bytes1 internal constant MSG_MINT_SHARES = 0x22;
 
-    // --- Satellite → Hub (Deposit/Withdraw) ---
+    // --- Satellite → Hub (Deposit/Withdraw/Redeem) ---
     bytes1 internal constant MSG_DEPOSIT = 0x30;
     bytes1 internal constant MSG_WITHDRAW = 0x31;
+    bytes1 internal constant MSG_REDEEM = 0x32;
 
     // --- Hub → RemoteAdapter (Commands) ---
     bytes1 internal constant MSG_DEPLOY = 0x40;
@@ -59,6 +60,11 @@ library MessageCodec {
     /// @notice Encode withdraw message (Satellite → Hub)
     function encodeWithdraw(address receiver, uint256 shares) internal pure returns (bytes memory) {
         return abi.encodePacked(MSG_WITHDRAW, abi.encode(receiver, shares));
+    }
+
+    /// @notice Encode redemption request message (Satellite → Hub)
+    function encodeRedeem(address owner, uint256 shares) internal pure returns (bytes memory) {
+        return abi.encodePacked(MSG_REDEEM, abi.encode(owner, shares));
     }
 
     /// @notice Encode credit used message (Satellite → Hub)

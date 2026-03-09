@@ -204,6 +204,8 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             _handleSatelliteDeposit(_origin, _payload);
         } else if (msgType == MessageCodec.MSG_WITHDRAW) {
             _handleSatelliteWithdraw(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_REDEEM) {
+            _handleSatelliteRedemption(_origin, _payload);
         } else {
             revert LayerZeroErrors.UnknownMessageType(msgType);
         }
@@ -305,6 +307,19 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         emit SatelliteWithdrawProcessed(_origin.srcEid, receiver, shares);
     }
 
+    /// @notice Handle satellite redemption request (PPTOFT.requestCrossChainRedemption)
+    /// @dev Tokens were burned on remote chain; locked tokens on Hub are used for redemption
+    function _handleSatelliteRedemption(Origin calldata _origin, bytes calldata _payload) internal {
+        (address owner, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
+
+        if (owner == address(0)) revert ZeroAddress();
+        if (shares == 0) revert InvalidAmount();
+
+        _requestRedemption(shares, owner);
+
+        emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, 0);
+    }
+
     /// @notice Handle cross-chain redemption request
     /// @dev P0-8 FIX: Removed unnecessary approve before safeTransfer
     function _handleRedemption(bytes32 _guid, bytes calldata _data) internal {
@@ -369,6 +384,13 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (_to == address(0)) revert ZeroAddress();
         IERC20(_token).safeTransfer(_to, _amount);
         emit EmergencyWithdraw(_token, _to, _amount);
+    }
+
+    /// @notice Override _payNative to use contract balance instead of msg.value
+    /// @dev Required for _lzSend calls inside _lzReceive (where msg.value=0)
+    function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
+        if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
+        return _nativeFee;
     }
 
     /// @notice Receive native token for cross-chain message fees

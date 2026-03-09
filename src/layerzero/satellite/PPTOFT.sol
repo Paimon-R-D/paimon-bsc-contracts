@@ -6,6 +6,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
+import {MessageCodec} from "../libraries/MessageCodec.sol";
 
 /// @title PPTOFT
 /// @notice LayerZero OFT for PPT on non-hub (remote) chains
@@ -219,7 +220,7 @@ contract PPTOFT is OApp, ERC20, Pausable {
     }
 
     function _buildRedemptionMessage(uint256 _shares, address _owner) internal pure returns (bytes memory) {
-        return abi.encodePacked(COMPOSE_MSG_REDEEM, abi.encode(_owner, _shares));
+        return MessageCodec.encodeRedeem(_owner, _shares);
     }
 
     function _bytes32ToAddress(bytes32 _b) internal pure returns (address) {

@@ -223,6 +223,13 @@ contract RemoteAssetAdapter is OApp, Pausable, ReentrancyGuard {
         emit YieldReportSent(yieldAmount, receipt.guid);
     }
 
+    /// @notice Override _payNative to use contract balance instead of msg.value
+    /// @dev Required for _lzSend calls inside _lzReceive (where msg.value=0)
+    function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
+        if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
+        return _nativeFee;
+    }
+
     /// @notice Receive native token for gas fees
     receive() external payable {}
 

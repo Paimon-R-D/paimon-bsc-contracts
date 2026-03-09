@@ -55,6 +55,11 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
         _;
     }
 
+    modifier onlySatelliteOrOwner() {
+        if (msg.sender != satellite && msg.sender != owner()) revert OnlySatellite();
+        _;
+    }
+
     // ========== Constructor ==========
 
     /// @notice Initialize the LiquidityPool
@@ -146,20 +151,20 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Credit Management ==========
 
     /// @inheritdoc ILiquidityPool
-    function updateCredit(uint256 newCredit) external override onlyOwner {
+    function updateCredit(uint256 newCredit) external override onlySatelliteOrOwner {
         emit CreditUpdated(credit, newCredit);
         credit = newCredit;
     }
 
     /// @inheritdoc ILiquidityPool
-    function increaseCredit(uint256 amount) external override onlyOwner {
+    function increaseCredit(uint256 amount) external override onlySatelliteOrOwner {
         uint256 oldCredit = credit;
         credit += amount;
         emit CreditUpdated(oldCredit, credit);
     }
 
     /// @inheritdoc ILiquidityPool
-    function decreaseCredit(uint256 amount) external override onlyOwner {
+    function decreaseCredit(uint256 amount) external override onlySatelliteOrOwner {
         // Check for underflow first
         if (amount > credit) revert InsufficientCredit(credit, amount);
         // Then check if remaining credit is sufficient for utilized

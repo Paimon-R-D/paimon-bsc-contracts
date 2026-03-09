@@ -216,8 +216,9 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
             uint256 newPrice = MessageCodec.decodeAmount(_payload);
             _updateSharePrice(newPrice);
         } else if (msgType == MessageCodec.MSG_CREDIT_UPDATE) {
-            uint256 newCredit = MessageCodec.decodeAmount(_payload);
-            liquidityPool.updateCredit(newCredit);
+            // Hub sends delta (increment), not absolute value
+            uint256 creditDelta = MessageCodec.decodeAmount(_payload);
+            liquidityPool.increaseCredit(creditDelta);
         } else if (msgType == MessageCodec.MSG_MINT_SHARES) {
             (address receiver, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
             // P0-6 FIX: Revert on invalid data instead of silently skipping
