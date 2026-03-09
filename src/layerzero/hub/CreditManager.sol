@@ -50,6 +50,12 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     /// @notice Total credits allocated across all chains
     uint256 public override totalCredits;
 
+    /// @notice Optional adapter that owns the Hub↔Satellite OApp channel for credit updates
+    address public satelliteSyncAdapter;
+
+    /// @notice Operators allowed to update utilization on behalf of the owner
+    mapping(address => bool) public operators;
+
     // ========== Constructor ==========
 
     /// @notice Initialize the CreditManager
@@ -59,6 +65,11 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         address _endpoint,
         address _delegate
     ) OApp(_endpoint, _delegate) Ownable(_delegate) {}
+
+    // ========== Events ==========
+
+    event SatelliteSyncAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
+    event OperatorUpdated(address indexed operator, bool allowed);
 
     // ========== View Functions ==========
 
@@ -112,19 +123,13 @@ contract CreditManager is OApp, Pausable, ICreditManager {
     }
 
     /// @inheritdoc ICreditManager
-    function reduceCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
+    function reduceCredit(uint32 eid, uint256 amount) external override onlyOwnerOrOperator whenNotPaused {
         _reduceCredit(eid, amount);
     }
 
     /// @inheritdoc ICreditManager
-    function restoreCredit(uint32 eid, uint256 amount) external override onlyOwner whenNotPaused {
-        if (!_isSupported[eid]) revert ChainNotSupported(eid);
-        if (_chainCredits[eid].utilized < amount) revert RestoreExceedsUtilized(_chainCredits[eid].utilized, amount);
-
-        _chainCredits[eid].utilized -= amount;
-        _chainCredits[eid].lastUpdate = block.timestamp;
-
-        emit CreditUtilized(eid, _chainCredits[eid].utilized);
+    function restoreCredit(uint32 eid, uint256 amount) external override onlyOwnerOrOperator whenNotPaused {
+        _restoreCredit(eid, amount);
     }
 
     /// @inheritdoc ICreditManager
@@ -293,6 +298,9 @@ contract CreditManager is OApp, Pausable, ICreditManager {
             uint256 amount = MessageCodec.decodeAmount(payload);
             _reduceCredit(origin.srcEid, amount);
             emit CreditsReceived(origin.srcEid, amount);
+        } else if (msgType == MessageCodec.MSG_CREDIT_RESTORED) {
+            uint256 amount = MessageCodec.decodeAmount(payload);
+            _restoreCredit(origin.srcEid, amount);
         } else {
             revert UnknownMessageType(msgType);
         }
@@ -307,6 +315,11 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         uint256 nativeFee,
         address refundAddress
     ) internal {
+        if (satelliteSyncAdapter != address(0)) {
+            ICreditSyncAdapter(satelliteSyncAdapter).syncCreditToSatellite{value: nativeFee}(dstEid, newCredit, refundAddress);
+            return;
+        }
+
         bytes memory payload = MessageCodec.encodeCreditUpdate(newCredit);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         _lzSend(dstEid, payload, options, MessagingFee(nativeFee, 0), payable(refundAddress));
@@ -330,6 +343,16 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         emit CreditUtilized(eid, cc.utilized);
     }
 
+    function _restoreCredit(uint32 eid, uint256 amount) internal {
+        if (!_isSupported[eid]) revert ChainNotSupported(eid);
+        if (_chainCredits[eid].utilized < amount) revert RestoreExceedsUtilized(_chainCredits[eid].utilized, amount);
+
+        _chainCredits[eid].utilized -= amount;
+        _chainCredits[eid].lastUpdate = block.timestamp;
+
+        emit CreditUtilized(eid, _chainCredits[eid].utilized);
+    }
+
     /// @notice Override _payNative to support multiple LZ sends in single tx
     /// @dev Uses address(this).balance instead of msg.value, since msg.value is constant
     ///      across multiple _lzSend calls within rebalance()
@@ -339,4 +362,25 @@ contract CreditManager is OApp, Pausable, ICreditManager {
         if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
         return _nativeFee;
     }
+
+    // ========== Configuration ==========
+
+    modifier onlyOwnerOrOperator() {
+        if (msg.sender != owner() && !operators[msg.sender]) revert OwnableUnauthorizedAccount(msg.sender);
+        _;
+    }
+
+    function setSatelliteSyncAdapter(address adapter) external onlyOwner {
+        emit SatelliteSyncAdapterUpdated(satelliteSyncAdapter, adapter);
+        satelliteSyncAdapter = adapter;
+    }
+
+    function setOperator(address operator, bool allowed) external onlyOwner {
+        operators[operator] = allowed;
+        emit OperatorUpdated(operator, allowed);
+    }
+}
+
+interface ICreditSyncAdapter {
+    function syncCreditToSatellite(uint32 dstEid, uint256 newCredit, address refundAddress) external payable;
 }

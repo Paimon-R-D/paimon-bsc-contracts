@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 /// @title CrossChainNAVReporter
@@ -29,12 +28,21 @@ contract CrossChainNAVReporter is AccessControl {
     /// @notice Last update timestamp per chain
     mapping(uint32 => uint256) public lastUpdateTime;
 
+    /// @notice Cached total cross-chain value to avoid linear iteration on hot paths
+    uint256 public totalCrossChainValue;
+
+    /// @notice Timestamp when the reporter last committed a full cross-chain snapshot
+    uint256 public lastGlobalSyncTime;
+
     /// @notice Supported chain list
     uint32[] internal _chains;
     mapping(uint32 => bool) internal _isChain;
 
     /// @notice Maximum age before data is considered stale (seconds)
     uint256 public stalePeriod = 7200; // 2 hours default
+
+    /// @notice When enabled, reads revert until the off-chain reporter commits a fresh global snapshot
+    bool public enforceGlobalFreshness;
 
     // ========== Events ==========
 
@@ -45,12 +53,17 @@ contract CrossChainNAVReporter is AccessControl {
     event ChainAdded(uint32 indexed eid);
     event ChainRemoved(uint32 indexed eid);
     event StalePeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
+    event GlobalSyncCommitted(uint256 timestamp);
+    event GlobalFreshnessEnforcementUpdated(bool oldValue, bool newValue);
 
     // ========== Errors ==========
 
     error ChainNotSupported(uint32 eid);
     error ChainAlreadySupported(uint32 eid);
     error ZeroAddress();
+    error LengthMismatch(uint256 expected, uint256 actual);
+    error EmptyArray();
+    error StaleCrossChainValue(uint256 lastGlobalSyncTime, uint256 stalePeriod);
 
     // ========== Constructor ==========
 
@@ -64,11 +77,12 @@ contract CrossChainNAVReporter is AccessControl {
     /// @notice Get total cross-chain value for NAV calculation
     /// @return total Sum of all satellite balances + remote deployments
     function getCrossChainValue() external view returns (uint256 total) {
-        for (uint256 i = 0; i < _chains.length; i++) {
-            uint32 eid = _chains[i];
-            total += satelliteBalances[eid];
-            total += remoteDeployments[eid];
+        if (enforceGlobalFreshness && _chains.length > 0) {
+            if (lastGlobalSyncTime == 0 || block.timestamp - lastGlobalSyncTime > stalePeriod) {
+                revert StaleCrossChainValue(lastGlobalSyncTime, stalePeriod);
+            }
         }
+        return totalCrossChainValue;
     }
 
     /// @notice Check if a chain's data is stale
@@ -103,6 +117,7 @@ contract CrossChainNAVReporter is AccessControl {
         if (!_isChain[eid]) revert ChainNotSupported(eid);
         uint256 old = satelliteBalances[eid];
         satelliteBalances[eid] = balance;
+        totalCrossChainValue = totalCrossChainValue + balance - old;
         lastUpdateTime[eid] = block.timestamp;
         emit SatelliteBalanceUpdated(eid, old, balance);
     }
@@ -112,6 +127,7 @@ contract CrossChainNAVReporter is AccessControl {
         if (!_isChain[eid]) revert ChainNotSupported(eid);
         uint256 old = remoteDeployments[eid];
         remoteDeployments[eid] = value;
+        totalCrossChainValue = totalCrossChainValue + value - old;
         lastUpdateTime[eid] = block.timestamp;
         emit RemoteDeploymentUpdated(eid, old, value);
     }
@@ -120,6 +136,7 @@ contract CrossChainNAVReporter is AccessControl {
     function recordDeploy(uint32 eid, uint256 amount) external onlyRole(REPORTER_ROLE) {
         if (!_isChain[eid]) revert ChainNotSupported(eid);
         remoteDeployments[eid] += amount;
+        totalCrossChainValue += amount;
         lastUpdateTime[eid] = block.timestamp;
         emit DeployRecorded(eid, amount);
     }
@@ -133,7 +150,9 @@ contract CrossChainNAVReporter is AccessControl {
         if (!isYield) {
             if (remoteDeployments[eid] >= amount) {
                 remoteDeployments[eid] -= amount;
+                totalCrossChainValue -= amount;
             } else {
+                totalCrossChainValue -= remoteDeployments[eid];
                 emit AccountingDiscrepancy(eid, amount, remoteDeployments[eid]);
                 remoteDeployments[eid] = 0;
             }
@@ -142,6 +161,42 @@ contract CrossChainNAVReporter is AccessControl {
 
         lastUpdateTime[eid] = block.timestamp;
         emit ReturnRecorded(eid, amount, isYield);
+    }
+
+    function batchSyncChainPositions(
+        uint32[] calldata eids,
+        uint256[] calldata satelliteValues,
+        uint256[] calldata remoteValues
+    ) external onlyRole(REPORTER_ROLE) {
+        if (eids.length == 0) revert EmptyArray();
+        if (eids.length != satelliteValues.length) revert LengthMismatch(eids.length, satelliteValues.length);
+        if (eids.length != remoteValues.length) revert LengthMismatch(eids.length, remoteValues.length);
+
+        for (uint256 i = 0; i < eids.length; i++) {
+            uint32 eid = eids[i];
+            if (!_isChain[eid]) revert ChainNotSupported(eid);
+
+            uint256 oldSatellite = satelliteBalances[eid];
+            uint256 oldRemote = remoteDeployments[eid];
+            uint256 newSatellite = satelliteValues[i];
+            uint256 newRemote = remoteValues[i];
+
+            satelliteBalances[eid] = newSatellite;
+            remoteDeployments[eid] = newRemote;
+            totalCrossChainValue = totalCrossChainValue + newSatellite + newRemote - oldSatellite - oldRemote;
+            lastUpdateTime[eid] = block.timestamp;
+
+            emit SatelliteBalanceUpdated(eid, oldSatellite, newSatellite);
+            emit RemoteDeploymentUpdated(eid, oldRemote, newRemote);
+        }
+
+        lastGlobalSyncTime = block.timestamp;
+        emit GlobalSyncCommitted(lastGlobalSyncTime);
+    }
+
+    function commitGlobalSync() external onlyRole(REPORTER_ROLE) {
+        lastGlobalSyncTime = block.timestamp;
+        emit GlobalSyncCommitted(lastGlobalSyncTime);
     }
 
     // ========== Admin Functions ==========
@@ -156,6 +211,7 @@ contract CrossChainNAVReporter is AccessControl {
     function removeChain(uint32 eid) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!_isChain[eid]) revert ChainNotSupported(eid);
         _isChain[eid] = false;
+        totalCrossChainValue -= satelliteBalances[eid] + remoteDeployments[eid];
         delete satelliteBalances[eid];
         delete remoteDeployments[eid];
         delete pendingTransits[eid];
@@ -174,5 +230,10 @@ contract CrossChainNAVReporter is AccessControl {
     function setStalePeriod(uint256 _stalePeriod) external onlyRole(DEFAULT_ADMIN_ROLE) {
         emit StalePeriodUpdated(stalePeriod, _stalePeriod);
         stalePeriod = _stalePeriod;
+    }
+
+    function setEnforceGlobalFreshness(bool enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        emit GlobalFreshnessEnforcementUpdated(enforceGlobalFreshness, enabled);
+        enforceGlobalFreshness = enabled;
     }
 }

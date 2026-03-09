@@ -10,6 +10,7 @@ interface ICrossChainNAVReporter {
     function getCrossChainValue() external view returns (uint256);
     function isStale(uint32 eid) external view returns (bool);
     function getChains() external view returns (uint32[] memory);
+    function lastGlobalSyncTime() external view returns (uint256);
     function getChainPosition(uint32 eid)
         external
         view
@@ -20,4 +21,10 @@ interface ICrossChainNAVReporter {
     function recordDeploy(uint32 eid, uint256 amount) external;
     function recordReturn(uint32 eid, uint256 amount, bool isYield) external;
     function updateSatelliteBalance(uint32 eid, uint256 balance) external;
+    function batchSyncChainPositions(
+        uint32[] calldata eids,
+        uint256[] calldata satelliteValues,
+        uint256[] calldata remoteValues
+    ) external;
+    function commitGlobalSync() external;
 }

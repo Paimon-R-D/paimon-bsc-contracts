@@ -15,6 +15,7 @@ library MessageCodec {
 
     // --- Satellite → Hub (Credit) ---
     bytes1 internal constant MSG_CREDIT_USED = 0x10;
+    bytes1 internal constant MSG_CREDIT_RESTORED = 0x11;
 
     // --- Hub → Satellite ---
     bytes1 internal constant MSG_SHARE_PRICE_UPDATE = 0x20;
@@ -70,6 +71,11 @@ library MessageCodec {
     /// @notice Encode credit used message (Satellite → Hub)
     function encodeCreditUsed(uint256 amount) internal pure returns (bytes memory) {
         return abi.encodePacked(MSG_CREDIT_USED, abi.encode(amount));
+    }
+
+    /// @notice Encode credit restored message (Satellite → Hub)
+    function encodeCreditRestored(uint256 amount) internal pure returns (bytes memory) {
+        return abi.encodePacked(MSG_CREDIT_RESTORED, abi.encode(amount));
     }
 
     /// @notice Encode deploy command (Hub → RemoteAdapter)

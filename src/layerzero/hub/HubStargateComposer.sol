@@ -14,6 +14,7 @@ import {IStargate} from "../interfaces/IStargateIntegration.sol";
 import {StargateComposeCodec} from "../libraries/StargateComposeCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 import {ICrossChainNAVReporter} from "../interfaces/ICrossChainNAVReporter.sol";
+import {ICreditManager} from "../interfaces/ICreditManager.sol";
 import {IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 
 /// @title HubStargateComposer
@@ -60,6 +61,12 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     /// @notice Redemption manager used for satellite standard withdrawals
     address public redemptionManager;
 
+    /// @notice Credit manager used to release utilized credit after remote replenishment lands
+    address public creditManager;
+
+    /// @notice Cross-chain asset controller used to reconcile bridged portfolio returns
+    address public crossChainAssetController;
+
     /// @notice Trusted gateway per remote chain (eid => gateway address)
     mapping(uint32 => address) public trustedGateways;
 
@@ -86,6 +93,8 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     event PptOftAdapterUpdated(address adapter);
     event NavReporterUpdated(address reporter);
     event RedemptionManagerUpdated(address manager);
+    event CreditManagerUpdated(address manager);
+    event CrossChainAssetControllerUpdated(address controller);
     event SatelliteRedemptionRegistered(uint256 indexed requestId, uint32 indexed dstEid, address indexed receiver);
     event SatelliteRedemptionSettled(uint256 indexed requestId, uint32 indexed dstEid, address indexed receiver, uint256 amount);
 
@@ -101,6 +110,7 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     error InsufficientBalance(uint256 available, uint256 required);
     error UnauthorizedRegistrar(address caller);
     error UnknownSatelliteRedemption(uint256 requestId);
+    error UnknownFailedDeposit(uint256 failedId);
 
     // ========== Constructor ==========
 
@@ -109,6 +119,7 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         uint32 srcEid;
         address receiver;
         uint256 assets;
+        uint256 minShares;
         uint256 timestamp;
     }
 
@@ -118,6 +129,7 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
 
     event DepositFailed(uint256 indexed failedId, uint32 srcEid, address receiver, uint256 assets, string reason);
     event FailedDepositRetried(uint256 indexed failedId, uint256 shares);
+    event FailedDepositRefunded(uint256 indexed failedId, uint32 indexed dstEid, address indexed receiver, uint256 assets);
 
     constructor(
         address _endpoint,
@@ -183,14 +195,25 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         if (assets == 0) revert ZeroAmount();
         if (address(vault) == address(0) || pptOftAdapter == address(0)) revert ZeroAddress();
 
+        if (minShares > 0) {
+            try vault.previewDeposit(assets) returns (uint256 previewShares) {
+                if (previewShares < minShares) {
+                    _storeFailedDeposit(srcEid, receiver, assets, minShares, "slippage");
+                    return;
+                }
+            } catch Error(string memory reason) {
+                _storeFailedDeposit(srcEid, receiver, assets, minShares, reason);
+                return;
+            } catch {
+                _storeFailedDeposit(srcEid, receiver, assets, minShares, "preview");
+                return;
+            }
+        }
+
         // Deposit USDT into PPT vault (try/catch to prevent nonce blocking)
         asset.forceApprove(address(vault), assets);
         try vault.deposit(assets, pptOftAdapter) returns (uint256 shares) {
             asset.forceApprove(address(vault), 0);
-
-            if (minShares > 0 && shares < minShares) {
-                revert SlippageTooHigh(shares, minShares);
-            }
 
             // Send PPT shares back to receiver on source chain via PPTOFTAdapter
             _sendSharesBack(srcEid, receiver, shares);
@@ -198,15 +221,10 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
             emit DepositReceived(srcEid, receiver, assets, shares);
         } catch Error(string memory reason) {
             asset.forceApprove(address(vault), 0);
-            // Store failed deposit for keeper retry instead of reverting (would block nonce)
-            uint256 failedId = failedDepositCount++;
-            failedDeposits[failedId] = FailedDeposit(srcEid, receiver, assets, block.timestamp);
-            emit DepositFailed(failedId, srcEid, receiver, assets, reason);
+            _storeFailedDeposit(srcEid, receiver, assets, minShares, reason);
         } catch {
             asset.forceApprove(address(vault), 0);
-            uint256 failedId = failedDepositCount++;
-            failedDeposits[failedId] = FailedDeposit(srcEid, receiver, assets, block.timestamp);
-            emit DepositFailed(failedId, srcEid, receiver, assets, "unknown");
+            _storeFailedDeposit(srcEid, receiver, assets, minShares, "unknown");
         }
     }
 
@@ -220,6 +238,10 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         // Update NAV reporter
         if (navReporter != address(0)) {
             ICrossChainNAVReporter(navReporter).recordReturn(srcEid, amount, isYield);
+        }
+
+        if (crossChainAssetController != address(0)) {
+            IBridgedReturnRecorder(crossChainAssetController).recordBridgedReturn(srcEid, amount, isYield);
         }
 
         emit ReturnReceived(srcEid, amount, isYield);
@@ -283,6 +305,48 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         emit SatelliteRedemptionSettled(requestId, pending.dstEid, pending.receiver, settledAmount);
     }
 
+    function retryFailedDeposit(uint256 failedId, uint256 minSharesOverride)
+        external
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        FailedDeposit memory failed = failedDeposits[failedId];
+        if (failed.assets == 0) revert UnknownFailedDeposit(failedId);
+        if (address(vault) == address(0) || pptOftAdapter == address(0)) revert ZeroAddress();
+
+        uint256 minShares = minSharesOverride;
+        if (minShares > 0) {
+            uint256 previewShares = vault.previewDeposit(failed.assets);
+            if (previewShares < minShares) revert SlippageTooHigh(previewShares, minShares);
+        }
+
+        asset.forceApprove(address(vault), failed.assets);
+        uint256 shares = vault.deposit(failed.assets, pptOftAdapter);
+        asset.forceApprove(address(vault), 0);
+
+        _sendSharesBack(failed.srcEid, failed.receiver, shares);
+        delete failedDeposits[failedId];
+
+        emit FailedDepositRetried(failedId, shares);
+    }
+
+    function refundFailedDeposit(uint256 failedId)
+        external
+        payable
+        onlyRole(KEEPER_ROLE)
+        nonReentrant
+        whenNotPaused
+    {
+        FailedDeposit memory failed = failedDeposits[failedId];
+        if (failed.assets == 0) revert UnknownFailedDeposit(failedId);
+
+        delete failedDeposits[failedId];
+        _bridgeSettlement(failed.srcEid, failed.receiver, failed.assets, 0, msg.value);
+
+        emit FailedDepositRefunded(failedId, failed.srcEid, failed.receiver, failed.assets);
+    }
+
     /// @notice Bridge USDT to remote chain for DeFi deployment
     /// @param dstEid Destination chain endpoint ID
     /// @param amount USDT amount to bridge and deploy
@@ -317,9 +381,9 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         if (amount == 0) revert ZeroAmount();
 
         bytes memory composeMsg = StargateComposeCodec.encodeReplenish();
-        _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_REPLENISH, msg.value);
+        uint256 bridgedAmount = _stargateSend(dstEid, amount, composeMsg, COMPOSE_GAS_REPLENISH, msg.value);
 
-        emit ReplenishBridged(dstEid, amount);
+        emit ReplenishBridged(dstEid, bridgedAmount);
     }
 
     // ========== Quote Functions ==========
@@ -423,6 +487,20 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         IPPTOFTAdapterMintShares(pptOftAdapter).mintSharesOnSatellite(dstEid, receiver, shares);
     }
 
+    function _storeFailedDeposit(uint32 srcEid, address receiver, uint256 assets, uint256 minShares, string memory reason)
+        internal
+    {
+        uint256 failedId = failedDepositCount++;
+        failedDeposits[failedId] = FailedDeposit({
+            srcEid: srcEid,
+            receiver: receiver,
+            assets: assets,
+            minShares: minShares,
+            timestamp: block.timestamp
+        });
+        emit DepositFailed(failedId, srcEid, receiver, assets, reason);
+    }
+
     function _calcMinAmount(uint32 eid, uint256 amount) internal view returns (uint256) {
         uint256 slippage = slippageBps[eid];
         if (slippage == 0) slippage = DEFAULT_SLIPPAGE_BPS;
@@ -462,6 +540,16 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         emit RedemptionManagerUpdated(_manager);
     }
 
+    function setCreditManager(address manager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        creditManager = manager;
+        emit CreditManagerUpdated(manager);
+    }
+
+    function setCrossChainAssetController(address controller) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        crossChainAssetController = controller;
+        emit CrossChainAssetControllerUpdated(controller);
+    }
+
     function setTrustedGateway(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (gateway == address(0)) revert ZeroAddress();
         trustedGateways[eid] = gateway;
@@ -493,4 +581,8 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
 
 interface IPPTOFTAdapterMintShares {
     function mintSharesOnSatellite(uint32 dstEid, address receiver, uint256 shares) external;
+}
+
+interface IBridgedReturnRecorder {
+    function recordBridgedReturn(uint32 eid, uint256 amount, bool isYield) external;
 }

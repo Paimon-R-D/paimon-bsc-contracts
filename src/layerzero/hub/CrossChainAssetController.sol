@@ -47,6 +47,12 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     /// @notice Remote adapter address per chain
     mapping(uint32 => address) public remoteAdapter;
 
+    /// @notice Chains whose remote portfolio is managed by Stargate bridge flow instead of legacy OApp commands
+    mapping(uint32 => bool) public stargateManagedChain;
+
+    /// @notice Confirmed assets deployed through the Stargate bridge pathway
+    mapping(uint32 => uint256) public bridgedDeployedAssets;
+
     /// @notice Supported chains
     uint32[] internal _supportedChains;
 
@@ -58,6 +64,9 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 
     /// @notice Total deployed across all chains (for quick lookup)
     uint256 public totalDeployed;
+
+    /// @notice Total deployed via Stargate bridge across all chains
+    uint256 public totalBridgedDeployed;
 
     // ========== Events ==========
 
@@ -73,6 +82,8 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     event ChainAdded(uint32 indexed eid, address adapter);
     event ChainRemoved(uint32 indexed eid);
     event EmergencyWithdraw(address indexed to, uint256 amount);
+    event StargateManagedChainUpdated(uint32 indexed eid, bool enabled);
+    event BridgedReturnRecorded(uint32 indexed srcEid, uint256 amount, bool isYield);
 
     // ========== Errors ==========
 
@@ -84,6 +95,8 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     error InsufficientBalance(uint256 available, uint256 required);
     error UnauthorizedSource(uint32 srcEid);
     error UnknownMessageType(bytes1 msgType);
+    error UseRemoteGatewayControl();
+    error UnauthorizedComposer(address caller);
 
     // ========== Constructor ==========
 
@@ -110,7 +123,7 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     }
 
     function getTotalDeployedAssets() external view returns (uint256) {
-        return totalDeployed;
+        return totalDeployed + totalBridgedDeployed;
     }
 
     // ========== Keeper Functions ==========
@@ -126,6 +139,7 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
         if (amount == 0) revert InvalidAmount();
         if (!_isChainSupported[dstEid]) revert ChainNotSupported();
         if (hubStargateComposer == address(0)) revert ChainNotSupported();
+        if (!stargateManagedChain[dstEid]) revert UseRemoteGatewayControl();
 
         uint256 balance = asset.balanceOf(address(this));
         if (balance < amount) {
@@ -138,11 +152,8 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
             dstEid, amount, protocol, protocolName
         );
 
-        // Record accounting
-        pendingDeploys[dstEid] += bridgedAmount;
-        _protocolAllocations[dstEid][protocol] += bridgedAmount;
-        deployedAssets[dstEid] += bridgedAmount;
-        totalDeployed += bridgedAmount;
+        bridgedDeployedAssets[dstEid] += bridgedAmount;
+        totalBridgedDeployed += bridgedAmount;
 
         emit AssetDeployed(dstEid, protocol, protocolName, bridgedAmount, bytes32(0));
     }
@@ -182,6 +193,7 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
     {
         if (amount == 0) revert InvalidAmount();
         if (!_isChainSupported[dstEid]) revert ChainNotSupported();
+        if (stargateManagedChain[dstEid]) revert UseRemoteGatewayControl();
         if (_protocolAllocations[dstEid][protocol] < amount) revert InsufficientAllocation();
 
         bytes memory payload = MessageCodec.encodeWithdrawAsset(amount, protocol, protocolName);
@@ -205,6 +217,7 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
         whenNotPaused
     {
         if (!_isChainSupported[dstEid]) revert ChainNotSupported();
+        if (stargateManagedChain[dstEid]) revert UseRemoteGatewayControl();
 
         bytes memory payload = MessageCodec.encodeHarvest(protocol, protocolName);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
@@ -274,7 +287,10 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 
     function removeSupportedChain(uint32 eid) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!_isChainSupported[eid]) revert ChainNotSupported();
-        if (deployedAssets[eid] > 0) revert ChainHasDeployedAssets();
+        if (
+            deployedAssets[eid] > 0 || bridgedDeployedAssets[eid] > 0 || pendingDeploys[eid] > 0
+                || pendingWithdraws[eid] > 0
+        ) revert ChainHasDeployedAssets();
 
         _isChainSupported[eid] = false;
         delete remoteAdapter[eid];
@@ -310,6 +326,26 @@ contract CrossChainAssetController is OApp, AccessControl, Pausable, ReentrancyG
 
     function setHubStargateComposer(address _composer) external onlyRole(DEFAULT_ADMIN_ROLE) {
         hubStargateComposer = _composer;
+    }
+
+    function setStargateManagedChain(uint32 eid, bool enabled) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!_isChainSupported[eid]) revert ChainNotSupported();
+        stargateManagedChain[eid] = enabled;
+        emit StargateManagedChainUpdated(eid, enabled);
+    }
+
+    function recordBridgedReturn(uint32 eid, uint256 amount, bool isYield) external {
+        if (msg.sender != hubStargateComposer) revert UnauthorizedComposer(msg.sender);
+        if (!_isChainSupported[eid]) revert ChainNotSupported();
+
+        if (!isYield) {
+            uint256 deployed = bridgedDeployedAssets[eid];
+            uint256 deducted = deployed >= amount ? amount : deployed;
+            bridgedDeployedAssets[eid] -= deducted;
+            totalBridgedDeployed = totalBridgedDeployed >= deducted ? totalBridgedDeployed - deducted : 0;
+        }
+
+        emit BridgedReturnRecorded(eid, amount, isYield);
     }
 }
 

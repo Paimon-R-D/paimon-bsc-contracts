@@ -11,16 +11,6 @@ interface IPPTOFT is IERC20 {
     // ========== Structs ==========
 
     /// @notice Send parameters for cross-chain transfer
-    struct SendParam {
-        uint32 dstEid;              // Destination chain endpoint ID
-        bytes32 to;                 // Recipient address (bytes32 for cross-chain compatibility)
-        uint256 amountLD;           // Amount in local decimals
-        uint256 minAmountLD;        // Minimum amount to receive (slippage protection)
-        bytes extraOptions;         // Additional LayerZero options
-        bytes composeMsg;           // Compose message for destination chain
-        bytes oftCmd;               // OFT specific command
-    }
-
     /// @notice Messaging fee structure
     struct MessagingFee {
         uint256 nativeFee;          // Native token fee
@@ -32,12 +22,6 @@ interface IPPTOFT is IERC20 {
         bytes32 guid;               // Global unique identifier
         uint64 nonce;               // Message nonce
         MessagingFee fee;           // Fee paid
-    }
-
-    /// @notice OFT receipt for send operation
-    struct OFTReceipt {
-        uint256 amountSentLD;       // Amount sent in local decimals
-        uint256 amountReceivedLD;   // Amount to be received in local decimals
     }
 
     // ========== Events ==========
@@ -103,25 +87,34 @@ interface IPPTOFT is IERC20 {
     // ========== Core OFT Functions ==========
 
     /// @notice Quote the messaging fee for a send operation
-    /// @param sendParam Send parameters
+    /// @param dstEid Destination chain endpoint ID
+    /// @param amountLD Amount in local decimals
+    /// @param options LayerZero options bytes
     /// @param payInLzToken Whether to pay fee in LZ token
     /// @return msgFee Messaging fee structure
     function quoteSend(
-        SendParam calldata sendParam,
+        uint32 dstEid,
+        uint256 amountLD,
+        bytes calldata options,
         bool payInLzToken
     ) external view returns (MessagingFee memory msgFee);
 
     /// @notice Send tokens cross-chain
-    /// @param sendParam Send parameters
-    /// @param fee Messaging fee to pay
+    /// @param dstEid Destination chain endpoint ID
+    /// @param to Recipient address in bytes32 format
+    /// @param amountLD Amount in local decimals
+    /// @param minAmountLD Minimum amount to receive
+    /// @param options LayerZero options bytes
     /// @param refundAddress Address to refund excess fee
     /// @return msgReceipt Messaging receipt
-    /// @return oftReceipt OFT receipt
     function send(
-        SendParam calldata sendParam,
-        MessagingFee calldata fee,
+        uint32 dstEid,
+        bytes32 to,
+        uint256 amountLD,
+        uint256 minAmountLD,
+        bytes calldata options,
         address refundAddress
-    ) external payable returns (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt);
+    ) external payable returns (MessagingReceipt memory msgReceipt);
 
     // ========== Minting/Burning (PPTSatellite Only) ==========
 
@@ -133,9 +126,8 @@ interface IPPTOFT is IERC20 {
 
     /// @notice Burn tokens from a holder
     /// @dev Only callable by authorized burner (PPTSatellite)
-    /// @param from Holder address
     /// @param amount Amount to burn
-    function burn(address from, uint256 amount) external;
+    function burn(uint256 amount) external;
 
     // ========== Peer Configuration ==========
 
@@ -144,20 +136,20 @@ interface IPPTOFT is IERC20 {
     /// @param peer Peer address in bytes32 format
     function setPeer(uint32 eid, bytes32 peer) external;
 
-    /// @notice Set the Hub endpoint ID
-    /// @param _hubEid LayerZero endpoint ID of the Hub
-    function setHubEid(uint32 _hubEid) external;
-
-    // ========== Configuration ==========
-
     /// @notice Set authorized minter address
-    /// @param minter Address to authorize for minting
-    /// @param authorized True to authorize, false to revoke
-    function setMinter(address minter, bool authorized) external;
+    /// @param minter Address authorized to mint remote shares
+    function setMinter(address minter) external;
 
     /// @notice Set enforced options for a destination chain
     /// @param eid Destination endpoint ID
     /// @param msgType Message type
     /// @param options Enforced options bytes
     function setEnforcedOptions(uint32 eid, uint16 msgType, bytes calldata options) external;
+
+    function quoteRedemptionFee(uint256 shares, bytes calldata options) external view returns (MessagingFee memory fee);
+
+    function requestCrossChainRedemption(uint256 shares, bytes calldata options)
+        external
+        payable
+        returns (MessagingReceipt memory receipt);
 }

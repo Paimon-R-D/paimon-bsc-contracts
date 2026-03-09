@@ -11,7 +11,7 @@ import {ICreditManager} from "../interfaces/ICreditManager.sol";
 import {ILayerZeroComposer} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroComposer.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {IRedemptionManager} from "../../ppt/IPPTContracts.sol";
+import {IPPT, IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 import {MessageCodec} from "../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 import {LayerZeroErrors} from "../libraries/LayerZeroErrors.sol";
@@ -56,8 +56,20 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     mapping(uint256 => PendingMint) public pendingMints;
     uint256 public pendingMintCount;
 
+    struct PendingSharePriceSync {
+        uint32 dstEid;
+        uint256 sharePrice;
+    }
+
+    mapping(uint256 => PendingSharePriceSync) public pendingSharePriceSyncs;
+    mapping(uint32 => uint256) public pendingSharePriceSyncIdByDstEid;
+    mapping(uint32 => bool) public hasPendingSharePriceSync;
+    uint256 public pendingSharePriceSyncCount;
+
     event PendingMintStored(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
     event PendingMintFlushed(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
+    event PendingSharePriceSyncStored(uint256 indexed syncId, uint32 dstEid, uint256 sharePrice);
+    event PendingSharePriceSyncFlushed(uint256 indexed syncId, uint32 dstEid, uint256 sharePrice);
 
     // ========== Events ==========
 
@@ -102,6 +114,10 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         address indexed receiver,
         uint256 shares
     );
+    event SatelliteCreditUsed(uint32 indexed srcEid, uint256 amount);
+    event SatelliteCreditRestored(uint32 indexed srcEid, uint256 amount);
+    event CreditSynced(uint32 indexed dstEid, uint256 credit);
+    event SharePriceSynced(uint32 indexed dstEid, uint256 sharePrice);
 
     // ========== Errors ==========
 
@@ -112,6 +128,13 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     error InvalidComposeMessage();
     error InvalidPeer(uint32 srcEid, bytes32 sender);
     error ZeroAddress();
+
+    modifier onlyOwnerOrCreditManager() {
+        if (msg.sender != owner() && msg.sender != address(creditManager)) {
+            revert OwnableUnauthorizedAccount(msg.sender);
+        }
+        _;
+    }
 
     // ========== Additional Events ==========
 
@@ -220,6 +243,10 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             _handleSatelliteWithdraw(_origin, _payload);
         } else if (msgType == MessageCodec.MSG_REDEEM) {
             _handleSatelliteRedemption(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_CREDIT_USED) {
+            _handleSatelliteCreditUsed(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_CREDIT_RESTORED) {
+            _handleSatelliteCreditRestored(_origin, _payload);
         } else {
             revert LayerZeroErrors.UnknownMessageType(msgType);
         }
@@ -315,6 +342,8 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             emit PendingMintStored(mintId, _origin.srcEid, receiver, shares);
         }
 
+        _queueOrSendSharePrice(_origin.srcEid);
+
         emit SatelliteDepositProcessed(_origin.srcEid, receiver, assets, shares);
     }
 
@@ -332,6 +361,20 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         emit PendingMintFlushed(mintId, pm.dstEid, pm.receiver, pm.shares);
     }
 
+    function flushPendingSharePriceSync(uint256 syncId) external payable whenNotPaused {
+        PendingSharePriceSync memory pending = pendingSharePriceSyncs[syncId];
+        if (pending.dstEid == 0) revert ZeroAddress();
+
+        delete pendingSharePriceSyncs[syncId];
+        if (hasPendingSharePriceSync[pending.dstEid] && pendingSharePriceSyncIdByDstEid[pending.dstEid] == syncId) {
+            delete hasPendingSharePriceSync[pending.dstEid];
+            delete pendingSharePriceSyncIdByDstEid[pending.dstEid];
+        }
+
+        _sendTypedMessage(pending.dstEid, MessageCodec.encodeSharePriceUpdate(pending.sharePrice), msg.sender);
+        emit PendingSharePriceSyncFlushed(syncId, pending.dstEid, pending.sharePrice);
+    }
+
     /// @notice Handle satellite withdraw: process redemption on hub
     function _handleSatelliteWithdraw(Origin calldata _origin, bytes calldata _payload) internal {
         (address receiver, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
@@ -345,6 +388,8 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         } else {
             _requestRedemption(shares, receiver);
         }
+
+        _queueOrSendSharePrice(_origin.srcEid);
 
         emit SatelliteWithdrawProcessed(_origin.srcEid, receiver, shares);
     }
@@ -361,6 +406,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             ? _requestSatelliteRedemption(_origin.srcEid, owner, shares)
             : _requestRedemption(shares, owner);
 
+        _queueOrSendSharePrice(_origin.srcEid);
         emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, requestId);
     }
 
@@ -387,6 +433,24 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     function _requestSatelliteRedemption(uint32 srcEid, address receiver, uint256 shares) internal returns (uint256 requestId) {
         requestId = _requestRedemption(shares, hubStargateComposer);
         IHubStargateSettlementRegistrar(hubStargateComposer).registerSatelliteRedemption(requestId, srcEid, receiver);
+    }
+
+    function _handleSatelliteCreditUsed(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint256 amount = MessageCodec.decodeAmount(_payload);
+        creditManager.reduceCredit(_origin.srcEid, amount);
+
+        emit SatelliteCreditUsed(_origin.srcEid, amount);
+    }
+
+    function _handleSatelliteCreditRestored(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint256 amount = MessageCodec.decodeAmount(_payload);
+        creditManager.restoreCredit(_origin.srcEid, amount);
+
+        emit SatelliteCreditRestored(_origin.srcEid, amount);
     }
 
     /// @notice Handle cross-chain deposit
@@ -427,10 +491,29 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             pendingMints[mintId] = PendingMint(dstEid, receiver, shares);
             emit PendingMintStored(mintId, dstEid, receiver, shares);
         }
+
+        _queueOrSendSharePrice(dstEid);
     }
 
     function setHubStargateComposer(address _composer) external onlyOwner {
         hubStargateComposer = _composer;
+    }
+
+    function syncCreditToSatellite(uint32 dstEid, uint256 newCredit, address refundAddress)
+        external
+        payable
+        whenNotPaused
+        onlyOwnerOrCreditManager
+    {
+        if (refundAddress == address(0)) revert ZeroAddress();
+        _sendTypedMessage(dstEid, MessageCodec.encodeCreditUpdate(newCredit), refundAddress);
+        emit CreditSynced(dstEid, newCredit);
+    }
+
+    function syncSharePrice(uint32 dstEid) external payable whenNotPaused onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
+
+        _queueOrSendSharePrice(dstEid);
     }
 
     // ========== Configuration ==========
@@ -462,6 +545,46 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (_to == address(0)) revert ZeroAddress();
         IERC20(_token).safeTransfer(_to, _amount);
         emit EmergencyWithdraw(_token, _to, _amount);
+    }
+
+    function _sendTypedMessage(uint32 dstEid, bytes memory payload, address refundAddress) internal {
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+        _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(refundAddress));
+    }
+
+    function _queueOrSendSharePrice(uint32 dstEid) internal {
+        if (vault == address(0)) return;
+
+        uint256 currentSharePrice = IPPT(vault).sharePrice();
+        bytes memory payload = MessageCodec.encodeSharePriceUpdate(currentSharePrice);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+
+        if (address(this).balance >= fee.nativeFee) {
+            if (hasPendingSharePriceSync[dstEid]) {
+                uint256 pendingSyncId = pendingSharePriceSyncIdByDstEid[dstEid];
+                delete pendingSharePriceSyncs[pendingSyncId];
+                delete hasPendingSharePriceSync[dstEid];
+                delete pendingSharePriceSyncIdByDstEid[dstEid];
+            }
+            _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+            emit SharePriceSynced(dstEid, currentSharePrice);
+            return;
+        }
+
+        if (hasPendingSharePriceSync[dstEid]) {
+            uint256 existingSyncId = pendingSharePriceSyncIdByDstEid[dstEid];
+            pendingSharePriceSyncs[existingSyncId].sharePrice = currentSharePrice;
+            emit PendingSharePriceSyncStored(existingSyncId, dstEid, currentSharePrice);
+            return;
+        }
+
+        uint256 syncId = pendingSharePriceSyncCount++;
+        pendingSharePriceSyncs[syncId] = PendingSharePriceSync({dstEid: dstEid, sharePrice: currentSharePrice});
+        pendingSharePriceSyncIdByDstEid[dstEid] = syncId;
+        hasPendingSharePriceSync[dstEid] = true;
+        emit PendingSharePriceSyncStored(syncId, dstEid, currentSharePrice);
     }
 
     /// @notice Override _payNative to use contract balance instead of msg.value

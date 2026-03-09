@@ -91,8 +91,11 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     /// @inheritdoc ILiquidityPool
     function availableLiquidity() public view override returns (uint256) {
         uint256 poolBalance = _asset.balanceOf(address(this));
+        if (poolBalance <= minBuffer) return 0;
+
+        uint256 bufferedBalance = poolBalance - minBuffer;
         uint256 remaining = remainingCredit();
-        return poolBalance < remaining ? poolBalance : remaining;
+        return bufferedBalance < remaining ? bufferedBalance : remaining;
     }
 
     /// @inheritdoc ILiquidityPool
@@ -186,15 +189,16 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ILiquidityPool
-    function replenish(uint256 amount) external override onlyOwner {
-        // Reduce utilized when pool is replenished from Hub
-        if (amount >= utilized) {
-            utilized = 0;
-        } else {
-            utilized -= amount;
-        }
+    function replenish(uint256 amount) external override onlyLiquidityManagerOrOwner nonReentrant whenNotPaused {
+        if (amount == 0) revert InvalidAmount();
 
-        emit CreditUpdated(credit, credit); // Pool replenished event
+        _asset.safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 released = amount >= utilized ? utilized : amount;
+        utilized -= released;
+
+        emit CreditReleased(released, credit);
+        emit PoolReplenished(amount, msg.sender);
     }
 
     // ========== Configuration ==========

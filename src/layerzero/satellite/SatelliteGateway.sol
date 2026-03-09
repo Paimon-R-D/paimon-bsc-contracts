@@ -48,6 +48,9 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
     /// @notice Local LiquidityPool for replenishment
     ILiquidityPool public liquidityPool;
 
+    /// @notice Trusted forwarding contract allowed to call depositFor on behalf of a payer
+    address public depositForwarder;
+
     /// @notice Slippage tolerance in basis points
     uint256 public slippageBps;
 
@@ -56,8 +59,11 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
     event DepositBridged(address indexed user, address indexed receiver, uint256 assets, uint256 minShares);
     event SettlementReceived(address indexed receiver, uint256 amount, uint256 requestId);
     event ReplenishReceived(uint256 amount);
+    event CreditRestoreNotified(address indexed satellite, uint256 amount);
+    event CreditRestoreNotificationFailed(address indexed satellite, uint256 amount);
     event HubComposerUpdated(address oldComposer, address newComposer);
     event LiquidityPoolUpdated(address pool);
+    event DepositForwarderUpdated(address oldForwarder, address newForwarder);
 
     // ========== Errors ==========
 
@@ -68,6 +74,7 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
     error ZeroAddress();
     error ZeroAmount();
     error InsufficientFee(uint256 provided, uint256 required);
+    error UnauthorizedForwarder(address caller);
 
     // ========== Constructor ==========
 
@@ -114,6 +121,7 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
         uint256 minShares,
         address refundAddress
     ) external payable nonReentrant whenNotPaused {
+        if (msg.sender != payer && msg.sender != depositForwarder) revert UnauthorizedForwarder(msg.sender);
         _depositFor(payer, assets, receiver, minShares, refundAddress);
     }
 
@@ -164,8 +172,17 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
     /// @notice Handle replenishment: USDT arrived from Hub → add to LiquidityPool
     function _handleReplenish(uint256 amount) internal {
         asset.forceApprove(address(liquidityPool), amount);
-        liquidityPool.addLiquidity(amount);
+        liquidityPool.replenish(amount);
         asset.forceApprove(address(liquidityPool), 0);
+
+        address satellite = liquidityPool.satellite();
+        if (satellite != address(0)) {
+            try IPPTSatelliteCreditNotifier(satellite).notifyCreditRestored(amount) {
+                emit CreditRestoreNotified(satellite, amount);
+            } catch {
+                emit CreditRestoreNotificationFailed(satellite, amount);
+            }
+        }
 
         emit ReplenishReceived(amount);
     }
@@ -262,6 +279,11 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
         emit LiquidityPoolUpdated(_pool);
     }
 
+    function setDepositForwarder(address _forwarder) external onlyOwner {
+        emit DepositForwarderUpdated(depositForwarder, _forwarder);
+        depositForwarder = _forwarder;
+    }
+
     function setSlippageBps(uint256 _bps) external onlyOwner {
         slippageBps = _bps;
     }
@@ -281,4 +303,8 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
     /// @notice Receive native token for Stargate refunds
     receive() external payable {}
+}
+
+interface IPPTSatelliteCreditNotifier {
+    function notifyCreditRestored(uint256 amount) external;
 }

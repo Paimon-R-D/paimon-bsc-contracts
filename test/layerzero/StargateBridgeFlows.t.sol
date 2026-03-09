@@ -144,6 +144,8 @@ contract MockPPTOFTAdapter {
 contract MockLiquidityPool {
     IERC20 public asset;
     uint256 public lastLiquidityAdded;
+    uint256 public lastReplenished;
+    address public satellite;
 
     constructor(address _asset) {
         asset = IERC20(_asset);
@@ -152,6 +154,16 @@ contract MockLiquidityPool {
     function addLiquidity(uint256 amount) external {
         asset.transferFrom(msg.sender, address(this), amount);
         lastLiquidityAdded = amount;
+    }
+
+    function replenish(uint256 amount) external {
+        asset.transferFrom(msg.sender, address(this), amount);
+        lastReplenished = amount;
+        lastLiquidityAdded = amount;
+    }
+
+    function setSatellite(address _satellite) external {
+        satellite = _satellite;
     }
 }
 
@@ -353,6 +365,53 @@ contract CrossChainNAVReporterTest is Test {
         assertEq(satellite, 100e6);
         assertEq(deployed, 200e6);
         assertEq(lastUpdate, block.timestamp);
+    }
+
+    function test_GetCrossChainValue_TracksReplacementDeltasAndRemoval() public {
+        reporter.updateSatelliteBalance(ETH_EID, 100e6);
+        reporter.recordDeploy(ETH_EID, 200e6);
+        assertEq(reporter.getCrossChainValue(), 300e6);
+
+        reporter.updateSatelliteBalance(ETH_EID, 40e6);
+        assertEq(reporter.getCrossChainValue(), 240e6);
+
+        reporter.updateRemoteDeployment(ETH_EID, 150e6);
+        assertEq(reporter.getCrossChainValue(), 190e6);
+
+        reporter.removeChain(ETH_EID);
+        assertEq(reporter.getCrossChainValue(), 0);
+    }
+
+    function test_GetCrossChainValue_RevertsWhenGlobalSyncIsStaleAndEnforced() public {
+        reporter.setEnforceGlobalFreshness(true);
+
+        vm.expectRevert(abi.encodeWithSelector(CrossChainNAVReporter.StaleCrossChainValue.selector, 0, 7200));
+        reporter.getCrossChainValue();
+    }
+
+    function test_BatchSyncChainPositions_CommitsFreshSnapshot() public {
+        uint32[] memory eids = new uint32[](2);
+        uint256[] memory satelliteBalances = new uint256[](2);
+        uint256[] memory remoteDeployments = new uint256[](2);
+
+        eids[0] = ETH_EID;
+        eids[1] = ARB_EID;
+        satelliteBalances[0] = 100e6;
+        satelliteBalances[1] = 50e6;
+        remoteDeployments[0] = 500e6;
+        remoteDeployments[1] = 200e6;
+
+        reporter.batchSyncChainPositions(eids, satelliteBalances, remoteDeployments);
+        reporter.setEnforceGlobalFreshness(true);
+
+        assertEq(reporter.getCrossChainValue(), 850e6);
+
+        uint256 lastGlobalSyncTime = reporter.lastGlobalSyncTime();
+        vm.warp(block.timestamp + 7201);
+        vm.expectRevert(
+            abi.encodeWithSelector(CrossChainNAVReporter.StaleCrossChainValue.selector, lastGlobalSyncTime, 7200)
+        );
+        reporter.getCrossChainValue();
     }
 }
 
