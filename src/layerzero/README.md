@@ -22,8 +22,13 @@ Paimon Finance 的 LayerZero V2 跨链模块，实现 PPT (Paimon Passive Treasu
                     │           │                   │          │
                     │  ┌────────┴───────────────────┴────────┐ │
                     │  │    CrossChainAssetController        │ │
-                    │  │    (DeFi Deployment Commands)       │ │
-                    │  └────────────────┬────────────────────┘ │
+                    │  │  (Bridge Deploy / OApp Control)     │ │
+                    │  └───────────────┬─────────────────────┘ │
+                    │                  │                       │
+                    │  ┌───────────────┴───────────────┐       │
+                    │  │      HubStargateComposer      │       │
+                    │  │   (Deposit / Deploy Compose)  │       │
+                    │  └───────────────────────────────┘       │
                     └───────────────────┼──────────────────────┘
                                         │
               ┌─────────────────────────┼─────────────────────────┐
@@ -48,8 +53,13 @@ Paimon Finance 的 LayerZero V2 跨链模块，实现 PPT (Paimon Passive Treasu
 │  └───────────────────┘  │  │  └───────────────────┘  │  │  └───────────────────┘  │
 │                         │  │                         │  │                         │
 │  ┌───────────────────┐  │  │  ┌───────────────────┐  │  │  ┌───────────────────┐  │
-│  │RemoteAssetAdapter │  │  │  │RemoteAssetAdapter │  │  │  │RemoteAssetAdapter │  │
-│  │(DeFi Operations)  │  │  │  │(DeFi Operations)  │  │  │  │(DeFi Operations)  │  │
+│  │ SatelliteGateway  │  │  │  │ SatelliteGateway  │  │  │  │ SatelliteGateway  │  │
+│  │ (Bridge / Return) │  │  │  │ (Bridge / Return) │  │  │  │ (Bridge / Return) │  │
+│  └───────────────────┘  │  │  └───────────────────┘  │  │  └───────────────────┘  │
+│                         │  │                         │  │                         │
+│  ┌───────────────────┐  │  │  ┌───────────────────┐  │  │  ┌───────────────────┐  │
+│  │ RemoteAssetGateway│  │  │  │ RemoteAssetGateway│  │  │  │ RemoteAssetGateway│  │
+│  │(Remote DeFi Exec) │  │  │  │(Remote DeFi Exec) │  │  │  │(Remote DeFi Exec) │  │
 │  └───────────────────┘  │  │  └───────────────────┘  │  │  └───────────────────┘  │
 └─────────────────────────┘  └─────────────────────────┘  └─────────────────────────┘
 ```
@@ -69,20 +79,21 @@ src/layerzero/
 │   ├── PPTSatellite.sol          # 用户入口点
 │   ├── PPTOFT.sol                # OFT 代币 (Mint/Burn)
 │   ├── LiquidityPool.sol         # 即时提款流动性池
+│   ├── SatelliteGateway.sol      # 申购/赎回 Stargate 网关
 │   └── adapters/
-│       └── RemoteAssetAdapter.sol # 远程 DeFi 操作适配器
+│       └── RemoteAssetGateway.sol # 远程 DeFi 执行网关
 │
 ├── interfaces/                   # 接口定义
 │   ├── ICreditManager.sol
 │   ├── ILiquidityPool.sol
+│   ├── IRemoteProtocolImplementation.sol
 │   ├── IPPTOFT.sol
 │   ├── IPPTOFTAdapter.sol
 │   └── IPPTSatellite.sol
 │
 └── libraries/
     ├── DeltaLib.sol              # Delta 算法计算库
-    ├── LzOptionsLib.sol          # LayerZero 选项构建库
-    └── LayerZeroErrors.sol       # 共享错误定义
+    └── LzOptionsLib.sol          # LayerZero 选项构建库
 ```
 
 ---
@@ -91,10 +102,10 @@ src/layerzero/
 
 | Chain | EID (V2) | Role | Contracts |
 |-------|----------|------|-----------|
-| BSC | 30102 | Hub | PPTOFTAdapter, CreditManager, CrossChainAssetController |
-| Ethereum | 30101 | Satellite | PPTSatellite, PPTOFT, LiquidityPool |
-| Arbitrum | 30110 | Satellite | PPTSatellite, PPTOFT, LiquidityPool |
-| Base | 30184 | Satellite | PPTSatellite, PPTOFT, LiquidityPool |
+| BSC | 30102 | Hub | PPTOFTAdapter, CreditManager, CrossChainAssetController, HubStargateComposer |
+| Ethereum | 30101 | Satellite | PPTSatellite, PPTOFT, LiquidityPool, SatelliteGateway, RemoteAssetGateway |
+| Arbitrum | 30110 | Satellite | PPTSatellite, PPTOFT, LiquidityPool, SatelliteGateway, RemoteAssetGateway |
+| Base | 30184 | Satellite | PPTSatellite, PPTOFT, LiquidityPool, SatelliteGateway, RemoteAssetGateway |
 
 ### LayerZero V2 Endpoint
 
@@ -248,7 +259,7 @@ function _removeDust(uint256 _amountLD) internal view returns (uint256) {
 
 **路径**: `hub/CrossChainAssetController.sol`
 
-**功能**: 管理跨链资产部署到 DeFi 协议 (Aave, Compound 等)。
+**功能**: 管理桥接部署，并向远程 `RemoteAssetGateway` 发送 withdraw / harvest 指令。
 
 #### 角色
 
@@ -256,23 +267,19 @@ function _removeDust(uint256 _amountLD) internal view returns (uint256) {
 |------|------|
 | `DEFAULT_ADMIN_ROLE` | 添加/移除链、紧急提款 |
 | `KEEPER_ROLE` | 执行 deploy/withdraw/harvest |
-| `REBALANCER_ROLE` | 跨链再平衡 |
 
 #### 消息类型
 
 | 常量 | 值 | 方向 | 说明 |
 |------|-----|------|------|
-| `MSG_DEPLOY` | `0x01` | Hub → Remote | 部署资产 |
-| `MSG_WITHDRAW` | `0x02` | Hub → Remote | 提取资产 |
-| `MSG_HARVEST` | `0x03` | Hub → Remote | 收获收益 |
-| `MSG_YIELD_REPORT` | `0x10` | Remote → Hub | 收益报告 |
-| `MSG_WITHDRAW_CONFIRM` | `0x11` | Remote → Hub | 提款确认 |
+| `MSG_WITHDRAW_ASSET` | `0x41` | Hub → RemoteGateway | 提取资产 |
+| `MSG_HARVEST` | `0x42` | Hub → RemoteGateway | 收获收益 |
 
 #### 核心函数
 
 ```solidity
-// 部署资产到远程协议
-function deployToRemote(
+// 通过 Stargate 桥接 USDT 并在远程链部署
+function deployViaBridge(
     uint32 dstEid,
     uint256 amount,
     address protocol,
@@ -295,7 +302,7 @@ function harvestYield(
 ) external payable onlyRole(KEEPER_ROLE);
 
 // 链管理
-function addSupportedChain(uint32 eid, address adapter) external onlyRole(DEFAULT_ADMIN_ROLE);
+function addSupportedChain(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE);
 function removeSupportedChain(uint32 eid) external onlyRole(DEFAULT_ADMIN_ROLE);
 ```
 
@@ -307,7 +314,7 @@ function removeSupportedChain(uint32 eid) external onlyRole(DEFAULT_ADMIN_ROLE);
 
 **路径**: `satellite/PPTSatellite.sol`
 
-**功能**: 远程链用户入口点，集成 PPTOFT 和 LiquidityPool。
+**功能**: 远程链用户入口点，集成 PPTOFT、LiquidityPool，并通过 `SatelliteGateway` 发起桥接申购。
 
 #### 关键参数
 
@@ -340,7 +347,7 @@ function removeSupportedChain(uint32 eid) external onlyRole(DEFAULT_ADMIN_ROLE);
 ```solidity
 // ========== 用户操作 ==========
 
-// 跨链存款 - 资产进入流动性池，消息发送到 Hub
+// 跨链申购 - 资产通过 SatelliteGateway 桥接到 Hub
 function deposit(uint256 assets, address receiver) external payable returns (uint256 shares);
 
 // 即时提款 - 使用本地流动性池，收取费用
@@ -371,7 +378,7 @@ function quoteWithdraw(uint256 shares, address receiver) external view returns (
 
 // ========== 管理函数 ==========
 
-function setHubAdapter(address _hubAdapter) external onlyOwner;
+function setSatelliteGateway(address _gateway) external onlyOwner;
 function setInstantWithdrawFee(uint256 _feeBps) external onlyOwner;
 function setSharePrice(uint256 _sharePrice) external onlyOwner;
 ```
@@ -502,37 +509,28 @@ event CreditUsed(uint256 amount, uint256 remainingCredit);
 
 ---
 
-### 7. RemoteAssetAdapter
+### 7. RemoteAssetGateway
 
-**路径**: `satellite/adapters/RemoteAssetAdapter.sol`
+**路径**: `satellite/adapters/RemoteAssetGateway.sol`
 
-**功能**: 接收 Hub 命令，在远程链执行 DeFi 操作。
+**功能**: 接收 Hub 通过 Stargate compose 发送的 deploy 指令，以及通过 OApp 发送的 withdraw / harvest 指令，并把资产回桥到 Hub。
 
-#### 消息处理
+#### 处理面
 
 ```solidity
-// 处理 Hub 发来的消息
-function _lzReceive(...) internal override {
-    if (msgType == MSG_DEPLOY) {
-        // 部署到协议 (Aave/Compound)
-    } else if (msgType == MSG_WITHDRAW) {
-        // 从协议提款
-        // 发送确认回 Hub
-    } else if (msgType == MSG_HARVEST) {
-        // 收获收益
-        // 发送收益报告回 Hub
-    }
-}
+// Stargate compose: deploy
+function lzCompose(...) external payable override;
+
+// OApp: withdraw / harvest
+function _lzReceive(...) internal override;
 ```
 
 #### 配置
 
 ```solidity
-// 设置协议实现
-function setProtocolImplementation(
-    string calldata protocolName,  // "aave", "compound"
-    address implementation
-) external onlyOwner;
+function setHubComposer(address _hubComposer) external onlyOwner;
+function setProtocolImplementation(string calldata protocolName, address implementation) external onlyOwner;
+function setSlippageBps(uint256 _bps) external onlyOwner;
 ```
 
 ---
@@ -613,26 +611,6 @@ bytes memory options = LzOptionsLib.buildLzReceiveOptions(200000);
 
 ---
 
-### LayerZeroErrors
-
-**路径**: `libraries/LayerZeroErrors.sol`
-
-**功能**: 跨合约共享的错误定义，确保错误命名一致性。
-
-```solidity
-library LayerZeroErrors {
-    error UnknownMessageType(bytes1 msgType);
-    error ZeroAddress();
-    error InvalidRecipient();
-    error InvalidAmount();
-    error InvalidPeer(uint32 srcEid, bytes32 sender);
-    error InsufficientFee();
-    error OnlyHub();
-}
-```
-
----
-
 ## User Flows
 
 ### Flow 1: Cross-Chain Deposit
@@ -640,19 +618,17 @@ library LayerZeroErrors {
 ```
 用户 (ETH) → PPTSatellite.deposit()
     │
-    ├── 1. 转移 USDT 到 Satellite
-    ├── 2. 存入 LiquidityPool
-    ├── 3. 发送 LZ 消息到 Hub
+    ├── 1. 转移 USDT 到 PPTSatellite
+    ├── 2. SatelliteGateway 通过 Stargate 桥接到 Hub
     │
     ▼
-Hub (BSC) ← _lzReceive()
+Hub (BSC) ← HubStargateComposer.lzCompose()
     │
-    ├── 4. PPTOFTAdapter 接收消息
-    ├── 5. PPT Vault.deposit() 执行
-    ├── 6. 铸造 PPT 给用户
+    ├── 3. Hub Vault.deposit() 执行
+    ├── 4. PPTOFTAdapter 向卫星链铸造份额
     │
     ▼
-用户获得 PPT 份额 (BSC 上)
+用户在卫星链收到 PPTOFT 份额
 ```
 
 ### Flow 2: Instant Withdrawal
@@ -679,13 +655,13 @@ Pool 更新 utilized 计数
     ├── 2. 发送 LZ 消息到 Hub
     │
     ▼
-Hub (BSC) ← _lzReceive()
+Hub (BSC) ← PPTOFTAdapter / RedemptionManager
     │
     ├── 3. 处理赎回请求
-    ├── 4. 通过 RedemptionManager 排队
+    ├── 4. 通过 HubStargateComposer + SatelliteGateway 回桥结算
     │
     ▼
-资产稍后通过 OFT 桥接回用户
+资产稍后桥接回卫星链用户
 ```
 
 ### Flow 4: Credit Rebalancing
@@ -786,7 +762,6 @@ forge test --match-contract CrossChainIntegrationTest -vvv
 | CreditManager | Owner | 信用管理、链配置 |
 | PPTOFTAdapter | Owner | 配置、紧急提款 |
 | CrossChainAssetController | KEEPER_ROLE | DeFi 操作 |
-| CrossChainAssetController | REBALANCER_ROLE | 再平衡 |
 | PPTSatellite | Owner | 配置、暂停 |
 | PPTOFT | Owner | 设置 minter、配置 |
 | PPTOFT | Minter | 铸造代币 |
@@ -807,8 +782,7 @@ forge test --match-contract CrossChainIntegrationTest -vvv
 ### Known Limitations
 
 1. **Quote Tests**: Fork 测试中 quote 函数可能因 DVN 未配置而跳过
-2. **Compose Messages**: 需要正确的 LZ Executor 配置
-3. **Asset Transfer**: CrossChainAssetController 仅发送命令，实际资产需单独桥接
+2. **Compose Messages**: 需要正确的 LZ Executor 与 Stargate compose 配置
 
 ---
 
@@ -842,7 +816,8 @@ event OFTReceived(bytes32 indexed guid, uint32 srcEid, address indexed to, uint2
 // CrossChainAssetController
 event AssetDeployed(uint32 indexed dstEid, address indexed protocol, string protocolName, uint256 amount, bytes32 guid);
 event WithdrawalRequested(uint32 indexed dstEid, address indexed protocol, string protocolName, uint256 amount, bytes32 guid);
-event YieldReceived(uint32 indexed srcEid, uint256 yieldAmount);
+event HarvestRequested(uint32 indexed dstEid, address indexed protocol, string protocolName, bytes32 guid);
+event BridgedReturnRecorded(uint32 indexed srcEid, uint256 amount, bool isYield);
 ```
 
 ### Satellite Events
@@ -875,7 +850,6 @@ event CreditUpdated(uint256 oldCredit, uint256 newCredit);
 | `ZeroAddress()` | Multiple | 地址参数为零 |
 | `InvalidRecipient()` | PPTOFT | 接收者地址无效 |
 | `OnlyMinter()` | PPTOFT | 非授权 minter |
-| `HubEidImmutable()` | PPTSatellite | Hub EID 不可修改 |
 | `SlippageExceeded(amount, min)` | OFT | 滑点超限 |
 | `InsufficientLiquidity()` | LiquidityPool | 流动性不足 |
 | `InsufficientFee()` | PPTSatellite | LZ 费用不足 |

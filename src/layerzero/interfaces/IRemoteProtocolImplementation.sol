@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 /// @title IRemoteProtocolImplementation
-/// @notice Protocol-specific execution interface used by RemoteAssetAdapter
+/// @notice Protocol-specific execution interface used by RemoteAssetGateway
 interface IRemoteProtocolImplementation {
     /// @notice Deploy assets from the adapter into a remote protocol
     /// @param asset Address of the underlying asset held by the adapter

@@ -10,8 +10,7 @@ library MessageCodec {
     // Namespace: 0x1x = Satellite→Hub (credit)
     //            0x2x = Hub→Satellite (credit/shares/price)
     //            0x3x = Satellite→Hub (deposit/withdraw)
-    //            0x4x = Hub→RemoteAdapter (commands)
-    //            0x5x = RemoteAdapter→Hub (confirmations)
+    //            0x4x = Hub→RemoteGateway (portfolio commands)
 
     // --- Satellite → Hub (Credit) ---
     bytes1 internal constant MSG_CREDIT_USED = 0x10;
@@ -27,14 +26,9 @@ library MessageCodec {
     bytes1 internal constant MSG_WITHDRAW = 0x31;
     bytes1 internal constant MSG_REDEEM = 0x32;
 
-    // --- Hub → RemoteAdapter (Commands) ---
-    bytes1 internal constant MSG_DEPLOY = 0x40;
+    // --- Hub → RemoteGateway (Commands) ---
     bytes1 internal constant MSG_WITHDRAW_ASSET = 0x41;
     bytes1 internal constant MSG_HARVEST = 0x42;
-
-    // --- RemoteAdapter → Hub (Confirmations) ---
-    bytes1 internal constant MSG_WITHDRAW_CONFIRM = 0x50;
-    bytes1 internal constant MSG_YIELD_REPORT = 0x51;
 
     // ========== Encode Functions ==========
 
@@ -78,16 +72,7 @@ library MessageCodec {
         return abi.encodePacked(MSG_CREDIT_RESTORED, abi.encode(amount));
     }
 
-    /// @notice Encode deploy command (Hub → RemoteAdapter)
-    function encodeDeploy(uint256 amount, address protocol, string memory protocolName)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        return abi.encodePacked(MSG_DEPLOY, abi.encode(amount, protocol, protocolName));
-    }
-
-    /// @notice Encode withdraw asset command (Hub → RemoteAdapter)
+    /// @notice Encode withdraw asset command (Hub → RemoteGateway)
     function encodeWithdrawAsset(uint256 amount, address protocol, string memory protocolName)
         internal
         pure
@@ -96,19 +81,9 @@ library MessageCodec {
         return abi.encodePacked(MSG_WITHDRAW_ASSET, abi.encode(amount, protocol, protocolName));
     }
 
-    /// @notice Encode harvest command (Hub → RemoteAdapter)
+    /// @notice Encode harvest command (Hub → RemoteGateway)
     function encodeHarvest(address protocol, string memory protocolName) internal pure returns (bytes memory) {
         return abi.encodePacked(MSG_HARVEST, abi.encode(protocol, protocolName));
-    }
-
-    /// @notice Encode withdraw confirmation (RemoteAdapter → Hub)
-    function encodeWithdrawConfirm(uint256 amount) internal pure returns (bytes memory) {
-        return abi.encodePacked(MSG_WITHDRAW_CONFIRM, abi.encode(amount));
-    }
-
-    /// @notice Encode yield report (RemoteAdapter → Hub)
-    function encodeYieldReport(uint256 yieldAmount) internal pure returns (bytes memory) {
-        return abi.encodePacked(MSG_YIELD_REPORT, abi.encode(yieldAmount));
     }
 
     // ========== Decode Functions ==========
@@ -128,8 +103,8 @@ library MessageCodec {
         return abi.decode(payload[1:], (address, uint256));
     }
 
-    /// @notice Decode deploy/withdraw command (amount, protocol, protocolName)
-    function decodeDeployCommand(bytes calldata payload)
+    /// @notice Decode an amount+protocol command (amount, protocol, protocolName)
+    function decodeAmountProtocolCommand(bytes calldata payload)
         internal
         pure
         returns (uint256 amount, address protocol, string memory protocolName)

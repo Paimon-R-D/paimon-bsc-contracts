@@ -5,7 +5,6 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
-import {OFTComposeMsgCodec} from "@layerzero-v2/oapp/contracts/oft/libs/OFTComposeMsgCodec.sol";
 
 import {IStargate} from "../../src/layerzero/interfaces/IStargateIntegration.sol";
 import {MessageCodec} from "../../src/layerzero/libraries/MessageCodec.sol";
@@ -235,9 +234,10 @@ contract StargateCriticalFixesTest is Test {
 
     address internal constant USER = address(0xCAFE);
     address internal constant HUB_COMPOSER = address(0xBEEF);
-    address internal constant ETH_GATEWAY = address(0x1234);
+    address internal constant ETH_SATELLITE_GATEWAY = address(0x1234);
+    address internal constant ETH_REMOTE_GATEWAY = address(0x5678);
 
-    function test_DepositViaBridge_UsesGatewayFundsPathAndRefundsUser() public {
+    function test_Deposit_UsesGatewayFundsPathAndRefundsUser() public {
         MockEndpoint endpoint = new MockEndpoint();
         MockToken usdt = new MockToken("USDT", "USDT", 6);
         RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
@@ -258,7 +258,7 @@ contract StargateCriticalFixesTest is Test {
         vm.startPrank(USER);
         usdt.approve(address(satellite), amount);
         vm.deal(USER, 1 ether);
-        satellite.depositViaBridge{value: 0.1 ether}(amount, USER, 0);
+        satellite.deposit{value: 0.1 ether}(amount, USER);
         vm.stopPrank();
 
         assertEq(stargatePool.sendCount(), 1);
@@ -290,6 +290,35 @@ contract StargateCriticalFixesTest is Test {
         gateway.depositFor{value: 0.1 ether}(USER, amount, address(0xBADD), 0, address(0xBADD));
     }
 
+    function test_SatelliteGateway_Deposit_RevertsWhenHubComposerUnset() public {
+        MockEndpoint endpoint = new MockEndpoint();
+        MockToken usdt = new MockToken("USDT", "USDT", 6);
+        RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
+        SatelliteGateway gateway =
+            new SatelliteGateway(address(endpoint), address(stargatePool), address(usdt), HUB_EID, address(this));
+
+        uint256 amount = 250e6;
+        usdt.mint(USER, amount);
+        stargatePool.setQuoteFee(0.01 ether);
+
+        vm.startPrank(USER);
+        usdt.approve(address(gateway), amount);
+        vm.expectRevert(SatelliteGateway.ZeroAddress.selector);
+        gateway.deposit{value: 0.01 ether}(amount, USER, 0);
+        vm.stopPrank();
+    }
+
+    function test_SatelliteGateway_QuoteDeposit_RevertsWhenHubComposerUnset() public {
+        MockEndpoint endpoint = new MockEndpoint();
+        MockToken usdt = new MockToken("USDT", "USDT", 6);
+        RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
+        SatelliteGateway gateway =
+            new SatelliteGateway(address(endpoint), address(stargatePool), address(usdt), HUB_EID, address(this));
+
+        vm.expectRevert(SatelliteGateway.ZeroAddress.selector);
+        gateway.quoteDeposit(250e6, USER);
+    }
+
     function test_HubReturn_ComposesAssetsBackIntoVaultBalance() public {
         MockToken usdt = new MockToken("USDT", "USDT", 6);
         RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
@@ -301,7 +330,7 @@ contract StargateCriticalFixesTest is Test {
             new HubStargateComposer(endpoint, address(stargatePool), address(usdt), address(this));
 
         composer.setVault(address(vault));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setRemoteAssetGateway(ETH_EID, ETH_REMOTE_GATEWAY);
         composer.setNavReporter(address(navReporter));
 
         navReporter.addChain(ETH_EID);
@@ -312,7 +341,7 @@ contract StargateCriticalFixesTest is Test {
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_REMOTE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -332,7 +361,7 @@ contract StargateCriticalFixesTest is Test {
 
         composer.setVault(address(vault));
         composer.setPptOftAdapter(address(0xBEEF));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
         vault.setShareRate(2e18);
 
         uint256 amount = 100e6;
@@ -340,7 +369,7 @@ contract StargateCriticalFixesTest is Test {
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, minShares);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -367,13 +396,13 @@ contract StargateCriticalFixesTest is Test {
 
         composer.setVault(address(vault));
         composer.setPptOftAdapter(address(0xBEEF));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
 
         uint256 amount = 100e6;
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 1);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -397,29 +426,58 @@ contract StargateCriticalFixesTest is Test {
 
         composer.setVault(address(vault));
         composer.setPptOftAdapter(address(adapter));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
         vault.setShareRate(2e18);
 
         uint256 amount = 100e6;
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 60e6);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
 
+        vault.setShareRate(1.5e18);
         composer.retryFailedDeposit(0, 0);
 
         assertEq(adapter.callCount(), 1);
         assertEq(adapter.lastDstEid(), ETH_EID);
         assertEq(adapter.lastReceiver(), USER);
-        assertEq(adapter.lastShares(), 50e6);
+        assertEq(adapter.lastShares(), 66_666_666);
         (, address receiver, uint256 assets,,) = composer.failedDeposits(0);
         assertEq(receiver, address(0));
         assertEq(assets, 0);
         assertEq(usdt.balanceOf(address(composer)), 0);
         assertEq(usdt.balanceOf(address(vault)), amount);
+    }
+
+    function test_RetryFailedDeposit_CannotBypassStoredMinShares() public {
+        MockToken usdt = new MockToken("USDT", "USDT", 6);
+        RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
+        MockVault vault = new MockVault(address(usdt));
+        MockMintSharesAdapter adapter = new MockMintSharesAdapter();
+        address endpoint = makeAddr("endpoint");
+
+        HubStargateComposer composer =
+            new HubStargateComposer(endpoint, address(stargatePool), address(usdt), address(this));
+
+        composer.setVault(address(vault));
+        composer.setPptOftAdapter(address(adapter));
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
+        vault.setShareRate(2e18);
+
+        uint256 amount = 100e6;
+        usdt.mint(address(composer), amount);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 60e6);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_SATELLITE_GATEWAY, composeMsg);
+
+        vm.prank(endpoint);
+        composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+
+        vm.expectRevert(abi.encodeWithSelector(HubStargateComposer.SlippageTooHigh.selector, 50e6, 60e6));
+        composer.retryFailedDeposit(0, 0);
     }
 
     function test_RefundFailedDeposit_BridgesAssetsBackToSatellite() public {
@@ -433,14 +491,14 @@ contract StargateCriticalFixesTest is Test {
 
         composer.setVault(address(vault));
         composer.setPptOftAdapter(address(0xBEEF));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
         vault.setShareRate(2e18);
 
         uint256 amount = 100e6;
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 60e6);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -488,6 +546,26 @@ contract StargateCriticalFixesTest is Test {
         assertEq(pool.utilized(), 0);
     }
 
+    function test_SatelliteGateway_Replenish_RevertsWhenLiquidityPoolUnset() public {
+        MockToken usdt = new MockToken("USDT", "USDT", 6);
+        RecordingStargatePool stargatePool = new RecordingStargatePool(address(usdt));
+        address endpoint = makeAddr("endpoint");
+
+        SatelliteGateway gateway =
+            new SatelliteGateway(endpoint, address(stargatePool), address(usdt), HUB_EID, address(this));
+        gateway.setHubComposer(HUB_COMPOSER);
+
+        uint256 amount = 300e6;
+        usdt.mint(address(gateway), amount);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeReplenish();
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID, amount, HUB_COMPOSER, composeMsg);
+
+        vm.prank(endpoint);
+        vm.expectRevert(SatelliteGateway.ZeroAddress.selector);
+        gateway.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+    }
+
     function test_SatelliteWithdraw_RegistersComposerSettlementAndBridgesOnSettle() public {
         MockEndpoint endpoint = new MockEndpoint();
         MockToken hubPpt = new MockToken("Hub PPT", "hPPT", 18);
@@ -502,7 +580,7 @@ contract StargateCriticalFixesTest is Test {
         adapter.setRedemptionManager(address(redemptionManager));
         adapter.setHubStargateComposer(address(composer));
         composer.setPptOftAdapter(address(adapter));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
 
         (bool setManagerOk,) =
             address(composer).call(abi.encodeWithSignature("setRedemptionManager(address)", address(redemptionManager)));
@@ -536,7 +614,7 @@ contract StargateCriticalFixesTest is Test {
         HubStargateComposer composer =
             new HubStargateComposer(makeAddr("composer-endpoint"), address(stargatePool), address(usdt), address(this));
 
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, ETH_SATELLITE_GATEWAY);
         composer.setCreditManager(address(creditManager));
 
         usdt.mint(address(composer), 300e6);
@@ -558,14 +636,14 @@ contract StargateCriticalFixesTest is Test {
             new HubStargateComposer(endpoint, address(stargatePool), address(usdt), address(this));
 
         composer.setVault(address(vault));
-        composer.setTrustedGateway(ETH_EID, ETH_GATEWAY);
+        composer.setRemoteAssetGateway(ETH_EID, ETH_REMOTE_GATEWAY);
         composer.setCrossChainAssetController(address(controller));
 
         uint256 amount = 90e6;
         usdt.mint(address(composer), amount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_REMOTE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
         composer.lzCompose(address(stargatePool), bytes32(0), fullMessage, address(0), "");

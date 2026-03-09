@@ -14,7 +14,6 @@ import {IStargate} from "../interfaces/IStargateIntegration.sol";
 import {StargateComposeCodec} from "../libraries/StargateComposeCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 import {ICrossChainNAVReporter} from "../interfaces/ICrossChainNAVReporter.sol";
-import {ICreditManager} from "../interfaces/ICreditManager.sol";
 import {IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 
 /// @title HubStargateComposer
@@ -67,8 +66,11 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     /// @notice Cross-chain asset controller used to reconcile bridged portfolio returns
     address public crossChainAssetController;
 
-    /// @notice Trusted gateway per remote chain (eid => gateway address)
-    mapping(uint32 => address) public trustedGateways;
+    /// @notice Satellite gateway per remote chain for deposit/settlement/replenish flows
+    mapping(uint32 => address) public satelliteGateways;
+
+    /// @notice Remote asset gateway per remote chain for portfolio deploy/return flows
+    mapping(uint32 => address) public remoteAssetGateways;
 
     /// @notice Slippage tolerance in basis points per chain
     mapping(uint32 => uint256) public slippageBps;
@@ -88,7 +90,8 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     event DeployBridged(uint32 indexed dstEid, address indexed protocol, uint256 amount);
     event ReturnReceived(uint32 indexed srcEid, uint256 amount, bool isYield);
     event ReplenishBridged(uint32 indexed dstEid, uint256 amount);
-    event TrustedGatewayUpdated(uint32 indexed eid, address gateway);
+    event SatelliteGatewayUpdated(uint32 indexed eid, address gateway);
+    event RemoteAssetGatewayUpdated(uint32 indexed eid, address gateway);
     event VaultUpdated(address vault);
     event PptOftAdapterUpdated(address adapter);
     event NavReporterUpdated(address reporter);
@@ -169,13 +172,12 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         uint32 srcEid = OFTComposeMsgCodec.srcEid(_message);
         bytes memory composeMsg = OFTComposeMsgCodec.composeMsg(_message);
 
-        // Verify the compose sender is a trusted gateway
+        uint8 action = StargateComposeCodec.decodeAction(composeMsg);
+
         address composeFrom = _bytes32ToAddress(composeFromBytes);
-        if (trustedGateways[srcEid] != composeFrom) {
+        if (_gatewayForAction(srcEid, action) != composeFrom) {
             revert UntrustedSource(srcEid, composeFrom);
         }
-
-        uint8 action = StargateComposeCodec.decodeAction(composeMsg);
 
         if (action == StargateComposeCodec.ACTION_DEPOSIT) {
             _handleDeposit(srcEid, amountLD, composeMsg, _guid);
@@ -315,7 +317,11 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         if (failed.assets == 0) revert UnknownFailedDeposit(failedId);
         if (address(vault) == address(0) || pptOftAdapter == address(0)) revert ZeroAddress();
 
-        uint256 minShares = minSharesOverride;
+        uint256 minShares = failed.minShares;
+        if (minSharesOverride > minShares) {
+            minShares = minSharesOverride;
+        }
+
         if (minShares > 0) {
             uint256 previewShares = vault.previewDeposit(failed.assets);
             if (previewShares < minShares) revert SlippageTooHigh(previewShares, minShares);
@@ -394,12 +400,13 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         view
         returns (uint256 nativeFee)
     {
+        uint8 action = StargateComposeCodec.decodeAction(composeMsg);
         bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, composeGas);
         uint256 minAmount = _calcMinAmount(dstEid, amount);
 
         IStargate.SendParam memory params = IStargate.SendParam({
             dstEid: dstEid,
-            to: _addressToBytes32(trustedGateways[dstEid]),
+            to: _addressToBytes32(_gatewayForAction(dstEid, action)),
             amountLD: amount,
             minAmountLD: minAmount,
             extraOptions: options,
@@ -443,7 +450,8 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         uint256 balance = asset.balanceOf(address(this));
         if (balance < amount) revert InsufficientBalance(balance, amount);
 
-        address gateway = trustedGateways[dstEid];
+        uint8 action = StargateComposeCodec.decodeAction(composeMsg);
+        address gateway = _gatewayForAction(dstEid, action);
         if (gateway == address(0)) revert ZeroAddress();
 
         bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, composeGas);
@@ -507,6 +515,21 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         return amount * (BPS_DENOMINATOR - slippage) / BPS_DENOMINATOR;
     }
 
+    function _gatewayForAction(uint32 eid, uint8 action) internal view returns (address gateway) {
+        if (
+            action == StargateComposeCodec.ACTION_DEPOSIT || action == StargateComposeCodec.ACTION_SETTLEMENT
+                || action == StargateComposeCodec.ACTION_REPLENISH
+        ) {
+            gateway = satelliteGateways[eid];
+        } else if (action == StargateComposeCodec.ACTION_DEPLOY || action == StargateComposeCodec.ACTION_RETURN) {
+            gateway = remoteAssetGateways[eid];
+        } else {
+            revert UnknownAction(action);
+        }
+
+        if (gateway == address(0)) revert ZeroAddress();
+    }
+
     function _addressToBytes32(address addr) internal pure returns (bytes32) {
         return bytes32(uint256(uint160(addr)));
     }
@@ -550,10 +573,16 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         emit CrossChainAssetControllerUpdated(controller);
     }
 
-    function setTrustedGateway(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setSatelliteGateway(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (gateway == address(0)) revert ZeroAddress();
-        trustedGateways[eid] = gateway;
-        emit TrustedGatewayUpdated(eid, gateway);
+        satelliteGateways[eid] = gateway;
+        emit SatelliteGatewayUpdated(eid, gateway);
+    }
+
+    function setRemoteAssetGateway(uint32 eid, address gateway) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (gateway == address(0)) revert ZeroAddress();
+        remoteAssetGateways[eid] = gateway;
+        emit RemoteAssetGatewayUpdated(eid, gateway);
     }
 
     function setSlippageBps(uint32 eid, uint256 bps) external onlyRole(DEFAULT_ADMIN_ROLE) {

@@ -4,9 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Origin, MessagingFee, MessagingReceipt} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
-import {OFTComposeMsgCodec} from "@layerzero-v2/oapp/contracts/oft/libs/OFTComposeMsgCodec.sol";
 
 import {IStargate} from "../../src/layerzero/interfaces/IStargateIntegration.sol";
 import {StargateComposeCodec} from "../../src/layerzero/libraries/StargateComposeCodec.sol";
@@ -205,6 +203,25 @@ contract MockProtocolImpl {
 
     function setDeployReturn(uint256 _amount) external {
         deployReturn = _amount;
+    }
+}
+
+contract RemoteAssetGatewayHarness is RemoteAssetGateway {
+    constructor(
+        address endpoint_,
+        address stargatePool_,
+        address asset_,
+        uint32 hubEid_,
+        uint32 thisEid_,
+        address owner_
+    ) RemoteAssetGateway(endpoint_, stargatePool_, asset_, hubEid_, thisEid_, owner_) {}
+
+    function harnessReceive(Origin calldata origin, bytes calldata payload) external {
+        this.harnessReceiveCalldata(origin, payload, "");
+    }
+
+    function harnessReceiveCalldata(Origin calldata origin, bytes calldata payload, bytes calldata extraData) external {
+        _lzReceive(origin, bytes32(0), payload, address(0), extraData);
     }
 }
 
@@ -425,7 +442,8 @@ contract HubStargateComposerTest is Test {
     address mockEndpoint;
 
     uint32 constant ETH_EID = 30101;
-    address constant GATEWAY = address(0x1234);
+    address constant SATELLITE_GATEWAY = address(0x1234);
+    address constant REMOTE_GATEWAY = address(0x5678);
     address constant USER = address(0xCAFE);
 
     function setUp() public {
@@ -446,7 +464,8 @@ contract HubStargateComposerTest is Test {
         composer.setVault(address(vault));
         composer.setPptOftAdapter(address(pptAdapter));
         composer.setNavReporter(address(navReporter));
-        composer.setTrustedGateway(ETH_EID, GATEWAY);
+        composer.setSatelliteGateway(ETH_EID, SATELLITE_GATEWAY);
+        composer.setRemoteAssetGateway(ETH_EID, REMOTE_GATEWAY);
 
         navReporter.addChain(ETH_EID);
         navReporter.grantRole(navReporter.REPORTER_ROLE(), address(composer));
@@ -458,7 +477,7 @@ contract HubStargateComposerTest is Test {
 
         // Build the OFTComposeMsgCodec-style message
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 0);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, depositAmount, GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, depositAmount, SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(mockEndpoint);
         composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -480,7 +499,7 @@ contract HubStargateComposerTest is Test {
         usdt.mint(address(composer), returnAmount);
 
         bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, returnAmount, GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, returnAmount, REMOTE_GATEWAY, composeMsg);
 
         vm.prank(mockEndpoint);
         composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -498,6 +517,7 @@ contract HubStargateComposerTest is Test {
         assertEq(stargatePool.sendCount(), 1);
         assertEq(stargatePool.getLastSendDstEid(), ETH_EID);
         assertEq(stargatePool.getLastSendAmountLD(), amount);
+        assertEq(stargatePool.getLastSendTo(), bytes32(uint256(uint160(SATELLITE_GATEWAY))));
     }
 
     function test_BridgeAndDeploy_UpdatesNAVReporter() public {
@@ -509,6 +529,7 @@ contract HubStargateComposerTest is Test {
 
         assertEq(stargatePool.sendCount(), 1);
         assertEq(navReporter.remoteDeployments(ETH_EID), 300e6);
+        assertEq(stargatePool.getLastSendTo(), bytes32(uint256(uint160(REMOTE_GATEWAY))));
     }
 
     function test_BridgeAndDeploy_UsesActualReceivedAmountForNAV() public {
@@ -532,6 +553,18 @@ contract HubStargateComposerTest is Test {
 
         assertEq(stargatePool.sendCount(), 1);
         assertEq(stargatePool.getLastSendAmountLD(), amount);
+        assertEq(stargatePool.getLastSendTo(), bytes32(uint256(uint160(SATELLITE_GATEWAY))));
+    }
+
+    function test_RevertOnReturnFromSatelliteGateway() public {
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, SATELLITE_GATEWAY, composeMsg);
+
+        vm.prank(mockEndpoint);
+        vm.expectRevert(
+            abi.encodeWithSelector(HubStargateComposer.UntrustedSource.selector, ETH_EID, SATELLITE_GATEWAY)
+        );
+        composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
     }
 
     function test_RevertOnUntrustedGateway() public {
@@ -546,7 +579,7 @@ contract HubStargateComposerTest is Test {
 
     function test_RevertOnNonEndpoint() public {
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 0);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, SATELLITE_GATEWAY, composeMsg);
 
         vm.expectRevert(HubStargateComposer.OnlyEndpoint.selector);
         composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
@@ -554,7 +587,7 @@ contract HubStargateComposerTest is Test {
 
     function test_RevertOnNonStargate() public {
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(USER, 0);
-        bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, GATEWAY, composeMsg);
+        bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(mockEndpoint);
         vm.expectRevert(HubStargateComposer.OnlyStargate.selector);
@@ -661,6 +694,15 @@ contract SatelliteGatewayTest is Test {
         gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
     }
 
+    function test_RevertOnUnexpectedComposeSourceEid() public {
+        bytes memory composeMsg = StargateComposeCodec.encodeSettlement(USER, 1);
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID + 1, 100e6, HUB_COMPOSER, composeMsg);
+
+        vm.prank(mockEndpoint);
+        vm.expectRevert(abi.encodeWithSelector(SatelliteGateway.UnexpectedSourceEid.selector, HUB_EID + 1));
+        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+    }
+
     function _buildComposeMessage(
         uint32 srcEid,
         uint256 amountLD,
@@ -678,7 +720,7 @@ contract SatelliteGatewayTest is Test {
 }
 
 contract RemoteAssetGatewayTest is Test {
-    RemoteAssetGateway gateway;
+    RemoteAssetGatewayHarness gateway;
     MockToken usdt;
     MockStargatePool stargatePool;
     MockProtocolImpl aaveImpl;
@@ -695,7 +737,7 @@ contract RemoteAssetGatewayTest is Test {
         mockEndpoint = makeAddr("endpoint");
         aaveImpl = new MockProtocolImpl(address(usdt));
 
-        gateway = new RemoteAssetGateway(
+        gateway = new RemoteAssetGatewayHarness(
             mockEndpoint,
             address(stargatePool),
             address(usdt),
@@ -744,48 +786,6 @@ contract RemoteAssetGatewayTest is Test {
         assertEq(stargatePool.getLastSendDstEid(), HUB_EID);
     }
 
-    function test_WithdrawAndBridge_SendsBackToHub() public {
-        // First deploy
-        uint256 deployAmount = 1000e6;
-        usdt.mint(address(gateway), deployAmount);
-        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
-        bytes memory fullMessage = _buildComposeMessage(HUB_EID, deployAmount, HUB_COMPOSER, composeMsg);
-        vm.prank(mockEndpoint);
-        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
-
-        // Now withdraw and bridge back
-        uint256 withdrawAmount = 500e6;
-        usdt.mint(address(aaveImpl), withdrawAmount); // impl has tokens to return
-
-        vm.deal(address(this), 1 ether);
-        gateway.withdrawAndBridge{value: 0.01 ether}(withdrawAmount, AAVE_POOL, "aave");
-
-        assertEq(gateway.protocolDeposits(AAVE_POOL), deployAmount - withdrawAmount);
-        assertEq(stargatePool.sendCount(), 1);
-        assertEq(stargatePool.getLastSendDstEid(), HUB_EID);
-    }
-
-    function test_HarvestAndBridge_SendsYieldToHub() public {
-        // First deploy
-        uint256 deployAmount = 1000e6;
-        usdt.mint(address(gateway), deployAmount);
-        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
-        bytes memory fullMessage = _buildComposeMessage(HUB_EID, deployAmount, HUB_COMPOSER, composeMsg);
-        vm.prank(mockEndpoint);
-        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
-
-        // Set harvest return and execute
-        uint256 yieldAmount = 50e6;
-        usdt.mint(address(aaveImpl), yieldAmount);
-        aaveImpl.setHarvestReturn(yieldAmount);
-
-        vm.deal(address(this), 1 ether);
-        gateway.harvestAndBridge{value: 0.01 ether}(AAVE_POOL, "aave");
-
-        assertEq(stargatePool.sendCount(), 1);
-        assertEq(stargatePool.getLastSendAmountLD(), yieldAmount);
-    }
-
     function test_RevertOnUnknownAction() public {
         bytes memory composeMsg = abi.encodePacked(uint8(0xFF)); // unknown action
         bytes memory fullMessage = _buildComposeMessage(HUB_EID, 100e6, HUB_COMPOSER, composeMsg);
@@ -793,6 +793,65 @@ contract RemoteAssetGatewayTest is Test {
         vm.prank(mockEndpoint);
         vm.expectRevert(abi.encodeWithSelector(RemoteAssetGateway.UnknownAction.selector, 0xFF));
         gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+    }
+
+    function test_RevertOnUnexpectedComposeSourceEid() public {
+        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID + 1, 100e6, HUB_COMPOSER, composeMsg);
+
+        vm.prank(mockEndpoint);
+        vm.expectRevert(abi.encodeWithSelector(RemoteAssetGateway.UnexpectedSourceEid.selector, HUB_EID + 1));
+        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+    }
+
+    function test_HubReceive_WithdrawCommand_BridgesBackToHub() public {
+        uint256 deployAmount = 1000e6;
+        uint256 withdrawAmount = 400e6;
+        usdt.mint(address(gateway), deployAmount);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID, deployAmount, HUB_COMPOSER, composeMsg);
+
+        vm.prank(mockEndpoint);
+        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+
+        usdt.mint(address(aaveImpl), withdrawAmount);
+        vm.deal(address(gateway), 1 ether);
+        gateway.harnessReceive(Origin({srcEid: HUB_EID, sender: bytes32(0), nonce: 0}), MessageCodec.encodeWithdrawAsset(withdrawAmount, AAVE_POOL, "aave"));
+
+        assertEq(gateway.protocolDeposits(AAVE_POOL), deployAmount - withdrawAmount);
+        assertEq(gateway.totalDeposited(), deployAmount - withdrawAmount);
+        assertEq(stargatePool.sendCount(), 1);
+        assertEq(stargatePool.getLastSendDstEid(), HUB_EID);
+        assertEq(stargatePool.getLastSendAmountLD(), withdrawAmount);
+    }
+
+    function test_HubReceive_HarvestCommand_BridgesYieldToHub() public {
+        uint256 deployAmount = 1000e6;
+        uint256 yieldAmount = 75e6;
+        usdt.mint(address(gateway), deployAmount);
+
+        bytes memory composeMsg = StargateComposeCodec.encodeDeploy(AAVE_POOL, "aave");
+        bytes memory fullMessage = _buildComposeMessage(HUB_EID, deployAmount, HUB_COMPOSER, composeMsg);
+
+        vm.prank(mockEndpoint);
+        gateway.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+
+        usdt.mint(address(aaveImpl), yieldAmount);
+        aaveImpl.setHarvestReturn(yieldAmount);
+        vm.deal(address(gateway), 1 ether);
+        gateway.harnessReceive(Origin({srcEid: HUB_EID, sender: bytes32(0), nonce: 0}), MessageCodec.encodeHarvest(AAVE_POOL, "aave"));
+
+        assertEq(gateway.protocolDeposits(AAVE_POOL), deployAmount);
+        assertEq(gateway.totalDeposited(), deployAmount);
+        assertEq(stargatePool.sendCount(), 1);
+        assertEq(stargatePool.getLastSendDstEid(), HUB_EID);
+        assertEq(stargatePool.getLastSendAmountLD(), yieldAmount);
+    }
+
+    function test_HubReceive_RevertsWhenSourceIsNotHub() public {
+        vm.expectRevert(RemoteAssetGateway.OnlyHub.selector);
+        gateway.harnessReceive(Origin({srcEid: THIS_EID, sender: bytes32(0), nonce: 0}), MessageCodec.encodeHarvest(AAVE_POOL, "aave"));
     }
 
     function _buildComposeMessage(

@@ -69,6 +69,7 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
     error OnlyEndpoint();
     error OnlyStargate();
+    error UnexpectedSourceEid(uint32 srcEid);
     error UntrustedSource(address composeFrom);
     error UnknownAction(uint8 action);
     error ZeroAddress();
@@ -139,7 +140,10 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
         if (_from != stargatePool) revert OnlyStargate();
 
         uint256 amountLD = OFTComposeMsgCodec.amountLD(_message);
+        uint32 srcEid = OFTComposeMsgCodec.srcEid(_message);
         bytes memory composeMsg = OFTComposeMsgCodec.composeMsg(_message);
+
+        if (srcEid != hubEid) revert UnexpectedSourceEid(srcEid);
 
         // Verify compose sender is Hub composer
         bytes32 composeFromBytes = OFTComposeMsgCodec.composeFrom(_message);
@@ -171,11 +175,12 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
     /// @notice Handle replenishment: USDT arrived from Hub → add to LiquidityPool
     function _handleReplenish(uint256 amount) internal {
-        asset.forceApprove(address(liquidityPool), amount);
-        liquidityPool.replenish(amount);
-        asset.forceApprove(address(liquidityPool), 0);
+        ILiquidityPool pool = _requireLiquidityPool();
+        asset.forceApprove(address(pool), amount);
+        pool.replenish(amount);
+        asset.forceApprove(address(pool), 0);
 
-        address satellite = liquidityPool.satellite();
+        address satellite = pool.satellite();
         if (satellite != address(0)) {
             try IPPTSatelliteCreditNotifier(satellite).notifyCreditRestored(amount) {
                 emit CreditRestoreNotified(satellite, amount);
@@ -191,13 +196,14 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
     /// @notice Quote the native fee for a deposit bridge
     function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 minReceive) {
+        address composer = _requireHubComposer();
         bytes memory composeMsg = StargateComposeCodec.encodeDeposit(receiver, 0);
         bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_DEPOSIT);
         minReceive = _calcMinAmount(assets);
 
         IStargate.SendParam memory params = IStargate.SendParam({
             dstEid: hubEid,
-            to: _addressToBytes32(hubComposer),
+            to: _addressToBytes32(composer),
             amountLD: assets,
             minAmountLD: minReceive,
             extraOptions: options,
@@ -223,6 +229,7 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
         uint256 minShares,
         address refundAddress
     ) internal {
+        address composer = _requireHubComposer();
         if (payer == address(0) || receiver == address(0) || refundAddress == address(0)) revert ZeroAddress();
         if (assets == 0) revert ZeroAmount();
 
@@ -236,7 +243,7 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
         IStargate.SendParam memory params = IStargate.SendParam({
             dstEid: hubEid,
-            to: _addressToBytes32(hubComposer),
+            to: _addressToBytes32(composer),
             amountLD: assets,
             minAmountLD: minAmount,
             extraOptions: options,
@@ -263,6 +270,16 @@ contract SatelliteGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausa
 
     function _bytes32ToAddress(bytes32 b) internal pure returns (address) {
         return address(uint160(uint256(b)));
+    }
+
+    function _requireHubComposer() internal view returns (address composer) {
+        composer = hubComposer;
+        if (composer == address(0)) revert ZeroAddress();
+    }
+
+    function _requireLiquidityPool() internal view returns (ILiquidityPool pool) {
+        pool = liquidityPool;
+        if (address(pool) == address(0)) revert ZeroAddress();
     }
 
     // ========== Configuration ==========

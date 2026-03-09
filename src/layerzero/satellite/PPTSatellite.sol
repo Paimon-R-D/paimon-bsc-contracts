@@ -48,7 +48,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     IERC20 public immutable asset;
     uint32 public immutable hubEid;
 
-    address public hubAdapter;
     address public satelliteGateway;
     uint256 public instantWithdrawFeeBps;
 
@@ -69,7 +68,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     event CrossChainDeposit(address indexed user, uint256 assets, uint256 shares, uint64 nonce);
     event CrossChainWithdraw(address indexed user, uint256 shares, uint256 assets, uint64 nonce);
     event InstantWithdraw(address indexed user, uint256 shares, uint256 assets, uint256 fee);
-    event HubAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
     event SatelliteGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event InstantWithdrawFeeUpdated(uint256 oldFee, uint256 newFee);
     event SharePriceUpdated(uint256 oldPrice, uint256 newPrice);
@@ -86,10 +84,8 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     error FeeTooHigh();
     error OnlyHub();
     error ZeroAddress();
-    error HubEidImmutable();
     error UnknownMessageType(bytes1 msgType);
     error InvalidSharePrice();
-    error MinSharesNotMet(uint256 expected, uint256 minimum);
     error MinAssetsNotMet(uint256 expected, uint256 minimum);
     error UnexpectedNativeValue();
     error UnknownPendingCredit(uint256 pendingId);
@@ -137,15 +133,9 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     // ========== Quote Functions ==========
 
     function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
-        if (satelliteGateway != address(0)) {
-            (nativeFee,) = ISatelliteGateway(satelliteGateway).quoteDeposit(assets, receiver);
-            return (nativeFee, 0);
-        }
-
-        bytes memory payload = MessageCodec.encodeDeposit(receiver, assets);
-        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
-        MessagingFee memory fee = _quote(hubEid, payload, options, false);
-        return (fee.nativeFee, fee.lzTokenFee);
+        if (satelliteGateway == address(0)) revert ZeroAddress();
+        (nativeFee,) = ISatelliteGateway(satelliteGateway).quoteDeposit(assets, receiver);
+        return (nativeFee, 0);
     }
 
     function quoteWithdraw(uint256 shares, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
@@ -157,16 +147,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     // ========== User Actions ==========
 
-    /// @notice Deposit USDT via Stargate bridge to Hub vault (recommended)
-    /// @dev Routes through SatelliteGateway for actual asset bridging
-    function depositViaBridge(
-        uint256 assets,
-        address receiver,
-        uint256 minShares
-    ) external payable nonReentrant whenNotPaused returns (uint256) {
-        return _depositThroughBridge(assets, receiver, minShares);
-    }
-
     function depositWithParams(DepositParams calldata params)
         external
         payable
@@ -174,24 +154,15 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         whenNotPaused
         returns (uint256 shares)
     {
-        if (satelliteGateway != address(0)) {
-            return _depositThroughBridge(params.assets, params.receiver, params.minShares);
-        }
-
-        return _depositLegacy(params.assets, params.receiver, params.minShares);
+        return _depositThroughBridge(params.assets, params.receiver, params.minShares);
     }
 
-    /// @notice Deposit USDT to local LiquidityPool + sends OApp message to Hub
-    /// @dev Uses OApp messaging only (no asset bridging). Assets stay in local LiquidityPool.
+    /// @notice Deposit USDT via the configured bridge gateway using default slippage settings
     function deposit(
         uint256 assets,
         address receiver
     ) external payable nonReentrant whenNotPaused returns (uint256 shares) {
-        if (satelliteGateway != address(0)) {
-            return _depositThroughBridge(assets, receiver, 0);
-        }
-
-        return _depositLegacy(assets, receiver, 0);
+        return _depositThroughBridge(assets, receiver, 0);
     }
 
     function instantWithdraw(
@@ -231,16 +202,15 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         if (params.mode == WithdrawMode.Instant) {
             if (msg.value != 0) revert UnexpectedNativeValue();
             assets = _instantWithdraw(params.shares, params.receiver);
+            if (params.minAssets > 0 && assets < params.minAssets) {
+                revert MinAssetsNotMet(assets, params.minAssets);
+            }
         } else {
             uint256 previewAssets = previewWithdraw(params.shares);
             if (params.minAssets > 0 && previewAssets < params.minAssets) {
                 revert MinAssetsNotMet(previewAssets, params.minAssets);
             }
             assets = _withdrawCrossChain(params.shares, params.receiver, msg.value);
-        }
-
-        if (params.minAssets > 0 && assets < params.minAssets) {
-            revert MinAssetsNotMet(assets, params.minAssets);
         }
     }
 
@@ -342,39 +312,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         return 0;
     }
 
-    function _depositLegacy(
-        uint256 assets,
-        address receiver,
-        uint256 minShares
-    ) internal returns (uint256 shares) {
-        if (assets == 0) revert InvalidAmount();
-        if (receiver == address(0)) revert ZeroAddress();
-
-        uint256 previewShares = previewDeposit(assets);
-        if (minShares > 0 && previewShares < minShares) {
-            revert MinSharesNotMet(previewShares, minShares);
-        }
-
-        asset.safeTransferFrom(msg.sender, address(this), assets);
-
-        asset.forceApprove(address(liquidityPool), assets);
-        liquidityPool.addLiquidity(assets);
-        asset.forceApprove(address(liquidityPool), 0);
-
-        bytes memory payload = MessageCodec.encodeDeposit(receiver, assets);
-        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
-
-        MessagingFee memory fee = _quote(hubEid, payload, options, false);
-        if (msg.value < fee.nativeFee) revert InsufficientFee();
-
-        MessagingReceipt memory receipt =
-            _lzSend(hubEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));
-
-        emit CrossChainDeposit(receiver, assets, 0, receipt.nonce);
-
-        return 0;
-    }
-
     function _notifyCreditUsed(uint256 amount) internal {
         bytes memory payload = MessageCodec.encodeCreditUsed(amount);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
@@ -438,16 +375,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     // ========== Configuration ==========
 
-    function setHubEid(uint32 /*_hubEid*/) external pure {
-        revert HubEidImmutable();
-    }
-
-    function setHubAdapter(address _hubAdapter) external onlyOwner {
-        if (_hubAdapter == address(0)) revert ZeroAddress();
-        emit HubAdapterUpdated(hubAdapter, _hubAdapter);
-        hubAdapter = _hubAdapter;
-    }
-
     function setSatelliteGateway(address _gateway) external onlyOwner {
         if (_gateway == address(0)) revert ZeroAddress();
         emit SatelliteGatewayUpdated(satelliteGateway, _gateway);
@@ -483,7 +410,6 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 }
 
 interface ISatelliteGateway {
-    function deposit(uint256 assets, address receiver, uint256 minShares) external payable;
     function depositFor(
         address payer,
         uint256 assets,

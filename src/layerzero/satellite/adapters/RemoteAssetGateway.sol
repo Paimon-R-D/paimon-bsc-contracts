@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {OApp, Origin, MessagingFee} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {MessagingFee} from "@layerzero-v2/oapp/contracts/oapp/OApp.sol";
 import {ILayerZeroComposer} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroComposer.sol";
 import {OFTComposeMsgCodec} from "@layerzero-v2/oapp/contracts/oft/libs/OFTComposeMsgCodec.sol";
 import {IStargate} from "../../interfaces/IStargateIntegration.sol";
 import {StargateComposeCodec} from "../../libraries/StargateComposeCodec.sol";
 import {LzOptionsLib} from "../../libraries/LzOptionsLib.sol";
 import {IRemoteProtocolImplementation} from "../../interfaces/IRemoteProtocolImplementation.sol";
+import {MessageCodec} from "../../libraries/MessageCodec.sol";
 
 /// @title RemoteAssetGateway
 /// @notice Receives USDT + deploy commands from Hub via Stargate compose,
 ///         executes DeFi operations, and bridges returns back to Hub
 /// @dev Deployed on each remote DeFi chain (ETH, ARB, Base, etc.)
-contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pausable {
+contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     // ========== Constants ==========
@@ -29,9 +30,6 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     // ========== State Variables ==========
-
-    /// @notice LayerZero endpoint address
-    address public immutable endpoint;
 
     /// @notice Stargate USDT pool on this chain
     address public immutable stargatePool;
@@ -80,16 +78,17 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
 
     // ========== Errors ==========
 
-    error OnlyEndpoint();
     error OnlyStargate();
+    error OnlyHub();
+    error UnexpectedSourceEid(uint32 srcEid);
     error UntrustedSource(address composeFrom);
     error UnknownAction(uint8 action);
+    error UnknownMessageType(bytes1 msgType);
     error ZeroAddress();
     error ZeroAmount();
     error ProtocolNotSupported();
     error InsufficientDeposit();
     error InvalidProtocolAmount(uint256 requested, uint256 actual);
-    error InsufficientGasBalance(uint256 available, uint256 required);
 
     // ========== Constructor ==========
 
@@ -100,7 +99,7 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         uint32 _hubEid,
         uint32 _thisEid,
         address _owner
-    ) Ownable(_owner) {
+    ) OApp(_endpoint, _owner) Ownable(_owner) {
         if (_endpoint == address(0)) revert ZeroAddress();
         if (_stargatePool == address(0)) revert ZeroAddress();
         if (_asset == address(0)) revert ZeroAddress();
@@ -108,7 +107,6 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         if (_thisEid == 0) revert ZeroAmount();
         if (_owner == address(0)) revert ZeroAddress();
 
-        endpoint = _endpoint;
         stargatePool = _stargatePool;
         asset = IERC20(_asset);
         hubEid = _hubEid;
@@ -126,11 +124,14 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         address /*_executor*/,
         bytes calldata /*_extraData*/
     ) external payable override nonReentrant whenNotPaused {
-        if (msg.sender != endpoint) revert OnlyEndpoint();
+        if (msg.sender != address(endpoint)) revert OnlyEndpoint(msg.sender);
         if (_from != stargatePool) revert OnlyStargate();
 
         uint256 amountLD = OFTComposeMsgCodec.amountLD(_message);
+        uint32 srcEid = OFTComposeMsgCodec.srcEid(_message);
         bytes memory composeMsg = OFTComposeMsgCodec.composeMsg(_message);
+
+        if (srcEid != hubEid) revert UnexpectedSourceEid(srcEid);
 
         // Verify compose sender is Hub composer
         bytes32 composeFromBytes = OFTComposeMsgCodec.composeFrom(_message);
@@ -143,6 +144,28 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
             _handleDeploy(amountLD, composeMsg);
         } else {
             revert UnknownAction(action);
+        }
+    }
+
+    // ========== LayerZero Receive ==========
+
+    function _lzReceive(
+        Origin calldata _origin,
+        bytes32, /*_guid*/
+        bytes calldata _payload,
+        address, /*_executor*/
+        bytes calldata /*_extraData*/
+    ) internal override whenNotPaused nonReentrant {
+        if (_origin.srcEid != hubEid) revert OnlyHub();
+
+        bytes1 msgType = MessageCodec.decodeMsgType(_payload);
+
+        if (msgType == MessageCodec.MSG_WITHDRAW_ASSET) {
+            _handleWithdrawCommand(_payload);
+        } else if (msgType == MessageCodec.MSG_HARVEST) {
+            _handleHarvestCommand(_payload);
+        } else {
+            revert UnknownMessageType(msgType);
         }
     }
 
@@ -176,54 +199,33 @@ contract RemoteAssetGateway is ILayerZeroComposer, Ownable, ReentrancyGuard, Pau
         emit DeployReceived(protocol, protocolName, deployedAmount);
     }
 
-    // ========== Keeper Functions ==========
-
-    /// @notice Withdraw from DeFi protocol and bridge USDT back to Hub
-    function withdrawAndBridge(
-        uint256 amount,
-        address protocol,
-        string calldata protocolName
-    ) external payable onlyOwner nonReentrant whenNotPaused {
+    function _handleWithdrawCommand(bytes calldata _payload) internal {
+        (uint256 amount, address protocol, string memory protocolName) =
+            MessageCodec.decodeAmountProtocolCommand(_payload);
         if (amount == 0) revert ZeroAmount();
         if (protocolDeposits[protocol] < amount) revert InsufficientDeposit();
 
         address implementation = protocolImplementations[protocolName];
         if (implementation == address(0)) revert ProtocolNotSupported();
 
-        // Withdraw from protocol
-        uint256 withdrawnAmount = IRemoteProtocolImplementation(implementation).withdraw(
-            address(asset), protocol, amount
-        );
+        uint256 withdrawnAmount = IRemoteProtocolImplementation(implementation).withdraw(address(asset), protocol, amount);
+        if (withdrawnAmount != amount) revert InvalidProtocolAmount(amount, withdrawnAmount);
 
-        // Safe subtraction: protocol may return more than deposited (interest)
-        if (withdrawnAmount >= protocolDeposits[protocol]) {
-            totalDeposited -= protocolDeposits[protocol];
-            protocolDeposits[protocol] = 0;
-        } else {
-            protocolDeposits[protocol] -= withdrawnAmount;
-            totalDeposited -= withdrawnAmount;
-        }
+        protocolDeposits[protocol] -= withdrawnAmount;
+        totalDeposited -= withdrawnAmount;
 
-        // Bridge back to Hub via Stargate
-        _bridgeToHub(withdrawnAmount, false, msg.value);
-
+        _bridgeOrQueueReturn(withdrawnAmount, false);
         emit WithdrawAndBridged(protocol, protocolName, withdrawnAmount);
     }
 
-    /// @notice Harvest yield from DeFi protocol and bridge to Hub
-    function harvestAndBridge(
-        address protocol,
-        string calldata protocolName
-    ) external payable onlyOwner nonReentrant whenNotPaused {
+    function _handleHarvestCommand(bytes calldata _payload) internal {
+        (address protocol, string memory protocolName) = MessageCodec.decodeHarvestCommand(_payload);
         address implementation = protocolImplementations[protocolName];
         if (implementation == address(0)) revert ProtocolNotSupported();
 
-        uint256 yieldAmount = IRemoteProtocolImplementation(implementation).harvest(
-            address(asset), protocol
-        );
-
+        uint256 yieldAmount = IRemoteProtocolImplementation(implementation).harvest(address(asset), protocol);
         if (yieldAmount > 0) {
-            _bridgeToHub(yieldAmount, true, msg.value);
+            _bridgeOrQueueReturn(yieldAmount, true);
         }
 
         emit HarvestAndBridged(protocol, protocolName, yieldAmount);

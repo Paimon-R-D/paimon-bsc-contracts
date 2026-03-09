@@ -10,7 +10,6 @@ import {PPTOFTAdapter} from "../../src/layerzero/hub/PPTOFTAdapter.sol";
 import {PPTSatellite} from "../../src/layerzero/satellite/PPTSatellite.sol";
 import {PPTOFT} from "../../src/layerzero/satellite/PPTOFT.sol";
 import {LiquidityPool} from "../../src/layerzero/satellite/LiquidityPool.sol";
-import {RemoteAssetAdapter} from "../../src/layerzero/satellite/adapters/RemoteAssetAdapter.sol";
 import {MessageCodec} from "../../src/layerzero/libraries/MessageCodec.sol";
 
 contract MockEndpoint {
@@ -86,42 +85,6 @@ contract MockAssetVaultWithSharePrice {
     }
 }
 
-contract MockRemoteProtocolImplementation {
-    address public lastAsset;
-    address public lastProtocol;
-    uint256 public lastAmount;
-    uint256 public harvestAmount;
-    uint256 public withdrawAmount;
-
-    function setWithdrawAmount(uint256 amount) external {
-        withdrawAmount = amount;
-    }
-
-    function setHarvestAmount(uint256 amount) external {
-        harvestAmount = amount;
-    }
-
-    function deploy(address asset, address protocol, uint256 amount) external returns (uint256 deployedAmount) {
-        lastAsset = asset;
-        lastProtocol = protocol;
-        lastAmount = amount;
-        return amount;
-    }
-
-    function withdraw(address asset, address protocol, uint256 amount) external returns (uint256 actualAmount) {
-        lastAsset = asset;
-        lastProtocol = protocol;
-        lastAmount = amount;
-        return withdrawAmount == 0 ? amount : withdrawAmount;
-    }
-
-    function harvest(address asset, address protocol) external returns (uint256 yieldAmount) {
-        lastAsset = asset;
-        lastProtocol = protocol;
-        return harvestAmount;
-    }
-}
-
 contract RecordingCreditManager is CreditManager {
     uint256 public sendCount;
     uint32 public lastDstEid;
@@ -164,6 +127,54 @@ contract MockHubStargateComposer {
         lastProtocol = protocol;
         lastProtocolName = protocolName;
         return bridgedAmount == 0 ? amount : bridgedAmount;
+    }
+}
+
+contract CrossChainAssetControllerHarness is CrossChainAssetController {
+    uint256 public sendCount;
+    uint32 public lastDstEid;
+    bytes public lastPayload;
+    uint256 public quotedNativeFee;
+
+    constructor(address endpoint_, address delegate_, address asset_)
+        CrossChainAssetController(endpoint_, delegate_, asset_)
+    {}
+
+    function setQuotedNativeFee(uint256 fee) external {
+        quotedNativeFee = fee;
+    }
+
+    function harnessReceive(Origin calldata origin, bytes calldata payload) external {
+        this.harnessReceiveCalldata(origin, payload, "");
+    }
+
+    function harnessReceiveCalldata(Origin calldata origin, bytes calldata payload, bytes calldata extraData)
+        external
+        pure
+    {
+        _lzReceive(origin, bytes32(0), payload, address(0), extraData);
+    }
+
+    function _quote(
+        uint32,
+        bytes memory,
+        bytes memory,
+        bool
+    ) internal view override returns (MessagingFee memory fee) {
+        return MessagingFee({nativeFee: quotedNativeFee, lzTokenFee: 0});
+    }
+
+    function _lzSend(
+        uint32 dstEid,
+        bytes memory message,
+        bytes memory,
+        MessagingFee memory fee,
+        address
+    ) internal override returns (MessagingReceipt memory receipt) {
+        sendCount++;
+        lastDstEid = dstEid;
+        lastPayload = message;
+        return MessagingReceipt({guid: bytes32(sendCount), nonce: uint64(sendCount), fee: fee});
     }
 }
 
@@ -270,44 +281,6 @@ contract PPTOFTAdapterHarness is PPTOFTAdapter {
     }
 }
 
-contract RemoteAssetAdapterHarness is RemoteAssetAdapter {
-    uint256 public sendCount;
-    bytes public lastPayload;
-
-    constructor(address endpoint_, address delegate_, address asset_, uint32 hubEid_)
-        RemoteAssetAdapter(endpoint_, delegate_, asset_, hubEid_)
-    {}
-
-    function harnessReceive(bytes calldata payload) external {
-        this.harnessReceiveCalldata(Origin({srcEid: hubEid, sender: bytes32(0), nonce: 0}), payload, "");
-    }
-
-    function harnessReceiveCalldata(Origin calldata origin, bytes calldata payload, bytes calldata extraData) external {
-        _lzReceive(origin, bytes32(0), payload, address(0), extraData);
-    }
-
-    function _quote(
-        uint32,
-        bytes memory,
-        bytes memory,
-        bool
-    ) internal pure override returns (MessagingFee memory fee) {
-        return MessagingFee({nativeFee: 0, lzTokenFee: 0});
-    }
-
-    function _lzSend(
-        uint32,
-        bytes memory message,
-        bytes memory,
-        MessagingFee memory _fee,
-        address
-    ) internal override returns (MessagingReceipt memory receipt) {
-        sendCount++;
-        lastPayload = message;
-        return MessagingReceipt({guid: bytes32(sendCount), nonce: uint64(sendCount), fee: _fee});
-    }
-}
-
 contract LayerZeroRuntimeFixesTest is Test {
     uint32 internal constant REMOTE_EID = 30101;
     uint32 internal constant HUB_EID = 30102;
@@ -386,30 +359,33 @@ contract LayerZeroRuntimeFixesTest is Test {
 
         controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
         controller.setHubStargateComposer(address(composer));
-        controller.setStargateManagedChain(REMOTE_EID, true);
 
         asset.mint(address(controller), 100 ether);
         composer.setBridgedAmount(82 ether);
 
         controller.deployViaBridge(REMOTE_EID, 100 ether, protocol, "aave");
 
-        assertEq(controller.pendingDeploys(REMOTE_EID), 0);
-        assertEq(controller.deployedAssets(REMOTE_EID), 0);
-        assertEq(controller.protocolAllocation(REMOTE_EID, protocol), 0);
         assertEq(controller.bridgedDeployedAssets(REMOTE_EID), 82 ether);
-        assertEq(controller.getTotalDeployedAssets(), 82 ether);
+        assertEq(controller.totalBridgedDeployed(), 82 ether);
     }
 
-    function test_CrossChainAssetController_RejectsLegacyWithdrawAndHarvestForStargateManagedChain() public {
-        CrossChainAssetController controller = new CrossChainAssetController(address(endpoint), address(this), address(asset));
+    function test_CrossChainAssetController_UsesGatewayControlPlaneForSupportedChains() public {
+        CrossChainAssetControllerHarness controller =
+            new CrossChainAssetControllerHarness(address(endpoint), address(this), address(asset));
+        address protocol = address(0xA11CE);
+
         controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
-        controller.setStargateManagedChain(REMOTE_EID, true);
+        controller.setQuotedNativeFee(0.05 ether);
 
-        vm.expectRevert(CrossChainAssetController.UseRemoteGatewayControl.selector);
-        controller.withdrawFromRemote(REMOTE_EID, 10 ether, address(0xA11CE), "aave");
+        controller.withdrawFromRemote{value: 0.05 ether}(REMOTE_EID, 10 ether, protocol, "aave");
+        assertEq(controller.sendCount(), 1);
+        assertEq(controller.lastDstEid(), REMOTE_EID);
+        assertEq(controller.lastPayload(), MessageCodec.encodeWithdrawAsset(10 ether, protocol, "aave"));
 
-        vm.expectRevert(CrossChainAssetController.UseRemoteGatewayControl.selector);
-        controller.harvestYield(REMOTE_EID, address(0xA11CE), "aave");
+        controller.harvestYield{value: 0.05 ether}(REMOTE_EID, protocol, "aave");
+        assertEq(controller.sendCount(), 2);
+        assertEq(controller.lastDstEid(), REMOTE_EID);
+        assertEq(controller.lastPayload(), MessageCodec.encodeHarvest(protocol, "aave"));
     }
 
     function test_CrossChainAssetController_RecordBridgedReturn_ReducesBridgeAccounting() public {
@@ -419,7 +395,6 @@ contract LayerZeroRuntimeFixesTest is Test {
 
         controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
         controller.setHubStargateComposer(address(composer));
-        controller.setStargateManagedChain(REMOTE_EID, true);
 
         asset.mint(address(controller), 100 ether);
         composer.setBridgedAmount(90 ether);
@@ -429,7 +404,19 @@ contract LayerZeroRuntimeFixesTest is Test {
         controller.recordBridgedReturn(REMOTE_EID, 25 ether, false);
 
         assertEq(controller.bridgedDeployedAssets(REMOTE_EID), 65 ether);
-        assertEq(controller.getTotalDeployedAssets(), 65 ether);
+        assertEq(controller.totalBridgedDeployed(), 65 ether);
+    }
+
+    function test_CrossChainAssetController_DisablesLegacyInboundMessages() public {
+        CrossChainAssetControllerHarness controller =
+            new CrossChainAssetControllerHarness(address(endpoint), address(this), address(asset));
+
+        controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
+        vm.expectRevert(CrossChainAssetController.InboundMessagesDisabled.selector);
+        controller.harnessReceive(
+            Origin({srcEid: REMOTE_EID, sender: bytes32(0), nonce: 0}),
+            MessageCodec.encodeHarvest(address(0xA11CE), "aave")
+        );
     }
 
     function test_CrossChainAssetController_RemoveSupportedChain_RevertsWhenBridgedAssetsExist() public {
@@ -438,7 +425,6 @@ contract LayerZeroRuntimeFixesTest is Test {
 
         controller.addSupportedChain(REMOTE_EID, address(0xBEEF));
         controller.setHubStargateComposer(address(composer));
-        controller.setStargateManagedChain(REMOTE_EID, true);
 
         asset.mint(address(controller), 100 ether);
         composer.setBridgedAmount(80 ether);
@@ -537,6 +523,54 @@ contract LayerZeroRuntimeFixesTest is Test {
         assertEq(satellite.lastPayload(), MessageCodec.encodeCreditRestored(12 ether));
     }
 
+    function test_PPTSatellite_WithdrawWithParams_CrossChainOnlyChecksPreviewMinAssets() public {
+        address user = address(0xCAFE);
+        PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
+        LiquidityPool pool = new LiquidityPool(address(asset), address(this));
+        PPTSatelliteHarness satellite =
+            new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+
+        pptOft.mint(user, 10 ether);
+        vm.prank(user);
+        pptOft.approve(address(satellite), 10 ether);
+
+        satellite.setQuotedNativeFee(0.05 ether);
+        vm.deal(user, 1 ether);
+
+        PPTSatellite.WithdrawParams memory params = PPTSatellite.WithdrawParams({
+            shares: 10 ether,
+            receiver: user,
+            minAssets: 10 ether,
+            mode: PPTSatellite.WithdrawMode.CrossChain
+        });
+
+        vm.prank(user);
+        uint256 assetsReceived = satellite.withdrawWithParams{value: 0.05 ether}(params);
+
+        assertEq(assetsReceived, 0);
+        assertEq(satellite.sendCount(), 1);
+        assertEq(satellite.lastDstEid(), HUB_EID);
+        assertEq(satellite.lastPayload(), MessageCodec.encodeWithdraw(user, 10 ether));
+    }
+
+    function test_PPTSatellite_DepositRequiresBridgeGateway() public {
+        PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
+        LiquidityPool pool = new LiquidityPool(address(asset), address(this));
+        PPTSatelliteHarness satellite =
+            new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+        address user = address(0xCAFE);
+
+        pool.setSatellite(address(satellite));
+        satellite.setQuotedNativeFee(0.01 ether);
+        asset.mint(user, 25 ether);
+
+        vm.startPrank(user);
+        asset.approve(address(satellite), 25 ether);
+        vm.expectRevert(PPTSatellite.ZeroAddress.selector);
+        satellite.deposit{value: 0.01 ether}(25 ether, user);
+        vm.stopPrank();
+    }
+
     function test_PPTSatelliteDepositFlow_DoesNotAllowArbitraryLiquidityProviders() public {
         LiquidityPool pool = new LiquidityPool(address(asset), address(this));
         pool.setSatellite(address(0xBEEF));
@@ -594,7 +628,7 @@ contract LayerZeroRuntimeFixesTest is Test {
         assertEq(redemptionManager.lastShares(), 25 ether);
     }
 
-    function test_PPTOFTAdapter_AutoSyncsSharePriceAfterSatelliteDeposit() public {
+    function test_PPTOFTAdapter_DisablesLegacySatelliteDepositMessages() public {
         MockToken assetToken = new MockToken("Hub Asset", "hUSDT");
         MockAssetVaultWithSharePrice vault = new MockAssetVaultWithSharePrice(address(assetToken), 1.125 ether, 1);
         PPTOFTAdapterHarness adapter = new PPTOFTAdapterHarness(address(assetToken), address(endpoint), address(this));
@@ -607,11 +641,8 @@ contract LayerZeroRuntimeFixesTest is Test {
         vm.deal(address(adapter), 1 ether);
         assetToken.mint(address(adapter), 50 ether);
 
+        vm.expectRevert(abi.encodeWithSelector(PPTOFTAdapter.UnknownMessageType.selector, MessageCodec.MSG_DEPOSIT));
         adapter.harnessReceiveTyped(REMOTE_EID, peer, MessageCodec.encodeDeposit(receiver, 25 ether));
-
-        assertEq(adapter.sendCount(), 2);
-        assertEq(adapter.lastDstEid(), REMOTE_EID);
-        assertEq(adapter.lastPayload(), MessageCodec.encodeSharePriceUpdate(1.125 ether));
     }
 
     function test_PPTOFTAdapter_RoutesCreditUsedMessagesIntoCreditManager() public {
@@ -701,28 +732,4 @@ contract LayerZeroRuntimeFixesTest is Test {
         assertEq(sharePrice, 1.4 ether);
     }
 
-    function test_RemoteAssetAdapter_UsesConfiguredProtocolImplementation() public {
-        RemoteAssetAdapterHarness adapter =
-            new RemoteAssetAdapterHarness(address(endpoint), address(this), address(asset), HUB_EID);
-        MockRemoteProtocolImplementation implementation = new MockRemoteProtocolImplementation();
-        address protocol = address(0xA11CE);
-
-        adapter.setProtocolImplementation("aave", address(implementation));
-        implementation.setWithdrawAmount(40 ether);
-        implementation.setHarvestAmount(7 ether);
-
-        adapter.harnessReceive(MessageCodec.encodeDeploy(50 ether, protocol, "aave"));
-        assertEq(adapter.protocolDeposits(protocol), 50 ether);
-        assertEq(adapter.totalDeposited(), 50 ether);
-        assertEq(implementation.lastAmount(), 50 ether);
-
-        adapter.harnessReceive(MessageCodec.encodeWithdrawAsset(40 ether, protocol, "aave"));
-        assertEq(adapter.protocolDeposits(protocol), 10 ether);
-        assertEq(adapter.totalDeposited(), 10 ether);
-        assertEq(_decodeAmount(adapter.lastPayload()), 40 ether);
-
-        adapter.harnessReceive(MessageCodec.encodeHarvest(protocol, "aave"));
-        assertEq(adapter.sendCount(), 2);
-        assertEq(_decodeAmount(adapter.lastPayload()), 7 ether);
-    }
 }

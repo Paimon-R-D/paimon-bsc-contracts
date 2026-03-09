@@ -9,17 +9,15 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICreditManager} from "../interfaces/ICreditManager.sol";
 import {ILayerZeroComposer} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroComposer.sol";
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IPPT, IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 import {MessageCodec} from "../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
-import {LayerZeroErrors} from "../libraries/LayerZeroErrors.sol";
 
 /// @title PPTOFTAdapter
 /// @notice OFT Adapter for PPT token on BSC Hub chain
 /// @dev Wraps existing PPT ERC20 into LayerZero OFT using lock/unlock mechanism.
-///      Handles both standard OFT messages and typed Satellite deposit/withdraw messages.
+///      Handles standard OFT messages plus typed satellite withdraw/redeem/credit messages.
 contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     using SafeERC20 for IERC20;
 
@@ -29,8 +27,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     uint16 public constant MSG_TYPE_SEND_AND_CALL = 2;
 
     bytes1 public constant COMPOSE_MSG_REDEEM = 0x01;
-    bytes1 public constant COMPOSE_MSG_DEPOSIT = 0x02;
-
     uint8 public constant SHARED_DECIMALS = 6;
 
     uint128 public constant DEFAULT_GAS_LIMIT = 200000;
@@ -95,20 +91,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 requestId
     );
 
-    event CrossChainDepositProcessed(
-        bytes32 indexed guid,
-        address indexed receiver,
-        uint256 assets,
-        uint256 shares
-    );
-
-    event SatelliteDepositProcessed(
-        uint32 indexed srcEid,
-        address indexed receiver,
-        uint256 assets,
-        uint256 shares
-    );
-
     event SatelliteWithdrawProcessed(
         uint32 indexed srcEid,
         address indexed receiver,
@@ -127,6 +109,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     error InvalidComposer();
     error InvalidComposeMessage();
     error InvalidPeer(uint32 srcEid, bytes32 sender);
+    error UnknownMessageType(bytes1 msgType);
     error ZeroAddress();
 
     modifier onlyOwnerOrCreditManager() {
@@ -237,9 +220,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         // Typed message from Satellite: first byte is message type
         bytes1 msgType = MessageCodec.decodeMsgType(_payload);
 
-        if (msgType == MessageCodec.MSG_DEPOSIT) {
-            _handleSatelliteDeposit(_origin, _payload);
-        } else if (msgType == MessageCodec.MSG_WITHDRAW) {
+        if (msgType == MessageCodec.MSG_WITHDRAW) {
             _handleSatelliteWithdraw(_origin, _payload);
         } else if (msgType == MessageCodec.MSG_REDEEM) {
             _handleSatelliteRedemption(_origin, _payload);
@@ -248,7 +229,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         } else if (msgType == MessageCodec.MSG_CREDIT_RESTORED) {
             _handleSatelliteCreditRestored(_origin, _payload);
         } else {
-            revert LayerZeroErrors.UnknownMessageType(msgType);
+            revert UnknownMessageType(msgType);
         }
     }
 
@@ -270,8 +251,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
         if (msgType == COMPOSE_MSG_REDEEM) {
             _handleRedemption(_guid, _message[1:]);
-        } else if (msgType == COMPOSE_MSG_DEPOSIT) {
-            _handleDeposit(_guid, _message[1:]);
         } else {
             revert InvalidComposeMessage();
         }
@@ -311,40 +290,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
     function _bytes32ToAddress(bytes32 _b) internal pure returns (address) {
         return address(uint160(uint256(_b)));
-    }
-
-    /// @notice Handle satellite deposit: deposit to vault, send mint shares back
-    /// @dev Uses pending mint queue to prevent nonce blocking on insufficient gas
-    function _handleSatelliteDeposit(Origin calldata _origin, bytes calldata _payload) internal {
-        (address receiver, uint256 assets) = MessageCodec.decodeAddressAndAmount(_payload);
-
-        if (vault == address(0)) revert ZeroAddress();
-        if (receiver == address(0)) revert ZeroAddress();
-        if (assets == 0) revert InvalidAmount();
-
-        // Approve vault and deposit (forceApprove for USDT compatibility)
-        innerToken.forceApprove(vault, assets);
-        uint256 shares = IERC4626(vault).deposit(assets, address(this));
-        innerToken.forceApprove(vault, 0);
-
-        // Try to send mint shares message back to satellite
-        bytes memory mintPayload = MessageCodec.encodeMintShares(receiver, shares);
-        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
-
-        MessagingFee memory fee = _quote(_origin.srcEid, mintPayload, options, false);
-
-        if (address(this).balance >= fee.nativeFee) {
-            _lzSend(_origin.srcEid, mintPayload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
-        } else {
-            // Store for keeper retry to prevent nonce blocking
-            uint256 mintId = pendingMintCount++;
-            pendingMints[mintId] = PendingMint(_origin.srcEid, receiver, shares);
-            emit PendingMintStored(mintId, _origin.srcEid, receiver, shares);
-        }
-
-        _queueOrSendSharePrice(_origin.srcEid);
-
-        emit SatelliteDepositProcessed(_origin.srcEid, receiver, assets, shares);
     }
 
     /// @notice Flush a pending mint that was stored due to insufficient gas
@@ -451,21 +396,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         creditManager.restoreCredit(_origin.srcEid, amount);
 
         emit SatelliteCreditRestored(_origin.srcEid, amount);
-    }
-
-    /// @notice Handle cross-chain deposit
-    function _handleDeposit(bytes32 _guid, bytes calldata _data) internal {
-        (address receiver, uint256 assets) = abi.decode(_data, (address, uint256));
-
-        if (vault == address(0)) revert InvalidComposeMessage();
-        if (receiver == address(0)) revert ZeroAddress();
-        if (assets == 0) revert InvalidAmount();
-
-        innerToken.forceApprove(vault, assets);
-        uint256 shares = IERC4626(vault).deposit(assets, receiver);
-        innerToken.forceApprove(vault, 0);
-
-        emit CrossChainDepositProcessed(_guid, receiver, assets, shares);
     }
 
     // ========== Stargate Composer Integration ==========
