@@ -454,6 +454,7 @@ contract LayerZeroRuntimeFixesTest is Test {
         LiquidityPool pool = new LiquidityPool(address(asset), address(this));
         PPTSatelliteHarness satellite =
             new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+        satellite.setSharePrice(1e18);
 
         pool.setSatellite(address(satellite));
         asset.mint(address(this), 100 ether);
@@ -483,6 +484,7 @@ contract LayerZeroRuntimeFixesTest is Test {
         LiquidityPool pool = new LiquidityPool(address(asset), address(this));
         PPTSatelliteHarness satellite =
             new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+        satellite.setSharePrice(1e18);
 
         pool.setSatellite(address(satellite));
         asset.mint(address(this), 100 ether);
@@ -569,6 +571,68 @@ contract LayerZeroRuntimeFixesTest is Test {
         vm.expectRevert(PPTSatellite.ZeroAddress.selector);
         satellite.deposit{value: 0.01 ether}(25 ether, user);
         vm.stopPrank();
+    }
+
+    function test_PPTSatellite_InstantWithdraw_RevertsWhenSharePriceUninitialized() public {
+        address user = address(0xCAFE);
+        PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
+        LiquidityPool pool = new LiquidityPool(address(asset), address(this));
+        PPTSatelliteHarness satellite =
+            new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+
+        pool.setSatellite(address(satellite));
+        asset.mint(address(this), 100 ether);
+        asset.approve(address(pool), 100 ether);
+        pool.addLiquidity(100 ether);
+        pool.updateCredit(100 ether);
+        pptOft.mint(user, 10 ether);
+        vm.prank(user);
+        pptOft.approve(address(satellite), 10 ether);
+
+        vm.expectRevert(PPTSatellite.SharePriceUninitialized.selector);
+        vm.prank(user);
+        satellite.instantWithdraw(10 ether, user);
+    }
+
+    function test_PPTSatellite_InstantWithdraw_RevertsWhenSharePriceStale() public {
+        address user = address(0xCAFE);
+        PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
+        LiquidityPool pool = new LiquidityPool(address(asset), address(this));
+        PPTSatelliteHarness satellite =
+            new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+        satellite.setSharePrice(1e18);
+
+        pool.setSatellite(address(satellite));
+        asset.mint(address(this), 100 ether);
+        asset.approve(address(pool), 100 ether);
+        pool.addLiquidity(100 ether);
+        pool.updateCredit(100 ether);
+        pptOft.mint(user, 10 ether);
+        vm.prank(user);
+        pptOft.approve(address(satellite), 10 ether);
+
+        uint256 staleness = satellite.maxSharePriceStaleness();
+        vm.warp(block.timestamp + staleness + 1);
+
+        vm.expectRevert();
+        vm.prank(user);
+        satellite.instantWithdraw(10 ether, user);
+    }
+
+    function test_PPTSatellite_IsSharePriceFresh_TracksInitializationAndStaleness() public {
+        PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
+        LiquidityPool pool = new LiquidityPool(address(asset), address(this));
+        PPTSatelliteHarness satellite =
+            new PPTSatelliteHarness(address(endpoint), address(this), address(pptOft), address(pool), address(asset), HUB_EID);
+
+        assertFalse(satellite.isSharePriceFresh());
+
+        satellite.setSharePrice(1e18);
+        assertTrue(satellite.isSharePriceFresh());
+
+        uint256 staleness = satellite.maxSharePriceStaleness();
+        vm.warp(block.timestamp + staleness + 1);
+        assertFalse(satellite.isSharePriceFresh());
     }
 
     function test_PPTSatelliteDepositFlow_DoesNotAllowArbitraryLiquidityProviders() public {

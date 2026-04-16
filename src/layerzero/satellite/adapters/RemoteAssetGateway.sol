@@ -209,7 +209,10 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
         if (implementation == address(0)) revert ProtocolNotSupported();
 
         uint256 withdrawnAmount = IRemoteProtocolImplementation(implementation).withdraw(address(asset), protocol, amount);
-        if (withdrawnAmount != amount) revert InvalidProtocolAmount(amount, withdrawnAmount);
+        // Accept withdrawnAmount <= amount to tolerate routine 1-wei rounding in
+        // index-based protocols (Aave liquidityIndex, Compound exchangeRate, Curve fees).
+        // Only over-withdrawal signals an adapter bug or unauthorized withdrawal.
+        if (withdrawnAmount > amount) revert InvalidProtocolAmount(amount, withdrawnAmount);
 
         protocolDeposits[protocol] -= withdrawnAmount;
         totalDeposited -= withdrawnAmount;
@@ -247,7 +250,7 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
         if (hubComposer == address(0)) revert ZeroAddress();
 
         // Encode this chain's EID so Hub can update the correct chain's NAV
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(thisEid, isYield);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(isYield);
         bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_RETURN);
         uint256 minAmount = _calcMinAmount(amount);
 
@@ -287,7 +290,7 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
     function _quoteBridgeFee(uint256 amount, bool isYield) internal view returns (uint256 nativeFee) {
         if (hubComposer == address(0)) revert ZeroAddress();
 
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(thisEid, isYield);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(isYield);
         bytes memory options = LzOptionsLib.buildComposeOptions(STARGATE_RECEIVE_GAS, COMPOSE_GAS_RETURN);
         uint256 minAmount = _calcMinAmount(amount);
 

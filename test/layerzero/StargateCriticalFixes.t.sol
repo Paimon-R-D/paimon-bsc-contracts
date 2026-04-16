@@ -251,6 +251,7 @@ contract StargateCriticalFixesTest is Test {
         gateway.setHubComposer(HUB_COMPOSER);
         gateway.setDepositForwarder(address(satellite));
         satellite.setSatelliteGateway(address(gateway));
+        satellite.setSharePrice(1e18);
 
         uint256 amount = 1_000e6;
         usdt.mint(USER, amount);
@@ -340,7 +341,7 @@ contract StargateCriticalFixesTest is Test {
         uint256 amount = 200e6;
         usdt.mint(address(composer), amount);
 
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(false);
         bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_REMOTE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);
@@ -642,7 +643,7 @@ contract StargateCriticalFixesTest is Test {
         uint256 amount = 90e6;
         usdt.mint(address(composer), amount);
 
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(false);
         bytes memory fullMessage = _buildComposeMessage(ETH_EID, amount, ETH_REMOTE_GATEWAY, composeMsg);
 
         vm.prank(endpoint);

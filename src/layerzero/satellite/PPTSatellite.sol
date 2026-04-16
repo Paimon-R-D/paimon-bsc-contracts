@@ -22,6 +22,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     uint256 public constant MAX_INSTANT_WITHDRAW_FEE = 1000;
     uint128 public constant DEFAULT_GAS_LIMIT = 300000;
+    uint256 public constant DEFAULT_MAX_SHARE_PRICE_STALENESS = 1 hours;
 
     enum WithdrawMode {
         CrossChain,
@@ -55,6 +56,16 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     /// @dev Price per share in asset terms, scaled by 1e18
     uint256 public sharePrice = 1e18;
 
+    /// @notice Whether `sharePrice` has ever been set by Hub or owner
+    /// @dev Guards against the uninitialized default of 1e18 being used to price state-changing flows
+    bool public sharePriceInitialized;
+
+    /// @notice Timestamp of the last sharePrice update
+    uint256 public sharePriceLastUpdate;
+
+    /// @notice Max age of sharePrice considered fresh for state-changing flows
+    uint256 public maxSharePriceStaleness = DEFAULT_MAX_SHARE_PRICE_STALENESS;
+
     /// @notice Pending credit utilization notices that could not be sent due to insufficient native gas
     mapping(uint256 => uint256) public pendingCreditUsed;
     uint256 public pendingCreditUsedCount;
@@ -71,6 +82,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     event SatelliteGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event InstantWithdrawFeeUpdated(uint256 oldFee, uint256 newFee);
     event SharePriceUpdated(uint256 oldPrice, uint256 newPrice);
+    event MaxSharePriceStalenessUpdated(uint256 oldStaleness, uint256 newStaleness);
     event PendingCreditUsedStored(uint256 indexed pendingId, uint256 amount);
     event PendingCreditUsedFlushed(uint256 indexed pendingId, uint256 amount);
     event PendingCreditRestoredStored(uint256 indexed pendingId, uint256 amount);
@@ -91,6 +103,9 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     error UnknownPendingCredit(uint256 pendingId);
     error UnknownPendingCreditRestore(uint256 pendingId);
     error OnlySatelliteGateway(address caller);
+    error SharePriceUninitialized();
+    error SharePriceStale(uint256 age, uint256 maxStaleness);
+    error InvalidStaleness();
 
     // ========== Constructor ==========
 
@@ -128,6 +143,13 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         assets = grossAssets - fee;
 
         available = assets <= liquidityPool.availableLiquidity();
+    }
+
+    /// @notice Whether the cached sharePrice is initialized and within the staleness window
+    /// @dev Frontends should gate deposit/instantWithdraw UIs on this flag
+    function isSharePriceFresh() external view returns (bool) {
+        if (!sharePriceInitialized) return false;
+        return block.timestamp - sharePriceLastUpdate <= maxSharePriceStaleness;
     }
 
     // ========== Quote Functions ==========
@@ -174,6 +196,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     function _instantWithdraw(uint256 shares, address receiver) internal returns (uint256 assets) {
         if (shares == 0) revert InvalidAmount();
+        _requireFreshSharePrice();
 
         uint256 grossAssets = previewWithdraw(shares);
         uint256 fee = (grossAssets * instantWithdrawFeeBps) / 10000;
@@ -287,6 +310,14 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         if (newPrice == 0) revert InvalidSharePrice();
         emit SharePriceUpdated(sharePrice, newPrice);
         sharePrice = newPrice;
+        sharePriceInitialized = true;
+        sharePriceLastUpdate = block.timestamp;
+    }
+
+    function _requireFreshSharePrice() internal view {
+        if (!sharePriceInitialized) revert SharePriceUninitialized();
+        uint256 age = block.timestamp - sharePriceLastUpdate;
+        if (age > maxSharePriceStaleness) revert SharePriceStale(age, maxSharePriceStaleness);
     }
 
     function _depositThroughBridge(
@@ -296,6 +327,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     ) internal returns (uint256) {
         if (assets == 0) revert InvalidAmount();
         if (satelliteGateway == address(0)) revert ZeroAddress();
+        _requireFreshSharePrice();
 
         asset.safeTransferFrom(msg.sender, address(this), assets);
         asset.forceApprove(satelliteGateway, assets);
@@ -388,9 +420,13 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     }
 
     function setSharePrice(uint256 _sharePrice) external onlyOwner {
-        if (_sharePrice == 0) revert InvalidSharePrice();
-        emit SharePriceUpdated(sharePrice, _sharePrice);
-        sharePrice = _sharePrice;
+        _updateSharePrice(_sharePrice);
+    }
+
+    function setMaxSharePriceStaleness(uint256 _staleness) external onlyOwner {
+        if (_staleness == 0) revert InvalidStaleness();
+        emit MaxSharePriceStalenessUpdated(maxSharePriceStaleness, _staleness);
+        maxSharePriceStaleness = _staleness;
     }
 
     function setPaused(bool _paused) external onlyOwner {

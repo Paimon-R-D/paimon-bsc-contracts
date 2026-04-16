@@ -182,7 +182,7 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
         if (action == StargateComposeCodec.ACTION_DEPOSIT) {
             _handleDeposit(srcEid, amountLD, composeMsg, _guid);
         } else if (action == StargateComposeCodec.ACTION_RETURN) {
-            _handleReturn(amountLD, composeMsg);
+            _handleReturn(srcEid, amountLD, composeMsg);
         } else {
             revert UnknownAction(action);
         }
@@ -231,8 +231,9 @@ contract HubStargateComposer is ILayerZeroComposer, AccessControl, ReentrancyGua
     }
 
     /// @notice Handle return from remote deployment (withdraw or yield)
-    function _handleReturn(uint256 amount, bytes memory composeMsg) internal {
-        (uint32 srcEid, bool isYield) = StargateComposeCodec.decodeReturn(composeMsg);
+    /// @param srcEid LayerZero-authenticated source endpoint id from the outer Stargate header
+    function _handleReturn(uint32 srcEid, uint256 amount, bytes memory composeMsg) internal {
+        bool isYield = StargateComposeCodec.decodeReturn(composeMsg);
         if (address(vault) == address(0)) revert ZeroAddress();
 
         asset.safeTransfer(address(vault), amount);

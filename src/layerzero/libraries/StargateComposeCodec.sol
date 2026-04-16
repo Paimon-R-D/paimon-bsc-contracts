@@ -41,10 +41,12 @@ library StargateComposeCodec {
     }
 
     /// @notice Encode return compose: RemoteAssetGateway → HubComposer
-    /// @param srcEid The source chain where assets were withdrawn/harvested
     /// @param isYield Whether this is yield (true) or withdrawal return (false)
-    function encodeReturn(uint32 srcEid, bool isYield) internal pure returns (bytes memory) {
-        return abi.encodePacked(ACTION_RETURN, abi.encode(srcEid, isYield));
+    /// @dev The source chain is derived from the LayerZero-authenticated outer srcEid
+    ///      on the Hub side; redundantly carrying it in the payload allowed a compromised
+    ///      gateway to forge cross-chain NAV accounting.
+    function encodeReturn(bool isYield) internal pure returns (bytes memory) {
+        return abi.encodePacked(ACTION_RETURN, abi.encode(isYield));
     }
 
     /// @notice Encode replenish compose: HubComposer → SatelliteGateway
@@ -87,12 +89,8 @@ library StargateComposeCodec {
     }
 
     /// @notice Decode return params
-    function decodeReturn(bytes memory composeMsg)
-        internal
-        pure
-        returns (uint32 srcEid, bool isYield)
-    {
-        return abi.decode(_stripAction(composeMsg), (uint32, bool));
+    function decodeReturn(bytes memory composeMsg) internal pure returns (bool isYield) {
+        return abi.decode(_stripAction(composeMsg), (bool));
     }
 
     // ========== Internal ==========

@@ -270,15 +270,13 @@ contract StargateCodecTest is Test {
     }
 
     function test_EncodeDecodeReturn() public pure {
-        uint32 srcEid = 30101;
         bool isYield = true;
 
-        bytes memory encoded = StargateComposeCodec.encodeReturn(srcEid, isYield);
+        bytes memory encoded = StargateComposeCodec.encodeReturn(isYield);
         uint8 action = StargateComposeCodec.decodeAction(encoded);
-        (uint32 decodedEid, bool decodedIsYield) = StargateComposeCodec.decodeReturn(encoded);
+        bool decodedIsYield = StargateComposeCodec.decodeReturn(encoded);
 
         assertEq(action, StargateComposeCodec.ACTION_RETURN);
-        assertEq(decodedEid, srcEid);
         assertEq(decodedIsYield, isYield);
     }
 
@@ -498,13 +496,37 @@ contract HubStargateComposerTest is Test {
         uint256 returnAmount = 200e6;
         usdt.mint(address(composer), returnAmount);
 
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(false);
         bytes memory fullMessage = _buildComposeMessage(ETH_EID, returnAmount, REMOTE_GATEWAY, composeMsg);
 
         vm.prank(mockEndpoint);
         composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
 
         assertEq(navReporter.remoteDeployments(ETH_EID), 300e6);
+    }
+
+    function test_HandleReturn_UsesOuterSrcEidForAccounting_NotInnerPayload() public {
+        uint32 ARB_EID = 30110;
+        address ARB_GATEWAY = address(0x9ABC);
+        navReporter.addChain(ARB_EID);
+        composer.setRemoteAssetGateway(ARB_EID, ARB_GATEWAY);
+        navReporter.recordDeploy(ETH_EID, 500e6);
+        navReporter.recordDeploy(ARB_EID, 700e6);
+
+        uint256 returnAmount = 200e6;
+        usdt.mint(address(composer), returnAmount);
+
+        // Return originates from ARB's authenticated gateway and outer srcEid.
+        // After bug_001 fix, the payload no longer carries a srcEid: the composer
+        // credits ARB solely from the LayerZero-authenticated outer header.
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(false);
+        bytes memory fullMessage = _buildComposeMessage(ARB_EID, returnAmount, ARB_GATEWAY, composeMsg);
+
+        vm.prank(mockEndpoint);
+        composer.lzCompose{value: 0}(address(stargatePool), bytes32(0), fullMessage, address(0), "");
+
+        assertEq(navReporter.remoteDeployments(ARB_EID), 500e6);
+        assertEq(navReporter.remoteDeployments(ETH_EID), 500e6);
     }
 
     function test_SettleAndBridge_SendsViaSargate() public {
@@ -557,7 +579,7 @@ contract HubStargateComposerTest is Test {
     }
 
     function test_RevertOnReturnFromSatelliteGateway() public {
-        bytes memory composeMsg = StargateComposeCodec.encodeReturn(ETH_EID, false);
+        bytes memory composeMsg = StargateComposeCodec.encodeReturn(false);
         bytes memory fullMessage = _buildComposeMessage(ETH_EID, 100e6, SATELLITE_GATEWAY, composeMsg);
 
         vm.prank(mockEndpoint);
