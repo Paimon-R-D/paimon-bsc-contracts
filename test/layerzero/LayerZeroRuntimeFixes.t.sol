@@ -448,7 +448,7 @@ contract LayerZeroRuntimeFixesTest is Test {
         assertEq(pool.credit(), 80);
     }
 
-    function test_PPTSatellite_InstantWithdraw_SendsCreditUsedMessageWhenFunded() public {
+    function test_PPTSatellite_InstantWithdraw_SendsInstantWithdrawSettledMessageWhenFunded() public {
         address user = address(0xCAFE);
         PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
         LiquidityPool pool = new LiquidityPool(address(asset), address(this));
@@ -474,11 +474,12 @@ contract LayerZeroRuntimeFixesTest is Test {
 
         assertEq(satellite.sendCount(), 1);
         assertEq(satellite.lastDstEid(), HUB_EID);
-        assertEq(satellite.lastPayload(), MessageCodec.encodeCreditUsed(10 ether));
+        // [M04] payload now carries both burned shares and disbursed assets
+        assertEq(satellite.lastPayload(), MessageCodec.encodeInstantWithdrawSettled(10 ether, 10 ether));
         assertEq(pool.utilized(), 10 ether);
     }
 
-    function test_PPTSatellite_InstantWithdraw_QueuesCreditUsedWhenUnfunded() public {
+    function test_PPTSatellite_InstantWithdraw_QueuesInstantWithdrawWhenUnfunded() public {
         address user = address(0xCAFE);
         PPTOFT pptOft = new PPTOFT("Satellite PPT", "spPPT", address(endpoint), address(this), HUB_EID);
         LiquidityPool pool = new LiquidityPool(address(asset), address(this));
@@ -502,8 +503,10 @@ contract LayerZeroRuntimeFixesTest is Test {
         satellite.instantWithdraw(15 ether, user);
 
         assertEq(satellite.sendCount(), 0);
-        assertEq(satellite.pendingCreditUsedCount(), 1);
-        assertEq(satellite.pendingCreditUsed(0), 15 ether);
+        assertEq(satellite.pendingInstantWithdrawCount(), 1);
+        (uint256 pendingShares, uint256 pendingAssets) = satellite.pendingInstantWithdraws(0);
+        assertEq(pendingShares, 15 ether);
+        assertEq(pendingAssets, 15 ether);
     }
 
     function test_PPTSatellite_NotifyCreditRestored_SendsRestoreMessageWhenFunded() public {

@@ -13,6 +13,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IPPT, IRedemptionManager} from "../../ppt/IPPTContracts.sol";
 import {MessageCodec} from "../libraries/MessageCodec.sol";
 import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
+import {ICrossChainNAVReporter} from "../interfaces/ICrossChainNAVReporter.sol";
 
 /// @title PPTOFTAdapter
 /// @notice OFT Adapter for PPT token on BSC Hub chain
@@ -40,6 +41,20 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     ICreditManager public creditManager;
     address public vault;
     address public redemptionManager;
+
+    /// @notice [M04] Cross-chain NAV reporter for immediate satellite balance delta updates
+    ICrossChainNAVReporter public navReporter;
+
+    /// @notice [M04] Explicit mirror share ledger
+    /// @dev Tracks Σ PPT locked in this adapter that correspond to live satellite mirror supply.
+    ///      Invariant: totalMirroredShares == Σ(PPTOFT.totalSupply across registered satellites).
+    ///      Compare against `innerToken.balanceOf(address(this))` to detect unexpected direct
+    ///      PPT transfers — excess balance is unlinked to any satellite mirror.
+    uint256 public totalMirroredShares;
+
+    /// @notice [M01] Per-chain sharePrice sync telemetry (timestamp + value) for keeper-driven broadcast
+    mapping(uint32 => uint256) public lastSharePriceSyncedAt;
+    mapping(uint32 => uint256) public lastSharePriceSyncedValue;
 
     // ========== Pending Mint Queue (ERR-002 fix) ==========
 
@@ -100,6 +115,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     event SatelliteCreditRestored(uint32 indexed srcEid, uint256 amount);
     event CreditSynced(uint32 indexed dstEid, uint256 credit);
     event SharePriceSynced(uint32 indexed dstEid, uint256 sharePrice);
+    event SatelliteInstantWithdrawProcessed(uint32 indexed srcEid, uint256 shares, uint256 assets);
+    event NavReporterUpdated(address indexed oldReporter, address indexed newReporter);
+    event MirroredSharesUpdated(uint256 oldAmount, uint256 newAmount);
+    /// @notice [M04] Fires when mirror ledger would underflow (observability for drift detection)
+    event MirroredLedgerDiscrepancy(uint32 indexed srcEid, uint256 requestedBurn, uint256 ledgerBalance);
 
     // ========== Errors ==========
 
@@ -182,6 +202,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
         innerToken.safeTransferFrom(msg.sender, address(this), amountSentLD);
 
+        // [M04] Mirror ledger: Hub locks PPT, satellite will mint amountReceivedLD
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = oldMirrored + amountReceivedLD;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
         bytes memory message = _buildSendMessage(amountReceivedLD, _bytes32ToAddress(_to));
         bytes memory options = _options.length > 0 ? _options : LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
@@ -228,6 +253,8 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             _handleSatelliteCreditUsed(_origin, _payload);
         } else if (msgType == MessageCodec.MSG_CREDIT_RESTORED) {
             _handleSatelliteCreditRestored(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_INSTANT_WITHDRAW_SETTLED) {
+            _handleSatelliteInstantWithdraw(_origin, _payload);
         } else {
             revert UnknownMessageType(msgType);
         }
@@ -277,6 +304,12 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint32 /*_srcEid*/
     ) internal returns (uint256 amountReceivedLD) {
         innerToken.safeTransfer(_to, _amountLD);
+
+        // [M04] Mirror ledger: satellite has burned _amountLD, Hub returns PPT to user
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = _amountLD > oldMirrored ? 0 : oldMirrored - _amountLD;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
         return _amountLD;
     }
 
@@ -334,6 +367,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
             _requestRedemption(shares, receiver);
         }
 
+        // [M04] Satellite already burned the mirror supply when it sent MSG_WITHDRAW
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = shares > oldMirrored ? 0 : oldMirrored - shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
         _queueOrSendSharePrice(_origin.srcEid);
 
         emit SatelliteWithdrawProcessed(_origin.srcEid, receiver, shares);
@@ -350,6 +388,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 requestId = hubStargateComposer != address(0)
             ? _requestSatelliteRedemption(_origin.srcEid, owner, shares)
             : _requestRedemption(shares, owner);
+
+        // [M04] Satellite already burned the mirror supply when it sent MSG_REDEEM
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = shares > oldMirrored ? 0 : oldMirrored - shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
 
         _queueOrSendSharePrice(_origin.srcEid);
         emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, requestId);
@@ -395,7 +438,54 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 amount = MessageCodec.decodeAmount(_payload);
         creditManager.restoreCredit(_origin.srcEid, amount);
 
+        // [M04] Mirror delta on NAV so replenish inflow is visible without waiting for keeper
+        if (address(navReporter) != address(0)) {
+            navReporter.recordSatelliteCredit(_origin.srcEid, amount);
+        }
+
         emit SatelliteCreditRestored(_origin.srcEid, amount);
+    }
+
+    /// @notice [M04] Handle instant-withdraw settlement from a satellite
+    /// @dev Atomically updates all three books that drift under the legacy `MSG_CREDIT_USED` path:
+    ///      - Credit book: `creditManager.reduceCredit`
+    ///      - NAV book: `navReporter.recordSatelliteDebit` (keeps sharePrice accurate)
+    ///      - Share mirror: `vault.lockShares + burnLockedShares` + `totalMirroredShares -= shares`
+    function _handleSatelliteInstantWithdraw(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+        if (vault == address(0)) revert ZeroAddress();
+        if (address(navReporter) == address(0)) revert ZeroAddress();
+
+        (uint256 shares, uint256 assets) = MessageCodec.decodeInstantWithdrawSettled(_payload);
+        if (shares == 0) revert InvalidAmount();
+        if (assets == 0) revert InvalidAmount();
+
+        // Book 1: Credit — advance utilization tracker for the satellite
+        creditManager.reduceCredit(_origin.srcEid, assets);
+
+        // Book 2: NAV — reduce cross-chain value to keep sharePrice accurate
+        navReporter.recordSatelliteDebit(_origin.srcEid, assets);
+
+        // Book 3: Share mirror — atomically burn locked PPT backing the satellite supply
+        IPPT(vault).lockShares(address(this), shares);
+        IPPT(vault).burnLockedShares(address(this), shares);
+
+        // [M04] Mirror ledger saturates to zero on underflow rather than reverting.
+        //   Rationale: reverting here would block the LayerZero channel after the other
+        //   two books have been committed (impossible to rollback the satellite-side burn).
+        //   Fail loud via event so off-chain keeper can pause + investigate drift.
+        uint256 oldMirrored = totalMirroredShares;
+        uint256 newMirrored;
+        if (shares > oldMirrored) {
+            emit MirroredLedgerDiscrepancy(_origin.srcEid, shares, oldMirrored);
+            newMirrored = 0;
+        } else {
+            newMirrored = oldMirrored - shares;
+        }
+        totalMirroredShares = newMirrored;
+        emit MirroredSharesUpdated(oldMirrored, newMirrored);
+
+        emit SatelliteInstantWithdrawProcessed(_origin.srcEid, shares, assets);
     }
 
     // ========== Stargate Composer Integration ==========
@@ -409,6 +499,12 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (msg.sender != hubStargateComposer) revert InvalidComposer();
         if (receiver == address(0)) revert ZeroAddress();
         if (shares == 0) revert InvalidAmount();
+
+        // [M04] Mirror ledger: composer has already minted the Hub-side PPT backing these shares;
+        //       satellite is about to increase its PPTOFT.totalSupply by `shares`.
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = oldMirrored + shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
 
         bytes memory payload = MessageCodec.encodeMintShares(receiver, shares);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
@@ -446,6 +542,21 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         _queueOrSendSharePrice(dstEid);
     }
 
+    /// @notice [M01] Broadcast the current sharePrice to all registered satellite chains
+    /// @dev Iterates `CreditManager.getSupportedChains()` (single source of truth for chain list).
+    ///      Each dispatch reuses `_queueOrSendSharePrice` which handles pending dedup and
+    ///      `totalMirroredShares`-adjacent observability. The `_payNative` override funds fees
+    ///      from `address(this).balance`, so caller must pre-fund the adapter or send `msg.value`.
+    function broadcastSharePriceToSupportedChains() external payable whenNotPaused onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint32[] memory eids = creditManager.getSupportedChains();
+        for (uint256 i = 0; i < eids.length; ++i) {
+            _queueOrSendSharePrice(eids[i]);
+        }
+    }
+
     // ========== Configuration ==========
 
     function setCreditManager(address _creditManager) external onlyOwner {
@@ -461,6 +572,15 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     function setRedemptionManager(address _redemptionManager) external onlyOwner {
         if (_redemptionManager == address(0)) revert ZeroAddress();
         redemptionManager = _redemptionManager;
+    }
+
+    /// @notice [M04] Set the cross-chain NAV reporter used for satellite balance delta updates
+    /// @dev Required for `MSG_INSTANT_WITHDRAW_SETTLED` handling and replenish NAV restoration.
+    ///      Adapter must hold `REPORTER_ROLE` on the target reporter.
+    function setNavReporter(address _navReporter) external onlyOwner {
+        if (_navReporter == address(0)) revert ZeroAddress();
+        emit NavReporterUpdated(address(navReporter), _navReporter);
+        navReporter = ICrossChainNAVReporter(_navReporter);
     }
 
     function pause() external onlyOwner {
@@ -499,6 +619,9 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
                 delete pendingSharePriceSyncIdByDstEid[dstEid];
             }
             _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+            // [M01] Record successful broadcast for keeper threshold/interval tracking
+            lastSharePriceSyncedAt[dstEid] = block.timestamp;
+            lastSharePriceSyncedValue[dstEid] = currentSharePrice;
             emit SharePriceSynced(dstEid, currentSharePrice);
             return;
         }

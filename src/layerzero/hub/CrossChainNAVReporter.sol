@@ -55,6 +55,8 @@ contract CrossChainNAVReporter is AccessControl {
     event StalePeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
     event GlobalSyncCommitted(uint256 timestamp);
     event GlobalFreshnessEnforcementUpdated(bool oldValue, bool newValue);
+    event SatelliteDebitRecorded(uint32 indexed eid, uint256 amount, uint256 newBalance);
+    event SatelliteCreditRecorded(uint32 indexed eid, uint256 amount, uint256 newBalance);
 
     // ========== Errors ==========
 
@@ -197,6 +199,41 @@ contract CrossChainNAVReporter is AccessControl {
     function commitGlobalSync() external onlyRole(REPORTER_ROLE) {
         lastGlobalSyncTime = block.timestamp;
         emit GlobalSyncCommitted(lastGlobalSyncTime);
+    }
+
+    /// @notice Apply a delta reduction to a satellite balance (event-driven accounting)
+    /// @dev [M04] Called by PPTOFTAdapter on MSG_INSTANT_WITHDRAW_SETTLED so NAV
+    ///      drops immediately when satellite LP pays out, keeping sharePrice accurate
+    ///      without waiting for the next keeper snapshot. Underflow folds to zero
+    ///      and emits AccountingDiscrepancy.
+    function recordSatelliteDebit(uint32 eid, uint256 amount) external onlyRole(REPORTER_ROLE) {
+        if (!_isChain[eid]) revert ChainNotSupported(eid);
+        uint256 old = satelliteBalances[eid];
+        uint256 newBalance;
+        if (amount > old) {
+            emit AccountingDiscrepancy(eid, amount, old);
+            totalCrossChainValue -= old;
+            satelliteBalances[eid] = 0;
+            newBalance = 0;
+        } else {
+            newBalance = old - amount;
+            satelliteBalances[eid] = newBalance;
+            totalCrossChainValue -= amount;
+        }
+        lastUpdateTime[eid] = block.timestamp;
+        emit SatelliteDebitRecorded(eid, amount, newBalance);
+    }
+
+    /// @notice Apply a delta increase to a satellite balance
+    /// @dev [M04] Called by PPTOFTAdapter on MSG_CREDIT_RESTORED so replenish inflow
+    ///      is visible to NAV immediately.
+    function recordSatelliteCredit(uint32 eid, uint256 amount) external onlyRole(REPORTER_ROLE) {
+        if (!_isChain[eid]) revert ChainNotSupported(eid);
+        uint256 newBalance = satelliteBalances[eid] + amount;
+        satelliteBalances[eid] = newBalance;
+        totalCrossChainValue += amount;
+        lastUpdateTime[eid] = block.timestamp;
+        emit SatelliteCreditRecorded(eid, amount, newBalance);
     }
 
     // ========== Admin Functions ==========

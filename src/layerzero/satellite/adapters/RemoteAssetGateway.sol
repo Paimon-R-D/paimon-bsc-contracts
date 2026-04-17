@@ -58,6 +58,16 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
     /// @notice Slippage tolerance in basis points
     uint256 public slippageBps;
 
+    /// @notice [M02] Default dust tolerance (in asset smallest unit) for
+    ///         reported-vs-actual withdrawal/deploy discrepancies.
+    /// @dev Index-based protocols (Aave liquidityIndex, Compound exchangeRate, Curve)
+    ///      produce 1-2 wei rounding in share-to-asset conversion. Default of 2 wei is
+    ///      chosen to tolerate one round trip; per-protocol override available below.
+    uint256 public defaultDust = 2;
+
+    /// @notice [M02] Optional per-protocol dust override, keyed by protocol name hash
+    mapping(bytes32 => uint256) public dustByProtocol;
+
     struct PendingReturn {
         uint256 amount;
         bool isYield;
@@ -75,6 +85,8 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
     event PendingReturnFlushed(uint256 indexed returnId, uint256 amount, bool isYield);
     event HubComposerUpdated(address oldComposer, address newComposer);
     event ProtocolUpdated(string protocolName, address implementation);
+    event DefaultDustUpdated(uint256 oldDust, uint256 newDust);
+    event ProtocolDustUpdated(string protocolName, uint256 oldDust, uint256 newDust);
 
     // ========== Errors ==========
 
@@ -89,6 +101,8 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
     error ProtocolNotSupported();
     error InsufficientDeposit();
     error InvalidProtocolAmount(uint256 requested, uint256 actual);
+    error ReportedActualMismatch(uint256 reported, uint256 actual, uint256 allowedDust);
+    error ShortfallExceedsDust(uint256 requested, uint256 actual, uint256 allowedDust);
 
     // ========== Constructor ==========
 
@@ -172,6 +186,8 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
     // ========== Internal Handlers ==========
 
     /// @notice Handle deploy: USDT arrived → deploy to DeFi protocol
+    /// @dev [M02] Uses balance-delta as source of truth. Reported return value is
+    ///      validated against actual balance consumed; divergence > dust reverts.
     function _handleDeploy(uint256 amount, bytes memory composeMsg) internal {
         (address protocol, string memory protocolName) = StargateComposeCodec.decodeDeploy(composeMsg);
         if (amount == 0) revert ZeroAmount();
@@ -179,26 +195,38 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
         address implementation = protocolImplementations[protocolName];
         if (implementation == address(0)) revert ProtocolNotSupported();
 
+        uint256 balanceBefore = asset.balanceOf(address(this));
+
         // Approve and deploy (forceApprove for USDT compatibility)
         asset.forceApprove(implementation, amount);
-        uint256 deployedAmount = IRemoteProtocolImplementation(implementation).deploy(
+        uint256 reported = IRemoteProtocolImplementation(implementation).deploy(
             address(asset), protocol, amount
         );
-        if (deployedAmount > amount) revert InvalidProtocolAmount(amount, deployedAmount);
-
         asset.forceApprove(implementation, 0);
 
-        protocolDeposits[protocol] += deployedAmount;
-        totalDeposited += deployedAmount;
+        // [M02] actualConsumed = assets that left this contract into the protocol
+        uint256 balanceAfter = asset.balanceOf(address(this));
+        uint256 actualConsumed = balanceBefore > balanceAfter ? balanceBefore - balanceAfter : 0;
 
-        uint256 undeployedAmount = amount - deployedAmount;
+        if (actualConsumed > amount) revert InvalidProtocolAmount(amount, actualConsumed);
+
+        uint256 allowedDust = _dustFor(protocolName);
+        uint256 diff = reported > actualConsumed ? reported - actualConsumed : actualConsumed - reported;
+        if (diff > allowedDust) revert ReportedActualMismatch(reported, actualConsumed, allowedDust);
+
+        protocolDeposits[protocol] += actualConsumed;
+        totalDeposited += actualConsumed;
+
+        uint256 undeployedAmount = amount - actualConsumed;
         if (undeployedAmount > 0) {
             _bridgeOrQueueReturn(undeployedAmount, false);
         }
 
-        emit DeployReceived(protocol, protocolName, deployedAmount);
+        emit DeployReceived(protocol, protocolName, actualConsumed);
     }
 
+    /// @dev [M02] balance-delta authoritative: protocol return value is only a sanity check.
+    ///      Accounting and bridging use `actualReceived` (asset.balanceOf delta).
     function _handleWithdrawCommand(bytes calldata _payload) internal {
         (uint256 amount, address protocol, string memory protocolName) =
             MessageCodec.decodeAmountProtocolCommand(_payload);
@@ -208,17 +236,25 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
         address implementation = protocolImplementations[protocolName];
         if (implementation == address(0)) revert ProtocolNotSupported();
 
-        uint256 withdrawnAmount = IRemoteProtocolImplementation(implementation).withdraw(address(asset), protocol, amount);
-        // Accept withdrawnAmount <= amount to tolerate routine 1-wei rounding in
-        // index-based protocols (Aave liquidityIndex, Compound exchangeRate, Curve fees).
-        // Only over-withdrawal signals an adapter bug or unauthorized withdrawal.
-        if (withdrawnAmount > amount) revert InvalidProtocolAmount(amount, withdrawnAmount);
+        uint256 balanceBefore = asset.balanceOf(address(this));
+        uint256 reported = IRemoteProtocolImplementation(implementation).withdraw(address(asset), protocol, amount);
+        uint256 balanceAfter = asset.balanceOf(address(this));
+        uint256 actualReceived = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
 
-        protocolDeposits[protocol] -= withdrawnAmount;
-        totalDeposited -= withdrawnAmount;
+        if (actualReceived > amount) revert InvalidProtocolAmount(amount, actualReceived);
 
-        _bridgeOrQueueReturn(withdrawnAmount, false);
-        emit WithdrawAndBridged(protocol, protocolName, withdrawnAmount);
+        uint256 allowedDust = _dustFor(protocolName);
+        uint256 diff = reported > actualReceived ? reported - actualReceived : actualReceived - reported;
+        if (diff > allowedDust) revert ReportedActualMismatch(reported, actualReceived, allowedDust);
+
+        uint256 shortfall = amount - actualReceived;
+        if (shortfall > allowedDust) revert ShortfallExceedsDust(amount, actualReceived, allowedDust);
+
+        protocolDeposits[protocol] -= actualReceived;
+        totalDeposited -= actualReceived;
+
+        _bridgeOrQueueReturn(actualReceived, false);
+        emit WithdrawAndBridged(protocol, protocolName, actualReceived);
     }
 
     function _handleHarvestCommand(bytes calldata _payload) internal {
@@ -337,6 +373,24 @@ contract RemoteAssetGateway is OApp, ILayerZeroComposer, ReentrancyGuard, Pausab
 
     function setSlippageBps(uint256 _bps) external onlyOwner {
         slippageBps = _bps;
+    }
+
+    /// @notice [M02] Update default dust tolerance for reported/actual discrepancies
+    function setDefaultDust(uint256 _dust) external onlyOwner {
+        emit DefaultDustUpdated(defaultDust, _dust);
+        defaultDust = _dust;
+    }
+
+    /// @notice [M02] Set a per-protocol dust override
+    function setProtocolDust(string calldata protocolName, uint256 _dust) external onlyOwner {
+        bytes32 key = keccak256(bytes(protocolName));
+        emit ProtocolDustUpdated(protocolName, dustByProtocol[key], _dust);
+        dustByProtocol[key] = _dust;
+    }
+
+    function _dustFor(string memory protocolName) internal view returns (uint256) {
+        uint256 override_ = dustByProtocol[keccak256(bytes(protocolName))];
+        return override_ > 0 ? override_ : defaultDust;
     }
 
     function pause() external onlyOwner {

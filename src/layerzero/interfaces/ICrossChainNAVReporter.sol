@@ -27,4 +27,10 @@ interface ICrossChainNAVReporter {
         uint256[] calldata remoteValues
     ) external;
     function commitGlobalSync() external;
+
+    /// @notice [M04] Apply delta decrease to satellite balance (event-driven accounting)
+    function recordSatelliteDebit(uint32 eid, uint256 amount) external;
+
+    /// @notice [M04] Apply delta increase to satellite balance
+    function recordSatelliteCredit(uint32 eid, uint256 amount) external;
 }

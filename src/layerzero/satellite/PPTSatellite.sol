@@ -22,7 +22,10 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     uint256 public constant MAX_INSTANT_WITHDRAW_FEE = 1000;
     uint128 public constant DEFAULT_GAS_LIMIT = 300000;
-    uint256 public constant DEFAULT_MAX_SHARE_PRICE_STALENESS = 1 hours;
+    /// @notice [M01] Default sharePrice staleness window tightened from 1h to 10min
+    /// @dev Aligns with Hub-side `maxSharePriceSyncInterval`. Keeper/Hub broadcast
+    ///      cadence is the primary sync face; this is the satellite-side defense in depth.
+    uint256 public constant DEFAULT_MAX_SHARE_PRICE_STALENESS = 10 minutes;
 
     enum WithdrawMode {
         CrossChain,
@@ -66,13 +69,27 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     /// @notice Max age of sharePrice considered fresh for state-changing flows
     uint256 public maxSharePriceStaleness = DEFAULT_MAX_SHARE_PRICE_STALENESS;
 
-    /// @notice Pending credit utilization notices that could not be sent due to insufficient native gas
+    /// @notice Legacy pending credit utilization queue (pre-M04). Preserved so
+    /// @dev operators can still `flushPendingCreditUsed()` to drain messages enqueued
+    ///      by the old notification path during upgrade. New writes go to
+    ///      `pendingInstantWithdraws` instead.
     mapping(uint256 => uint256) public pendingCreditUsed;
     uint256 public pendingCreditUsedCount;
 
     /// @notice Pending credit restoration notices that could not be sent due to insufficient native gas
     mapping(uint256 => uint256) public pendingCreditRestored;
     uint256 public pendingCreditRestoredCount;
+
+    /// @notice [M04] Pending instant-withdraw settlements that could not be sent due to insufficient native gas
+    /// @dev Both `shares` and `assets` are required so the Hub handler can atomically
+    ///      reduce credit, debit NAV, and mirror-burn adapter's locked PPT.
+    struct PendingInstantWithdraw {
+        uint256 shares;
+        uint256 assets;
+    }
+
+    mapping(uint256 => PendingInstantWithdraw) public pendingInstantWithdraws;
+    uint256 public pendingInstantWithdrawCount;
 
     // ========== Events ==========
 
@@ -87,6 +104,8 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     event PendingCreditUsedFlushed(uint256 indexed pendingId, uint256 amount);
     event PendingCreditRestoredStored(uint256 indexed pendingId, uint256 amount);
     event PendingCreditRestoredFlushed(uint256 indexed pendingId, uint256 amount);
+    event PendingInstantWithdrawStored(uint256 indexed pendingId, uint256 shares, uint256 assets);
+    event PendingInstantWithdrawFlushed(uint256 indexed pendingId, uint256 shares, uint256 assets);
 
     // ========== Errors ==========
 
@@ -102,6 +121,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     error UnexpectedNativeValue();
     error UnknownPendingCredit(uint256 pendingId);
     error UnknownPendingCreditRestore(uint256 pendingId);
+    error UnknownPendingInstantWithdraw(uint256 pendingId);
     error OnlySatelliteGateway(address caller);
     error SharePriceUninitialized();
     error SharePriceStale(uint256 age, uint256 maxStaleness);
@@ -208,7 +228,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         pptOft.burn(shares);
 
         liquidityPool.withdrawForUser(receiver, assets);
-        _notifyCreditUsed(assets);
+        _notifyInstantWithdrawSettled(shares, assets);
 
         emit InstantWithdraw(receiver, shares, assets, fee);
 
@@ -344,8 +364,12 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         return 0;
     }
 
-    function _notifyCreditUsed(uint256 amount) internal {
-        bytes memory payload = MessageCodec.encodeCreditUsed(amount);
+    /// @notice [M04] Notify Hub that an instant withdrawal has settled on this satellite
+    /// @dev Carries both burned shares and disbursed assets so the Hub handler can
+    ///      atomically reduce credit, debit NAV, and mirror-burn locked PPT in one tx,
+    ///      preserving the share conservation invariant.
+    function _notifyInstantWithdrawSettled(uint256 shares, uint256 assets) internal {
+        bytes memory payload = MessageCodec.encodeInstantWithdrawSettled(shares, assets);
         bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
 
@@ -354,9 +378,9 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
             return;
         }
 
-        uint256 pendingId = pendingCreditUsedCount++;
-        pendingCreditUsed[pendingId] = amount;
-        emit PendingCreditUsedStored(pendingId, amount);
+        uint256 pendingId = pendingInstantWithdrawCount++;
+        pendingInstantWithdraws[pendingId] = PendingInstantWithdraw({shares: shares, assets: assets});
+        emit PendingInstantWithdrawStored(pendingId, shares, assets);
     }
 
     function notifyCreditRestored(uint256 amount) external whenNotPaused {
@@ -403,6 +427,21 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
 
         emit PendingCreditRestoredFlushed(pendingId, amount);
+    }
+
+    /// @notice [M04] Flush a pending instant-withdraw settlement that was queued due to insufficient native fee
+    function flushPendingInstantWithdraw(uint256 pendingId) external payable onlyOwner whenNotPaused {
+        PendingInstantWithdraw memory pending = pendingInstantWithdraws[pendingId];
+        if (pending.shares == 0 && pending.assets == 0) revert UnknownPendingInstantWithdraw(pendingId);
+
+        delete pendingInstantWithdraws[pendingId];
+
+        bytes memory payload = MessageCodec.encodeInstantWithdrawSettled(pending.shares, pending.assets);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+        _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+
+        emit PendingInstantWithdrawFlushed(pendingId, pending.shares, pending.assets);
     }
 
     // ========== Configuration ==========

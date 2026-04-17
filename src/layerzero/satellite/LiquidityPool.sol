@@ -51,6 +51,7 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     event CreditUsed(uint256 amount, uint256 remainingCredit);
     event MinBufferUpdated(uint256 oldBuffer, uint256 newBuffer);
     event EmergencyWithdraw(address indexed to, uint256 amount);
+    event CreditSyncClamped(uint256 requestedCredit, uint256 appliedCredit, uint256 utilized);
 
     // ========== Modifiers ==========
 
@@ -164,9 +165,29 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Credit Management ==========
 
     /// @inheritdoc ILiquidityPool
+    /// @dev [M03] Split-path invariant enforcement:
+    ///      - Owner (local admin) path: strict `newCredit >= utilized`, else revert.
+    ///      - Satellite (cross-chain sync) path: clamp to `max(newCredit, utilized)` and
+    ///        emit `CreditSyncClamped` so keeper can resync from Hub. Avoiding revert here
+    ///        is critical — `PPTSatellite._lzReceive` calls this directly when
+    ///        `MSG_CREDIT_UPDATE` arrives, and a revert would block the LayerZero
+    ///        channel during normal 1-10 min race windows.
     function updateCredit(uint256 newCredit) external override onlySatelliteOrOwner {
-        emit CreditUpdated(credit, newCredit);
-        credit = newCredit;
+        uint256 oldCredit = credit;
+
+        if (msg.sender == owner()) {
+            if (newCredit < utilized) revert CreditBelowUtilized();
+            credit = newCredit;
+            emit CreditUpdated(oldCredit, newCredit);
+            return;
+        }
+
+        uint256 applied = newCredit < utilized ? utilized : newCredit;
+        credit = applied;
+        emit CreditUpdated(oldCredit, applied);
+        if (applied != newCredit) {
+            emit CreditSyncClamped(newCredit, applied, utilized);
+        }
     }
 
     /// @inheritdoc ILiquidityPool

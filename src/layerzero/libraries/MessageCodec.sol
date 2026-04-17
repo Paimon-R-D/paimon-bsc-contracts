@@ -15,6 +15,7 @@ library MessageCodec {
     // --- Satellite → Hub (Credit) ---
     bytes1 internal constant MSG_CREDIT_USED = 0x10;
     bytes1 internal constant MSG_CREDIT_RESTORED = 0x11;
+    bytes1 internal constant MSG_INSTANT_WITHDRAW_SETTLED = 0x12;
 
     // --- Hub → Satellite ---
     bytes1 internal constant MSG_SHARE_PRICE_UPDATE = 0x20;
@@ -72,6 +73,18 @@ library MessageCodec {
         return abi.encodePacked(MSG_CREDIT_RESTORED, abi.encode(amount));
     }
 
+    /// @notice Encode instant withdraw settled message (Satellite → Hub)
+    /// @dev Carries both burned shares and disbursed assets so Hub can atomically
+    ///      reduce credit, debit NAV, and mirror-burn adapter's locked PPT in one tx.
+    ///      Fixes [M04]: share conservation invariant between satellite and Hub.
+    function encodeInstantWithdrawSettled(uint256 shares, uint256 assets)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(MSG_INSTANT_WITHDRAW_SETTLED, abi.encode(shares, assets));
+    }
+
     /// @notice Encode withdraw asset command (Hub → RemoteGateway)
     function encodeWithdrawAsset(uint256 amount, address protocol, string memory protocolName)
         internal
@@ -119,5 +132,14 @@ library MessageCodec {
         returns (address protocol, string memory protocolName)
     {
         return abi.decode(payload[1:], (address, string));
+    }
+
+    /// @notice Decode instant withdraw settled payload (shares, assets)
+    function decodeInstantWithdrawSettled(bytes calldata payload)
+        internal
+        pure
+        returns (uint256 shares, uint256 assets)
+    {
+        return abi.decode(payload[1:], (uint256, uint256));
     }
 }
