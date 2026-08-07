@@ -68,16 +68,6 @@ interface IPPTSatellite {
         uint256 fee
     );
 
-    /// @notice Emitted when deposit assets arrive from user
-    /// @param user Address of the user
-    /// @param amount Amount of assets received
-    event AssetsReceived(address indexed user, uint256 amount);
-
-    /// @notice Emitted when shares arrive from Hub via OFT
-    /// @param user Address of the recipient
-    /// @param shares Amount of shares received
-    event SharesReceived(address indexed user, uint256 shares);
-
     // ========== View Functions ==========
 
     /// @notice Get the PPTOFT (OFT representation of PPT shares) address
@@ -95,10 +85,6 @@ interface IPPTSatellite {
     /// @notice Get the underlying asset address
     /// @return Address of the underlying asset (e.g., USDT)
     function asset() external view returns (address);
-
-    /// @notice Get the PPTOFTAdapter address on Hub
-    /// @return Address of the Hub's PPTOFTAdapter
-    function hubAdapter() external view returns (address);
 
     /// @notice Preview deposit - estimate shares to receive
     /// @param assets Amount of assets to deposit
@@ -124,7 +110,7 @@ interface IPPTSatellite {
     // ========== User Actions ==========
 
     /// @notice Deposit assets and receive PPT shares via cross-chain
-    /// @dev Assets stay on satellite, shares minted on Hub and sent via OFT
+    /// @dev Assets are bridged to Hub before shares are minted.
     /// @param assets Amount of assets to deposit
     /// @param receiver Address to receive shares
     /// @return shares Amount of shares to be received
@@ -171,14 +157,6 @@ interface IPPTSatellite {
     function quoteWithdraw(uint256 shares, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee);
 
     // ========== Configuration ==========
-
-    /// @notice Set the Hub endpoint ID
-    /// @param _hubEid LayerZero endpoint ID of the Hub
-    function setHubEid(uint32 _hubEid) external;
-
-    /// @notice Set the Hub adapter address
-    /// @param _hubAdapter Address of PPTOFTAdapter on Hub
-    function setHubAdapter(address _hubAdapter) external;
 
     /// @notice Set instant withdrawal fee
     /// @param _feeBps Fee in basis points

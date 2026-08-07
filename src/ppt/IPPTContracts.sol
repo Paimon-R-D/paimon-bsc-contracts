@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {PPTTypes} from "./PPTTypes.sol";
+import {ICrossChainNAVReporter} from "../layerzero/interfaces/ICrossChainNAVReporter.sol";
 
 /// @title IPPT
 /// @notice Main Vault contract interface (custom functions, use IERC4626 for ERC4626 standard functions)
@@ -211,6 +212,9 @@ interface IAssetScheduler {
         uint256 advanceDays
     ) external returns (uint256 schedulerRequestId, uint256 windowId);
 }
+
+// ICrossChainNAVReporter is canonically defined in src/layerzero/interfaces/ICrossChainNAVReporter.sol
+// Re-exported via import above for backward compatibility
 
 /// @title IRedemptionVoucher
 /// @notice Redemption voucher NFT interface - Tradeable voucher for long-term redemptions

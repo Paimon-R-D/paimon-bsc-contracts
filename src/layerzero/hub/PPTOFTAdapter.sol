@@ -8,60 +8,82 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ICreditManager} from "../interfaces/ICreditManager.sol";
-import {IPPTOFTAdapter} from "../interfaces/IPPTOFTAdapter.sol";
 import {ILayerZeroComposer} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroComposer.sol";
-import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IPPT, IRedemptionManager} from "../../ppt/IPPTContracts.sol";
+import {MessageCodec} from "../libraries/MessageCodec.sol";
+import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
+import {ICrossChainNAVReporter} from "../interfaces/ICrossChainNAVReporter.sol";
 
 /// @title PPTOFTAdapter
 /// @notice OFT Adapter for PPT token on BSC Hub chain
-/// @dev Wraps existing PPT ERC20 into LayerZero OFT using lock/unlock mechanism
+/// @dev Wraps existing PPT ERC20 into LayerZero OFT using lock/unlock mechanism.
+///      Handles standard OFT messages plus typed satellite withdraw/redeem/credit messages.
 contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     using SafeERC20 for IERC20;
 
     // ========== Constants ==========
 
-    /// @notice Message type for standard OFT send
     uint16 public constant MSG_TYPE_SEND = 1;
-
-    /// @notice Message type for send with compose (lzCompose)
     uint16 public constant MSG_TYPE_SEND_AND_CALL = 2;
 
-    /// @notice Compose message type: Redemption request
     bytes1 public constant COMPOSE_MSG_REDEEM = 0x01;
-
-    /// @notice Compose message type: Deposit
-    bytes1 public constant COMPOSE_MSG_DEPOSIT = 0x02;
-
-    /// @notice Shared decimals for cross-chain compatibility (LayerZero standard)
     uint8 public constant SHARED_DECIMALS = 6;
 
-    /// @notice Default gas limit for cross-chain messages
     uint128 public constant DEFAULT_GAS_LIMIT = 200000;
 
     // ========== State Variables ==========
 
-    /// @notice The underlying PPT token
     IERC20 public immutable innerToken;
-
-    /// @notice Local token decimals
     uint8 public immutable localDecimals;
-
-    /// @notice Decimal conversion rate (10^(localDecimals - sharedDecimals))
     uint256 public immutable decimalConversionRate;
 
-    /// @notice Credit manager for tracking cross-chain credit
     ICreditManager public creditManager;
-
-    /// @notice PPT Vault address for deposits
     address public vault;
-
-    /// @notice Redemption manager address
     address public redemptionManager;
+
+    /// @notice [M04] Cross-chain NAV reporter for immediate satellite balance delta updates
+    ICrossChainNAVReporter public navReporter;
+
+    /// @notice [M04] Explicit mirror share ledger
+    /// @dev Tracks Σ PPT locked in this adapter that correspond to live satellite mirror supply.
+    ///      Invariant: totalMirroredShares == Σ(PPTOFT.totalSupply across registered satellites).
+    ///      Compare against `innerToken.balanceOf(address(this))` to detect unexpected direct
+    ///      PPT transfers — excess balance is unlinked to any satellite mirror.
+    uint256 public totalMirroredShares;
+
+    /// @notice [M01] Per-chain sharePrice sync telemetry (timestamp + value) for keeper-driven broadcast
+    mapping(uint32 => uint256) public lastSharePriceSyncedAt;
+    mapping(uint32 => uint256) public lastSharePriceSyncedValue;
+
+    // ========== Pending Mint Queue (ERR-002 fix) ==========
+
+    struct PendingMint {
+        uint32 dstEid;
+        address receiver;
+        uint256 shares;
+    }
+
+    mapping(uint256 => PendingMint) public pendingMints;
+    uint256 public pendingMintCount;
+
+    struct PendingSharePriceSync {
+        uint32 dstEid;
+        uint256 sharePrice;
+    }
+
+    mapping(uint256 => PendingSharePriceSync) public pendingSharePriceSyncs;
+    mapping(uint32 => uint256) public pendingSharePriceSyncIdByDstEid;
+    mapping(uint32 => bool) public hasPendingSharePriceSync;
+    uint256 public pendingSharePriceSyncCount;
+
+    event PendingMintStored(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
+    event PendingMintFlushed(uint256 indexed mintId, uint32 dstEid, address receiver, uint256 shares);
+    event PendingSharePriceSyncStored(uint256 indexed syncId, uint32 dstEid, uint256 sharePrice);
+    event PendingSharePriceSyncFlushed(uint256 indexed syncId, uint32 dstEid, uint256 sharePrice);
 
     // ========== Events ==========
 
-    /// @notice Emitted when tokens are sent cross-chain
     event OFTSent(
         bytes32 indexed guid,
         uint32 dstEid,
@@ -70,7 +92,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 amountReceivedLD
     );
 
-    /// @notice Emitted when tokens are received from cross-chain
     event OFTReceived(
         bytes32 indexed guid,
         uint32 srcEid,
@@ -78,7 +99,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 amountReceivedLD
     );
 
-    /// @notice Emitted when cross-chain redemption is processed
     event CrossChainRedemptionProcessed(
         bytes32 indexed guid,
         address indexed owner,
@@ -86,13 +106,20 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         uint256 requestId
     );
 
-    /// @notice Emitted when cross-chain deposit is processed
-    event CrossChainDepositProcessed(
-        bytes32 indexed guid,
+    event SatelliteWithdrawProcessed(
+        uint32 indexed srcEid,
         address indexed receiver,
-        uint256 assets,
         uint256 shares
     );
+    event SatelliteCreditUsed(uint32 indexed srcEid, uint256 amount);
+    event SatelliteCreditRestored(uint32 indexed srcEid, uint256 amount);
+    event CreditSynced(uint32 indexed dstEid, uint256 credit);
+    event SharePriceSynced(uint32 indexed dstEid, uint256 sharePrice);
+    event SatelliteInstantWithdrawProcessed(uint32 indexed srcEid, uint256 shares, uint256 assets);
+    event NavReporterUpdated(address indexed oldReporter, address indexed newReporter);
+    event MirroredSharesUpdated(uint256 oldAmount, uint256 newAmount);
+    /// @notice [M04] Fires when mirror ledger would underflow (observability for drift detection)
+    event MirroredLedgerDiscrepancy(uint32 indexed srcEid, uint256 requestedBurn, uint256 ledgerBalance);
 
     // ========== Errors ==========
 
@@ -102,19 +129,22 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     error InvalidComposer();
     error InvalidComposeMessage();
     error InvalidPeer(uint32 srcEid, bytes32 sender);
+    error UnknownMessageType(bytes1 msgType);
     error ZeroAddress();
+
+    modifier onlyOwnerOrCreditManager() {
+        if (msg.sender != owner() && msg.sender != address(creditManager)) {
+            revert OwnableUnauthorizedAccount(msg.sender);
+        }
+        _;
+    }
 
     // ========== Additional Events ==========
 
-    /// @notice Emitted when emergency withdrawal is executed
     event EmergencyWithdraw(address indexed token, address indexed to, uint256 amount);
 
     // ========== Constructor ==========
 
-    /// @notice Initialize the PPTOFTAdapter
-    /// @param _token PPT token address
-    /// @param _endpoint LayerZero endpoint address
-    /// @param _delegate Owner/delegate address
     constructor(
         address _token,
         address _endpoint,
@@ -129,34 +159,24 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
     // ========== View Functions ==========
 
-    /// @notice Get the underlying token address
     function token() external view returns (address) {
         return address(innerToken);
     }
 
-    /// @notice Get token decimals
     function decimals() external view returns (uint8) {
         return localDecimals;
     }
 
-    /// @notice Get shared decimals for cross-chain
     function sharedDecimals() external pure returns (uint8) {
         return SHARED_DECIMALS;
     }
 
-    /// @notice Whether approval is required to send
     function approvalRequired() external pure returns (bool) {
         return true;
     }
 
     // ========== OFT Send Functions ==========
 
-    /// @notice Quote the messaging fee for a send operation
-    /// @param _dstEid Destination chain endpoint ID
-    /// @param _amountLD Amount in local decimals
-    /// @param _options Extra options for the message
-    /// @param _payInLzToken Whether to pay in LZ token
-    /// @return fee The messaging fee
     function quoteSend(
         uint32 _dstEid,
         uint256 _amountLD,
@@ -164,18 +184,10 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         bool _payInLzToken
     ) external view returns (MessagingFee memory fee) {
         bytes memory message = _buildSendMessage(_amountLD, msg.sender);
-        bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();
+        bytes memory options = _options.length > 0 ? _options : LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         return _quote(_dstEid, message, options, _payInLzToken);
     }
 
-    /// @notice Send tokens to a destination chain
-    /// @param _dstEid Destination chain endpoint ID
-    /// @param _to Recipient address on destination chain
-    /// @param _amountLD Amount in local decimals
-    /// @param _minAmountLD Minimum amount to receive (slippage protection)
-    /// @param _options Extra options for the message
-    /// @param _refundAddress Address to refund excess fee
-    /// @return receipt Messaging receipt
     function send(
         uint32 _dstEid,
         bytes32 _to,
@@ -186,15 +198,17 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     ) external payable whenNotPaused returns (MessagingReceipt memory receipt) {
         if (_amountLD == 0) revert InvalidAmount();
 
-        // Calculate amounts with decimal conversion
         (uint256 amountSentLD, uint256 amountReceivedLD) = _debitView(_amountLD, _minAmountLD, _dstEid);
 
-        // Lock tokens from sender
         innerToken.safeTransferFrom(msg.sender, address(this), amountSentLD);
 
-        // Build and send message
+        // [M04] Mirror ledger: Hub locks PPT, satellite will mint amountReceivedLD
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = oldMirrored + amountReceivedLD;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
         bytes memory message = _buildSendMessage(amountReceivedLD, _bytes32ToAddress(_to));
-        bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();
+        bytes memory options = _options.length > 0 ? _options : LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         receipt = _lzSend(_dstEid, message, options, MessagingFee(msg.value, 0), payable(_refundAddress));
 
@@ -204,6 +218,9 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
     // ========== LayerZero Receive ==========
 
     /// @notice Handle incoming LayerZero messages
+    /// @dev P0-4 + P1-2 FIX: Dispatches both standard OFT messages and typed Satellite messages.
+    ///      Standard OFT messages are 64 bytes (abi.encode(address, uint256)).
+    ///      Typed messages have a bytes1 prefix at payload[0].
     function _lzReceive(
         Origin calldata _origin,
         bytes32 _guid,
@@ -211,28 +228,40 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         address /*_executor*/,
         bytes calldata /*_extraData*/
     ) internal override whenNotPaused nonReentrant {
-        // Verify message is from trusted peer
         bytes32 expectedPeer = peers[_origin.srcEid];
         if (expectedPeer == bytes32(0) || _origin.sender != expectedPeer) {
             revert InvalidPeer(_origin.srcEid, _origin.sender);
         }
 
-        // Decode message: [to (address)][amountLD (uint256)]
-        (address to, uint256 amountLD) = abi.decode(_payload, (address, uint256));
+        // Standard OFT message: abi.encode(address, uint256) = exactly 64 bytes
+        if (_payload.length == 64) {
+            (address to, uint256 amountLD) = abi.decode(_payload, (address, uint256));
+            if (to == address(0)) revert ZeroAddress();
+            _credit(to, amountLD, _origin.srcEid);
+            emit OFTReceived(_guid, _origin.srcEid, to, amountLD);
+            return;
+        }
 
-        // Validate recipient
-        if (to == address(0)) revert ZeroAddress();
+        // Typed message from Satellite: first byte is message type
+        bytes1 msgType = MessageCodec.decodeMsgType(_payload);
 
-        // Unlock tokens to recipient
-        _credit(to, amountLD, _origin.srcEid);
-
-        emit OFTReceived(_guid, _origin.srcEid, to, amountLD);
+        if (msgType == MessageCodec.MSG_WITHDRAW) {
+            _handleSatelliteWithdraw(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_REDEEM) {
+            _handleSatelliteRedemption(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_CREDIT_USED) {
+            _handleSatelliteCreditUsed(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_CREDIT_RESTORED) {
+            _handleSatelliteCreditRestored(_origin, _payload);
+        } else if (msgType == MessageCodec.MSG_INSTANT_WITHDRAW_SETTLED) {
+            _handleSatelliteInstantWithdraw(_origin, _payload);
+        } else {
+            revert UnknownMessageType(msgType);
+        }
     }
 
     // ========== Compose Functions ==========
 
-    /// @notice Handle composed messages (cross-chain redemption/deposit)
-    /// @dev Called by LayerZero endpoint after lzReceive
     function lzCompose(
         address _from,
         bytes32 _guid,
@@ -240,9 +269,7 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         address /*_executor*/,
         bytes calldata /*_extraData*/
     ) external payable override {
-        // Only endpoint can call this
         if (msg.sender != address(endpoint)) revert InvalidComposer();
-        // Only accept compose from self (after lzReceive)
         if (_from != address(this)) revert InvalidComposer();
 
         if (_message.length == 0) revert InvalidComposeMessage();
@@ -251,8 +278,6 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
         if (msgType == COMPOSE_MSG_REDEEM) {
             _handleRedemption(_guid, _message[1:]);
-        } else if (msgType == COMPOSE_MSG_DEPOSIT) {
-            _handleDeposit(_guid, _message[1:]);
         } else {
             revert InvalidComposeMessage();
         }
@@ -260,13 +285,11 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
 
     // ========== Internal Functions ==========
 
-    /// @notice Calculate debit amounts with slippage check
     function _debitView(
         uint256 _amountLD,
         uint256 _minAmountLD,
         uint32 /*_dstEid*/
     ) internal view returns (uint256 amountSentLD, uint256 amountReceivedLD) {
-        // Remove dust for cross-chain compatibility
         amountSentLD = _removeDust(_amountLD);
         amountReceivedLD = amountSentLD;
 
@@ -275,37 +298,108 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         }
     }
 
-    /// @notice Credit tokens to recipient (unlock)
     function _credit(
         address _to,
         uint256 _amountLD,
         uint32 /*_srcEid*/
     ) internal returns (uint256 amountReceivedLD) {
         innerToken.safeTransfer(_to, _amountLD);
+
+        // [M04] Mirror ledger: satellite has burned _amountLD, Hub returns PPT to user
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = _amountLD > oldMirrored ? 0 : oldMirrored - _amountLD;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
         return _amountLD;
     }
 
-    /// @notice Remove dust for cross-chain decimal compatibility
     function _removeDust(uint256 _amountLD) internal view returns (uint256 amountLD) {
         return (_amountLD / decimalConversionRate) * decimalConversionRate;
     }
 
-    /// @notice Build send message payload
     function _buildSendMessage(uint256 _amountLD, address _to) internal pure returns (bytes memory) {
         return abi.encode(_to, _amountLD);
     }
 
-    /// @notice Build default options for messages
-    function _buildDefaultOptions() internal pure returns (bytes memory) {
-        return abi.encodePacked(uint16(3), DEFAULT_GAS_LIMIT, uint128(0));
-    }
-
-    /// @notice Convert bytes32 to address
     function _bytes32ToAddress(bytes32 _b) internal pure returns (address) {
         return address(uint160(uint256(_b)));
     }
 
+    /// @notice Flush a pending mint that was stored due to insufficient gas
+    function flushPendingMint(uint256 mintId) external payable whenNotPaused {
+        PendingMint memory pm = pendingMints[mintId];
+        if (pm.receiver == address(0)) revert ZeroAddress();
+
+        delete pendingMints[mintId];
+
+        bytes memory mintPayload = MessageCodec.encodeMintShares(pm.receiver, pm.shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        _lzSend(pm.dstEid, mintPayload, options, MessagingFee(msg.value, 0), payable(msg.sender));
+
+        emit PendingMintFlushed(mintId, pm.dstEid, pm.receiver, pm.shares);
+    }
+
+    function flushPendingSharePriceSync(uint256 syncId) external payable whenNotPaused {
+        PendingSharePriceSync memory pending = pendingSharePriceSyncs[syncId];
+        if (pending.dstEid == 0) revert ZeroAddress();
+
+        delete pendingSharePriceSyncs[syncId];
+        if (hasPendingSharePriceSync[pending.dstEid] && pendingSharePriceSyncIdByDstEid[pending.dstEid] == syncId) {
+            delete hasPendingSharePriceSync[pending.dstEid];
+            delete pendingSharePriceSyncIdByDstEid[pending.dstEid];
+        }
+
+        _sendTypedMessage(pending.dstEid, MessageCodec.encodeSharePriceUpdate(pending.sharePrice), msg.sender);
+        emit PendingSharePriceSyncFlushed(syncId, pending.dstEid, pending.sharePrice);
+    }
+
+    /// @notice Handle satellite withdraw: process redemption on hub
+    function _handleSatelliteWithdraw(Origin calldata _origin, bytes calldata _payload) internal {
+        (address receiver, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
+
+        if (receiver == address(0)) revert ZeroAddress();
+        if (shares == 0) revert InvalidAmount();
+
+        if (hubStargateComposer != address(0)) {
+            uint256 requestId = _requestSatelliteRedemption(_origin.srcEid, receiver, shares);
+            emit CrossChainRedemptionProcessed(bytes32(0), receiver, shares, requestId);
+        } else {
+            _requestRedemption(shares, receiver);
+        }
+
+        // [M04] Satellite already burned the mirror supply when it sent MSG_WITHDRAW
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = shares > oldMirrored ? 0 : oldMirrored - shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
+        _queueOrSendSharePrice(_origin.srcEid);
+
+        emit SatelliteWithdrawProcessed(_origin.srcEid, receiver, shares);
+    }
+
+    /// @notice Handle satellite redemption request (PPTOFT.requestCrossChainRedemption)
+    /// @dev Tokens were burned on remote chain; locked tokens on Hub are used for redemption
+    function _handleSatelliteRedemption(Origin calldata _origin, bytes calldata _payload) internal {
+        (address owner, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
+
+        if (owner == address(0)) revert ZeroAddress();
+        if (shares == 0) revert InvalidAmount();
+
+        uint256 requestId = hubStargateComposer != address(0)
+            ? _requestSatelliteRedemption(_origin.srcEid, owner, shares)
+            : _requestRedemption(shares, owner);
+
+        // [M04] Satellite already burned the mirror supply when it sent MSG_REDEEM
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = shares > oldMirrored ? 0 : oldMirrored - shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
+        _queueOrSendSharePrice(_origin.srcEid);
+        emit CrossChainRedemptionProcessed(bytes32(0), owner, shares, requestId);
+    }
+
     /// @notice Handle cross-chain redemption request
+    /// @dev P0-8 FIX: Removed unnecessary approve before safeTransfer
     function _handleRedemption(bytes32 _guid, bytes calldata _data) internal {
         (address owner, uint256 shares) = abi.decode(_data, (address, uint256));
 
@@ -313,84 +407,250 @@ contract PPTOFTAdapter is OApp, Pausable, ReentrancyGuard, ILayerZeroComposer {
         if (owner == address(0)) revert ZeroAddress();
         if (shares == 0) revert InvalidAmount();
 
-        // Tokens are already unlocked via lzReceive, approve redemption manager
-        innerToken.approve(redemptionManager, shares);
-
-        // Call redemption manager to create redemption request
-        // Note: The redemption manager interface may vary - this is a common pattern
-        // The actual requestId would be returned by the redemption manager
         uint256 requestId = _requestRedemption(shares, owner);
 
         emit CrossChainRedemptionProcessed(_guid, owner, shares, requestId);
     }
 
-    /// @notice Internal function to request redemption
-    /// @dev Override this in production to call actual RedemptionManager
-    function _requestRedemption(uint256 shares, address owner) internal virtual returns (uint256 requestId) {
-        // In production deployment, this would call:
-        // return IRedemptionManager(redemptionManager).requestRedemption(shares, owner);
-        // For now, we transfer tokens to redemption manager and emit event
-        innerToken.safeTransfer(redemptionManager, shares);
-        return uint256(keccak256(abi.encodePacked(block.timestamp, owner, shares)));
+    /// @notice Internal function to request redemption through the configured manager
+    function _requestRedemption(uint256 shares, address owner) internal returns (uint256) {
+        if (redemptionManager == address(0)) revert InvalidComposeMessage();
+        return IRedemptionManager(redemptionManager).requestRedemption(shares, owner);
     }
 
-    /// @notice Handle cross-chain deposit
-    function _handleDeposit(bytes32 _guid, bytes calldata _data) internal {
-        (address receiver, uint256 assets) = abi.decode(_data, (address, uint256));
+    function _requestSatelliteRedemption(uint32 srcEid, address receiver, uint256 shares) internal returns (uint256 requestId) {
+        requestId = _requestRedemption(shares, hubStargateComposer);
+        IHubStargateSettlementRegistrar(hubStargateComposer).registerSatelliteRedemption(requestId, srcEid, receiver);
+    }
 
-        if (vault == address(0)) revert InvalidComposeMessage();
-        if (receiver == address(0)) revert ZeroAddress();
+    function _handleSatelliteCreditUsed(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint256 amount = MessageCodec.decodeAmount(_payload);
+        creditManager.reduceCredit(_origin.srcEid, amount);
+
+        emit SatelliteCreditUsed(_origin.srcEid, amount);
+    }
+
+    function _handleSatelliteCreditRestored(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint256 amount = MessageCodec.decodeAmount(_payload);
+        creditManager.restoreCredit(_origin.srcEid, amount);
+
+        // [M04] Mirror delta on NAV so replenish inflow is visible without waiting for keeper
+        if (address(navReporter) != address(0)) {
+            navReporter.recordSatelliteCredit(_origin.srcEid, amount);
+        }
+
+        emit SatelliteCreditRestored(_origin.srcEid, amount);
+    }
+
+    /// @notice [M04] Handle instant-withdraw settlement from a satellite
+    /// @dev Atomically updates all three books that drift under the legacy `MSG_CREDIT_USED` path:
+    ///      - Credit book: `creditManager.reduceCredit`
+    ///      - NAV book: `navReporter.recordSatelliteDebit` (keeps sharePrice accurate)
+    ///      - Share mirror: `vault.lockShares + burnLockedShares` + `totalMirroredShares -= shares`
+    function _handleSatelliteInstantWithdraw(Origin calldata _origin, bytes calldata _payload) internal {
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+        if (vault == address(0)) revert ZeroAddress();
+        if (address(navReporter) == address(0)) revert ZeroAddress();
+
+        (uint256 shares, uint256 assets) = MessageCodec.decodeInstantWithdrawSettled(_payload);
+        if (shares == 0) revert InvalidAmount();
         if (assets == 0) revert InvalidAmount();
 
-        // Approve vault and deposit
-        innerToken.approve(vault, assets);
+        // Book 1: Credit — advance utilization tracker for the satellite
+        creditManager.reduceCredit(_origin.srcEid, assets);
 
-        // Call vault deposit
-        uint256 shares = IERC4626(vault).deposit(assets, receiver);
+        // Book 2: NAV — reduce cross-chain value to keep sharePrice accurate
+        navReporter.recordSatelliteDebit(_origin.srcEid, assets);
 
-        emit CrossChainDepositProcessed(_guid, receiver, assets, shares);
+        // Book 3: Share mirror — atomically burn locked PPT backing the satellite supply
+        IPPT(vault).lockShares(address(this), shares);
+        IPPT(vault).burnLockedShares(address(this), shares);
+
+        // [M04] Mirror ledger saturates to zero on underflow rather than reverting.
+        //   Rationale: reverting here would block the LayerZero channel after the other
+        //   two books have been committed (impossible to rollback the satellite-side burn).
+        //   Fail loud via event so off-chain keeper can pause + investigate drift.
+        uint256 oldMirrored = totalMirroredShares;
+        uint256 newMirrored;
+        if (shares > oldMirrored) {
+            emit MirroredLedgerDiscrepancy(_origin.srcEid, shares, oldMirrored);
+            newMirrored = 0;
+        } else {
+            newMirrored = oldMirrored - shares;
+        }
+        totalMirroredShares = newMirrored;
+        emit MirroredSharesUpdated(oldMirrored, newMirrored);
+
+        emit SatelliteInstantWithdrawProcessed(_origin.srcEid, shares, assets);
+    }
+
+    // ========== Stargate Composer Integration ==========
+
+    /// @notice Hub Stargate Composer address (authorized to call mintSharesOnSatellite)
+    address public hubStargateComposer;
+
+    /// @notice Send PPT shares to a receiver on a satellite chain
+    /// @dev Called by HubStargateComposer after a bridged deposit is processed
+    function mintSharesOnSatellite(uint32 dstEid, address receiver, uint256 shares) external whenNotPaused {
+        if (msg.sender != hubStargateComposer) revert InvalidComposer();
+        if (receiver == address(0)) revert ZeroAddress();
+        if (shares == 0) revert InvalidAmount();
+
+        // [M04] Mirror ledger: composer has already minted the Hub-side PPT backing these shares;
+        //       satellite is about to increase its PPTOFT.totalSupply by `shares`.
+        uint256 oldMirrored = totalMirroredShares;
+        totalMirroredShares = oldMirrored + shares;
+        emit MirroredSharesUpdated(oldMirrored, totalMirroredShares);
+
+        bytes memory payload = MessageCodec.encodeMintShares(receiver, shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+        if (address(this).balance >= fee.nativeFee) {
+            _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+        } else {
+            uint256 mintId = pendingMintCount++;
+            pendingMints[mintId] = PendingMint(dstEid, receiver, shares);
+            emit PendingMintStored(mintId, dstEid, receiver, shares);
+        }
+
+        _queueOrSendSharePrice(dstEid);
+    }
+
+    function setHubStargateComposer(address _composer) external onlyOwner {
+        hubStargateComposer = _composer;
+    }
+
+    function syncCreditToSatellite(uint32 dstEid, uint256 newCredit, address refundAddress)
+        external
+        payable
+        whenNotPaused
+        onlyOwnerOrCreditManager
+    {
+        if (refundAddress == address(0)) revert ZeroAddress();
+        _sendTypedMessage(dstEid, MessageCodec.encodeCreditUpdate(newCredit), refundAddress);
+        emit CreditSynced(dstEid, newCredit);
+    }
+
+    function syncSharePrice(uint32 dstEid) external payable whenNotPaused onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
+
+        _queueOrSendSharePrice(dstEid);
+    }
+
+    /// @notice [M01] Broadcast the current sharePrice to all registered satellite chains
+    /// @dev Iterates `CreditManager.getSupportedChains()` (single source of truth for chain list).
+    ///      Each dispatch reuses `_queueOrSendSharePrice` which handles pending dedup and
+    ///      `totalMirroredShares`-adjacent observability. The `_payNative` override funds fees
+    ///      from `address(this).balance`, so caller must pre-fund the adapter or send `msg.value`.
+    function broadcastSharePriceToSupportedChains() external payable whenNotPaused onlyOwner {
+        if (vault == address(0)) revert ZeroAddress();
+        if (address(creditManager) == address(0)) revert ZeroAddress();
+
+        uint32[] memory eids = creditManager.getSupportedChains();
+        for (uint256 i = 0; i < eids.length; ++i) {
+            _queueOrSendSharePrice(eids[i]);
+        }
     }
 
     // ========== Configuration ==========
 
-    /// @notice Set credit manager address
-    /// @param _creditManager New credit manager address
     function setCreditManager(address _creditManager) external onlyOwner {
         if (_creditManager == address(0)) revert ZeroAddress();
         creditManager = ICreditManager(_creditManager);
     }
 
-    /// @notice Set vault address
-    /// @param _vault New vault address
     function setVault(address _vault) external onlyOwner {
         if (_vault == address(0)) revert ZeroAddress();
         vault = _vault;
     }
 
-    /// @notice Set redemption manager address
-    /// @param _redemptionManager New redemption manager address
     function setRedemptionManager(address _redemptionManager) external onlyOwner {
         if (_redemptionManager == address(0)) revert ZeroAddress();
         redemptionManager = _redemptionManager;
     }
 
-    /// @notice Pause the contract
+    /// @notice [M04] Set the cross-chain NAV reporter used for satellite balance delta updates
+    /// @dev Required for `MSG_INSTANT_WITHDRAW_SETTLED` handling and replenish NAV restoration.
+    ///      Adapter must hold `REPORTER_ROLE` on the target reporter.
+    function setNavReporter(address _navReporter) external onlyOwner {
+        if (_navReporter == address(0)) revert ZeroAddress();
+        emit NavReporterUpdated(address(navReporter), _navReporter);
+        navReporter = ICrossChainNAVReporter(_navReporter);
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
 
-    /// @notice Unpause the contract
     function unpause() external onlyOwner {
         _unpause();
     }
 
-    /// @notice Emergency withdraw locked tokens (admin only)
-    /// @param _token Token address to withdraw
-    /// @param _to Recipient address
-    /// @param _amount Amount to withdraw
     function emergencyWithdraw(address _token, address _to, uint256 _amount) external onlyOwner {
         if (_to == address(0)) revert ZeroAddress();
         IERC20(_token).safeTransfer(_to, _amount);
         emit EmergencyWithdraw(_token, _to, _amount);
     }
+
+    function _sendTypedMessage(uint32 dstEid, bytes memory payload, address refundAddress) internal {
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+        _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(refundAddress));
+    }
+
+    function _queueOrSendSharePrice(uint32 dstEid) internal {
+        if (vault == address(0)) return;
+
+        uint256 currentSharePrice = IPPT(vault).sharePrice();
+        bytes memory payload = MessageCodec.encodeSharePriceUpdate(currentSharePrice);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(dstEid, payload, options, false);
+
+        if (address(this).balance >= fee.nativeFee) {
+            if (hasPendingSharePriceSync[dstEid]) {
+                uint256 pendingSyncId = pendingSharePriceSyncIdByDstEid[dstEid];
+                delete pendingSharePriceSyncs[pendingSyncId];
+                delete hasPendingSharePriceSync[dstEid];
+                delete pendingSharePriceSyncIdByDstEid[dstEid];
+            }
+            _lzSend(dstEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+            // [M01] Record successful broadcast for keeper threshold/interval tracking
+            lastSharePriceSyncedAt[dstEid] = block.timestamp;
+            lastSharePriceSyncedValue[dstEid] = currentSharePrice;
+            emit SharePriceSynced(dstEid, currentSharePrice);
+            return;
+        }
+
+        if (hasPendingSharePriceSync[dstEid]) {
+            uint256 existingSyncId = pendingSharePriceSyncIdByDstEid[dstEid];
+            pendingSharePriceSyncs[existingSyncId].sharePrice = currentSharePrice;
+            emit PendingSharePriceSyncStored(existingSyncId, dstEid, currentSharePrice);
+            return;
+        }
+
+        uint256 syncId = pendingSharePriceSyncCount++;
+        pendingSharePriceSyncs[syncId] = PendingSharePriceSync({dstEid: dstEid, sharePrice: currentSharePrice});
+        pendingSharePriceSyncIdByDstEid[dstEid] = syncId;
+        hasPendingSharePriceSync[dstEid] = true;
+        emit PendingSharePriceSyncStored(syncId, dstEid, currentSharePrice);
+    }
+
+    /// @notice Override _payNative to use contract balance instead of msg.value
+    /// @dev Required for _lzSend calls inside _lzReceive (where msg.value=0)
+    function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
+        if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
+        return _nativeFee;
+    }
+
+    /// @notice Receive native token for cross-chain message fees
+    receive() external payable {}
+}
+
+interface IHubStargateSettlementRegistrar {
+    function registerSatelliteRedemption(uint256 requestId, uint32 dstEid, address receiver) external;
 }

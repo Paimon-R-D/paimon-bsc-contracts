@@ -22,6 +22,9 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     /// @notice The PPTSatellite that can withdraw from this pool
     address public satellite;
 
+    /// @notice The SatelliteGateway allowed to replenish local liquidity
+    address public liquidityGateway;
+
     /// @notice Current credit allocation from Hub
     uint256 public credit;
 
@@ -43,15 +46,27 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Events ==========
 
     event SatelliteUpdated(address indexed oldSatellite, address indexed newSatellite);
+    event LiquidityGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event LiquidityWithdrawn(address indexed user, uint256 amount);
     event CreditUsed(uint256 amount, uint256 remainingCredit);
     event MinBufferUpdated(uint256 oldBuffer, uint256 newBuffer);
     event EmergencyWithdraw(address indexed to, uint256 amount);
+    event CreditSyncClamped(uint256 requestedCredit, uint256 appliedCredit, uint256 utilized);
 
     // ========== Modifiers ==========
 
     modifier onlySatellite() {
         if (msg.sender != satellite) revert OnlySatellite();
+        _;
+    }
+
+    modifier onlySatelliteOrOwner() {
+        if (msg.sender != satellite && msg.sender != owner()) revert OnlySatellite();
+        _;
+    }
+
+    modifier onlyLiquidityManagerOrOwner() {
+        if (msg.sender != satellite && msg.sender != liquidityGateway && msg.sender != owner()) revert OnlySatellite();
         _;
     }
 
@@ -77,8 +92,11 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     /// @inheritdoc ILiquidityPool
     function availableLiquidity() public view override returns (uint256) {
         uint256 poolBalance = _asset.balanceOf(address(this));
+        if (poolBalance <= minBuffer) return 0;
+
+        uint256 bufferedBalance = poolBalance - minBuffer;
         uint256 remaining = remainingCredit();
-        return poolBalance < remaining ? poolBalance : remaining;
+        return bufferedBalance < remaining ? bufferedBalance : remaining;
     }
 
     /// @inheritdoc ILiquidityPool
@@ -100,7 +118,8 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Liquidity Provider Functions ==========
 
     /// @inheritdoc ILiquidityPool
-    function addLiquidity(uint256 amount) external override nonReentrant whenNotPaused {
+    /// @dev Restrict top-ups to the operational owner/satellite pair until LP share accounting exists.
+    function addLiquidity(uint256 amount) external override onlyLiquidityManagerOrOwner nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
 
         _asset.safeTransferFrom(msg.sender, address(this), amount);
@@ -109,7 +128,8 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ILiquidityPool
-    function removeLiquidity(uint256 amount) external override nonReentrant whenNotPaused {
+    /// @dev P1-1 FIX: Added onlyOwner to prevent unauthorized liquidity removal
+    function removeLiquidity(uint256 amount) external override onlyOwner nonReentrant whenNotPaused {
         if (amount == 0) revert InvalidAmount();
 
         uint256 poolBalance = _asset.balanceOf(address(this));
@@ -145,20 +165,40 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     // ========== Credit Management ==========
 
     /// @inheritdoc ILiquidityPool
-    function updateCredit(uint256 newCredit) external override onlyOwner {
-        emit CreditUpdated(credit, newCredit);
-        credit = newCredit;
+    /// @dev [M03] Split-path invariant enforcement:
+    ///      - Owner (local admin) path: strict `newCredit >= utilized`, else revert.
+    ///      - Satellite (cross-chain sync) path: clamp to `max(newCredit, utilized)` and
+    ///        emit `CreditSyncClamped` so keeper can resync from Hub. Avoiding revert here
+    ///        is critical — `PPTSatellite._lzReceive` calls this directly when
+    ///        `MSG_CREDIT_UPDATE` arrives, and a revert would block the LayerZero
+    ///        channel during normal 1-10 min race windows.
+    function updateCredit(uint256 newCredit) external override onlySatelliteOrOwner {
+        uint256 oldCredit = credit;
+
+        if (msg.sender == owner()) {
+            if (newCredit < utilized) revert CreditBelowUtilized();
+            credit = newCredit;
+            emit CreditUpdated(oldCredit, newCredit);
+            return;
+        }
+
+        uint256 applied = newCredit < utilized ? utilized : newCredit;
+        credit = applied;
+        emit CreditUpdated(oldCredit, applied);
+        if (applied != newCredit) {
+            emit CreditSyncClamped(newCredit, applied, utilized);
+        }
     }
 
     /// @inheritdoc ILiquidityPool
-    function increaseCredit(uint256 amount) external override onlyOwner {
+    function increaseCredit(uint256 amount) external override onlySatelliteOrOwner {
         uint256 oldCredit = credit;
         credit += amount;
         emit CreditUpdated(oldCredit, credit);
     }
 
     /// @inheritdoc ILiquidityPool
-    function decreaseCredit(uint256 amount) external override onlyOwner {
+    function decreaseCredit(uint256 amount) external override onlySatelliteOrOwner {
         // Check for underflow first
         if (amount > credit) revert InsufficientCredit(credit, amount);
         // Then check if remaining credit is sufficient for utilized
@@ -170,15 +210,16 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
     }
 
     /// @inheritdoc ILiquidityPool
-    function replenish(uint256 amount) external override onlyOwner {
-        // Reduce utilized when pool is replenished from Hub
-        if (amount >= utilized) {
-            utilized = 0;
-        } else {
-            utilized -= amount;
-        }
+    function replenish(uint256 amount) external override onlyLiquidityManagerOrOwner nonReentrant whenNotPaused {
+        if (amount == 0) revert InvalidAmount();
 
-        emit CreditUpdated(credit, credit); // Pool replenished event
+        _asset.safeTransferFrom(msg.sender, address(this), amount);
+
+        uint256 released = amount >= utilized ? utilized : amount;
+        utilized -= released;
+
+        emit CreditReleased(released, credit);
+        emit PoolReplenished(amount, msg.sender);
     }
 
     // ========== Configuration ==========
@@ -188,6 +229,12 @@ contract LiquidityPool is ILiquidityPool, Ownable, ReentrancyGuard, Pausable {
         if (_satellite == address(0)) revert ZeroAddress();
         emit SatelliteUpdated(satellite, _satellite);
         satellite = _satellite;
+    }
+
+    function setLiquidityGateway(address _gateway) external onlyOwner {
+        if (_gateway == address(0)) revert ZeroAddress();
+        emit LiquidityGatewayUpdated(liquidityGateway, _gateway);
+        liquidityGateway = _gateway;
     }
 
     /// @inheritdoc ILiquidityPool

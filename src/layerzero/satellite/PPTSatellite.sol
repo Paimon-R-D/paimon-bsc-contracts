@@ -9,7 +9,8 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {PPTOFT} from "./PPTOFT.sol";
 import {LiquidityPool} from "./LiquidityPool.sol";
-import {IPPTSatellite} from "../interfaces/IPPTSatellite.sol";
+import {MessageCodec} from "../libraries/MessageCodec.sol";
+import {LzOptionsLib} from "../libraries/LzOptionsLib.sol";
 
 /// @title PPTSatellite
 /// @notice Entry point for PPT operations on remote chains
@@ -19,54 +20,92 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     // ========== Constants ==========
 
-    /// @notice Maximum instant withdrawal fee (10% = 1000 bps)
     uint256 public constant MAX_INSTANT_WITHDRAW_FEE = 1000;
-
-    /// @notice Default gas limit for cross-chain messages
     uint128 public constant DEFAULT_GAS_LIMIT = 300000;
+    /// @notice [M01] Default sharePrice staleness window tightened from 1h to 10min
+    /// @dev Aligns with Hub-side `maxSharePriceSyncInterval`. Keeper/Hub broadcast
+    ///      cadence is the primary sync face; this is the satellite-side defense in depth.
+    uint256 public constant DEFAULT_MAX_SHARE_PRICE_STALENESS = 10 minutes;
 
-    // Message types (outgoing)
-    bytes1 public constant MSG_DEPOSIT = 0x01;
-    bytes1 public constant MSG_WITHDRAW = 0x02;
-    bytes1 public constant MSG_CREDIT_USED = 0x10;
+    enum WithdrawMode {
+        CrossChain,
+        Instant
+    }
 
-    // Message types (incoming from Hub)
-    bytes1 public constant MSG_SHARE_PRICE_UPDATE = 0x20;
-    bytes1 public constant MSG_CREDIT_UPDATE = 0x21;
-    bytes1 public constant MSG_MINT_SHARES = 0x22;
+    struct DepositParams {
+        uint256 assets;
+        address receiver;
+        uint256 minShares;
+    }
+
+    struct WithdrawParams {
+        uint256 shares;
+        address receiver;
+        uint256 minAssets;
+        WithdrawMode mode;
+    }
 
     // ========== State Variables ==========
 
-    /// @notice The PPTOFT token on this chain
     PPTOFT public immutable pptOft;
-
-    /// @notice The LiquidityPool for instant withdrawals
     LiquidityPool public immutable liquidityPool;
-
-    /// @notice The underlying asset (e.g., USDT)
     IERC20 public immutable asset;
-
-    /// @notice Hub chain EID (BSC = 102)
     uint32 public immutable hubEid;
 
-    /// @notice Hub PPTOFTAdapter address
-    address public hubAdapter;
-
-    /// @notice Instant withdrawal fee in basis points
+    address public satelliteGateway;
     uint256 public instantWithdrawFeeBps;
 
     /// @notice Current share price (from Hub, updated via cross-chain)
     /// @dev Price per share in asset terms, scaled by 1e18
-    uint256 public sharePrice = 1e18; // Default 1:1
+    uint256 public sharePrice = 1e18;
+
+    /// @notice Whether `sharePrice` has ever been set by Hub or owner
+    /// @dev Guards against the uninitialized default of 1e18 being used to price state-changing flows
+    bool public sharePriceInitialized;
+
+    /// @notice Timestamp of the last sharePrice update
+    uint256 public sharePriceLastUpdate;
+
+    /// @notice Max age of sharePrice considered fresh for state-changing flows
+    uint256 public maxSharePriceStaleness = DEFAULT_MAX_SHARE_PRICE_STALENESS;
+
+    /// @notice Legacy pending credit utilization queue (pre-M04). Preserved so
+    /// @dev operators can still `flushPendingCreditUsed()` to drain messages enqueued
+    ///      by the old notification path during upgrade. New writes go to
+    ///      `pendingInstantWithdraws` instead.
+    mapping(uint256 => uint256) public pendingCreditUsed;
+    uint256 public pendingCreditUsedCount;
+
+    /// @notice Pending credit restoration notices that could not be sent due to insufficient native gas
+    mapping(uint256 => uint256) public pendingCreditRestored;
+    uint256 public pendingCreditRestoredCount;
+
+    /// @notice [M04] Pending instant-withdraw settlements that could not be sent due to insufficient native gas
+    /// @dev Both `shares` and `assets` are required so the Hub handler can atomically
+    ///      reduce credit, debit NAV, and mirror-burn adapter's locked PPT.
+    struct PendingInstantWithdraw {
+        uint256 shares;
+        uint256 assets;
+    }
+
+    mapping(uint256 => PendingInstantWithdraw) public pendingInstantWithdraws;
+    uint256 public pendingInstantWithdrawCount;
 
     // ========== Events ==========
 
     event CrossChainDeposit(address indexed user, uint256 assets, uint256 shares, uint64 nonce);
     event CrossChainWithdraw(address indexed user, uint256 shares, uint256 assets, uint64 nonce);
     event InstantWithdraw(address indexed user, uint256 shares, uint256 assets, uint256 fee);
-    event HubAdapterUpdated(address indexed oldAdapter, address indexed newAdapter);
+    event SatelliteGatewayUpdated(address indexed oldGateway, address indexed newGateway);
     event InstantWithdrawFeeUpdated(uint256 oldFee, uint256 newFee);
     event SharePriceUpdated(uint256 oldPrice, uint256 newPrice);
+    event MaxSharePriceStalenessUpdated(uint256 oldStaleness, uint256 newStaleness);
+    event PendingCreditUsedStored(uint256 indexed pendingId, uint256 amount);
+    event PendingCreditUsedFlushed(uint256 indexed pendingId, uint256 amount);
+    event PendingCreditRestoredStored(uint256 indexed pendingId, uint256 amount);
+    event PendingCreditRestoredFlushed(uint256 indexed pendingId, uint256 amount);
+    event PendingInstantWithdrawStored(uint256 indexed pendingId, uint256 shares, uint256 assets);
+    event PendingInstantWithdrawFlushed(uint256 indexed pendingId, uint256 shares, uint256 assets);
 
     // ========== Errors ==========
 
@@ -76,19 +115,20 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     error FeeTooHigh();
     error OnlyHub();
     error ZeroAddress();
-    error HubEidImmutable();
     error UnknownMessageType(bytes1 msgType);
     error InvalidSharePrice();
+    error MinAssetsNotMet(uint256 expected, uint256 minimum);
+    error UnexpectedNativeValue();
+    error UnknownPendingCredit(uint256 pendingId);
+    error UnknownPendingCreditRestore(uint256 pendingId);
+    error UnknownPendingInstantWithdraw(uint256 pendingId);
+    error OnlySatelliteGateway(address caller);
+    error SharePriceUninitialized();
+    error SharePriceStale(uint256 age, uint256 maxStaleness);
+    error InvalidStaleness();
 
     // ========== Constructor ==========
 
-    /// @notice Initialize the PPTSatellite
-    /// @param _endpoint LayerZero endpoint address
-    /// @param _delegate Owner/delegate address
-    /// @param _pptOft PPTOFT token address
-    /// @param _liquidityPool LiquidityPool address
-    /// @param _asset Underlying asset address
-    /// @param _hubEid Hub chain endpoint ID
     constructor(
         address _endpoint,
         address _delegate,
@@ -105,27 +145,14 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
 
     // ========== View Functions ==========
 
-    /// @notice Preview deposit - estimate shares to receive
-    /// @param assets Amount of assets to deposit
-    /// @return shares Estimated shares to receive
     function previewDeposit(uint256 assets) public view returns (uint256 shares) {
-        // shares = assets * 1e18 / sharePrice
         return (assets * 1e18) / sharePrice;
     }
 
-    /// @notice Preview withdrawal - estimate assets to receive
-    /// @param shares Amount of shares to withdraw
-    /// @return assets Estimated assets to receive
     function previewWithdraw(uint256 shares) public view returns (uint256 assets) {
-        // assets = shares * sharePrice / 1e18
         return (shares * sharePrice) / 1e18;
     }
 
-    /// @notice Check if instant withdrawal is available
-    /// @param shares Amount of shares to withdraw
-    /// @return available True if instant withdrawal is possible
-    /// @return assets Estimated assets to receive (after fee)
-    /// @return fee Fee for instant withdrawal
     function previewInstantWithdraw(uint256 shares) public view returns (
         bool available,
         uint256 assets,
@@ -138,127 +165,127 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         available = assets <= liquidityPool.availableLiquidity();
     }
 
-    // ========== Quote Functions ==========
-
-    /// @notice Quote LayerZero fee for deposit
-    /// @param assets Amount of assets to deposit
-    /// @param receiver Address to receive shares
-    /// @return nativeFee Native token fee required
-    /// @return lzTokenFee LayerZero token fee (if applicable)
-    function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
-        bytes memory payload = _buildDepositPayload(assets, receiver);
-        bytes memory options = _buildDefaultOptions();
-        MessagingFee memory fee = _quote(hubEid, payload, options, false);
-        return (fee.nativeFee, fee.lzTokenFee);
+    /// @notice Whether the cached sharePrice is initialized and within the staleness window
+    /// @dev Frontends should gate deposit/instantWithdraw UIs on this flag
+    function isSharePriceFresh() external view returns (bool) {
+        if (!sharePriceInitialized) return false;
+        return block.timestamp - sharePriceLastUpdate <= maxSharePriceStaleness;
     }
 
-    /// @notice Quote LayerZero fee for cross-chain withdrawal
-    /// @param shares Amount of shares to withdraw
-    /// @param receiver Address to receive assets
-    /// @return nativeFee Native token fee required
-    /// @return lzTokenFee LayerZero token fee (if applicable)
+    // ========== Quote Functions ==========
+
+    function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
+        if (satelliteGateway == address(0)) revert ZeroAddress();
+        (nativeFee,) = ISatelliteGateway(satelliteGateway).quoteDeposit(assets, receiver);
+        return (nativeFee, 0);
+    }
+
     function quoteWithdraw(uint256 shares, address receiver) external view returns (uint256 nativeFee, uint256 lzTokenFee) {
-        bytes memory payload = _buildWithdrawPayload(shares, receiver);
-        bytes memory options = _buildDefaultOptions();
+        bytes memory payload = MessageCodec.encodeWithdraw(receiver, shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
         return (fee.nativeFee, fee.lzTokenFee);
     }
 
     // ========== User Actions ==========
 
-    /// @notice Deposit assets and receive PPT shares via cross-chain
-    /// @param assets Amount of assets to deposit
-    /// @param receiver Address to receive shares
-    /// @return shares Amount of shares to be received (0 initially, async)
+    function depositWithParams(DepositParams calldata params)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (uint256 shares)
+    {
+        return _depositThroughBridge(params.assets, params.receiver, params.minShares);
+    }
+
+    /// @notice Deposit USDT via the configured bridge gateway using default slippage settings
     function deposit(
         uint256 assets,
         address receiver
     ) external payable nonReentrant whenNotPaused returns (uint256 shares) {
-        if (assets == 0) revert InvalidAmount();
-
-        // Transfer assets from user
-        asset.safeTransferFrom(msg.sender, address(this), assets);
-
-        // Deposit to liquidity pool (increases pool balance)
-        asset.approve(address(liquidityPool), assets);
-        liquidityPool.addLiquidity(assets);
-
-        // Send cross-chain message to Hub
-        bytes memory payload = _buildDepositPayload(assets, receiver);
-        bytes memory options = _buildDefaultOptions();
-
-        MessagingFee memory fee = _quote(hubEid, payload, options, false);
-        if (msg.value < fee.nativeFee) revert InsufficientFee();
-
-        MessagingReceipt memory receipt = _lzSend(
-            hubEid,
-            payload,
-            options,
-            MessagingFee(msg.value, 0),
-            payable(msg.sender)
-        );
-
-        emit CrossChainDeposit(receiver, assets, 0, receipt.nonce);
-
-        return 0; // Shares minted async on Hub
+        return _depositThroughBridge(assets, receiver, 0);
     }
 
-    /// @notice Instant withdrawal using local liquidity pool
-    /// @param shares Amount of shares to burn
-    /// @param receiver Address to receive assets
-    /// @return assets Amount of assets received (after fee)
     function instantWithdraw(
         uint256 shares,
         address receiver
     ) external nonReentrant whenNotPaused returns (uint256 assets) {
-        if (shares == 0) revert InvalidAmount();
+        return _instantWithdraw(shares, receiver);
+    }
 
-        // Calculate assets and fee
+    function _instantWithdraw(uint256 shares, address receiver) internal returns (uint256 assets) {
+        if (shares == 0) revert InvalidAmount();
+        _requireFreshSharePrice();
+
         uint256 grossAssets = previewWithdraw(shares);
         uint256 fee = (grossAssets * instantWithdrawFeeBps) / 10000;
         assets = grossAssets - fee;
 
-        // Check liquidity
         if (assets > liquidityPool.availableLiquidity()) revert InsufficientLiquidity();
 
-        // Burn user's PPT shares
         pptOft.transferFrom(msg.sender, address(this), shares);
         pptOft.burn(shares);
 
-        // Withdraw from liquidity pool to user
         liquidityPool.withdrawForUser(receiver, assets);
+        _notifyInstantWithdrawSettled(shares, assets);
 
         emit InstantWithdraw(receiver, shares, assets, fee);
 
         return assets;
     }
 
-    /// @notice Standard cross-chain withdraw
-    /// @param shares Amount of shares to withdraw
-    /// @param receiver Address to receive assets
-    /// @return assets Amount of assets to receive (0 initially, async)
+    function withdrawWithParams(WithdrawParams calldata params)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+        returns (uint256 assets)
+    {
+        if (params.mode == WithdrawMode.Instant) {
+            if (msg.value != 0) revert UnexpectedNativeValue();
+            assets = _instantWithdraw(params.shares, params.receiver);
+            if (params.minAssets > 0 && assets < params.minAssets) {
+                revert MinAssetsNotMet(assets, params.minAssets);
+            }
+        } else {
+            uint256 previewAssets = previewWithdraw(params.shares);
+            if (params.minAssets > 0 && previewAssets < params.minAssets) {
+                revert MinAssetsNotMet(previewAssets, params.minAssets);
+            }
+            assets = _withdrawCrossChain(params.shares, params.receiver, msg.value);
+        }
+    }
+
     function withdraw(
         uint256 shares,
         address receiver
     ) external payable nonReentrant whenNotPaused returns (uint256 assets) {
+        return _withdrawCrossChain(shares, receiver, msg.value);
+    }
+
+    function _withdrawCrossChain(
+        uint256 shares,
+        address receiver,
+        uint256 nativeFee
+    ) internal returns (uint256 assets) {
         if (shares == 0) revert InvalidAmount();
 
-        // Burn user's PPT shares
         pptOft.transferFrom(msg.sender, address(this), shares);
         pptOft.burn(shares);
 
-        // Send cross-chain message to Hub
-        bytes memory payload = _buildWithdrawPayload(shares, receiver);
-        bytes memory options = _buildDefaultOptions();
+        // Send cross-chain message to Hub using MessageCodec (MSG_WITHDRAW = 0x31)
+        bytes memory payload = MessageCodec.encodeWithdraw(receiver, shares);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
 
         MessagingFee memory fee = _quote(hubEid, payload, options, false);
-        if (msg.value < fee.nativeFee) revert InsufficientFee();
+        if (nativeFee < fee.nativeFee) revert InsufficientFee();
 
         MessagingReceipt memory receipt = _lzSend(
             hubEid,
             payload,
             options,
-            MessagingFee(msg.value, 0),
+            MessagingFee(nativeFee, 0),
             payable(msg.sender)
         );
 
@@ -270,6 +297,7 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     // ========== LayerZero Receive ==========
 
     /// @notice Handle messages from Hub
+    /// @dev P0-6 FIX: MSG_MINT_SHARES reverts on invalid data instead of silently skipping
     function _lzReceive(
         Origin calldata _origin,
         bytes32 /*_guid*/,
@@ -279,85 +307,167 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
     ) internal override whenNotPaused {
         if (_origin.srcEid != hubEid) revert OnlyHub();
 
-        bytes1 msgType = bytes1(_payload[0]);
+        bytes1 msgType = MessageCodec.decodeMsgType(_payload);
 
-        if (msgType == MSG_SHARE_PRICE_UPDATE) {
-            // Update share price from Hub
-            uint256 newPrice = abi.decode(_payload[1:], (uint256));
+        if (msgType == MessageCodec.MSG_SHARE_PRICE_UPDATE) {
+            uint256 newPrice = MessageCodec.decodeAmount(_payload);
             _updateSharePrice(newPrice);
-        } else if (msgType == MSG_CREDIT_UPDATE) {
-            // Update credit allocation
-            uint256 newCredit = abi.decode(_payload[1:], (uint256));
+        } else if (msgType == MessageCodec.MSG_CREDIT_UPDATE) {
+            uint256 newCredit = MessageCodec.decodeAmount(_payload);
             liquidityPool.updateCredit(newCredit);
-        } else if (msgType == MSG_MINT_SHARES) {
-            // Mint shares to user (deposit confirmation)
-            (address receiver, uint256 shares) = abi.decode(_payload[1:], (address, uint256));
-            if (receiver != address(0) && shares > 0) {
-                pptOft.mint(receiver, shares);
-            }
+        } else if (msgType == MessageCodec.MSG_MINT_SHARES) {
+            (address receiver, uint256 shares) = MessageCodec.decodeAddressAndAmount(_payload);
+            // P0-6 FIX: Revert on invalid data instead of silently skipping
+            if (receiver == address(0)) revert ZeroAddress();
+            if (shares == 0) revert InvalidAmount();
+            pptOft.mint(receiver, shares);
         } else {
             revert UnknownMessageType(msgType);
         }
     }
 
-    /// @notice Internal function to update share price
-    /// @param newPrice New share price (scaled by 1e18)
     function _updateSharePrice(uint256 newPrice) internal {
         if (newPrice == 0) revert InvalidSharePrice();
         emit SharePriceUpdated(sharePrice, newPrice);
         sharePrice = newPrice;
+        sharePriceInitialized = true;
+        sharePriceLastUpdate = block.timestamp;
     }
 
-    // ========== Internal Functions ==========
-
-    /// @notice Build deposit payload
-    function _buildDepositPayload(uint256 assets, address receiver) internal pure returns (bytes memory) {
-        return abi.encodePacked(MSG_DEPOSIT, abi.encode(receiver, assets));
+    function _requireFreshSharePrice() internal view {
+        if (!sharePriceInitialized) revert SharePriceUninitialized();
+        uint256 age = block.timestamp - sharePriceLastUpdate;
+        if (age > maxSharePriceStaleness) revert SharePriceStale(age, maxSharePriceStaleness);
     }
 
-    /// @notice Build withdraw payload
-    function _buildWithdrawPayload(uint256 shares, address receiver) internal pure returns (bytes memory) {
-        return abi.encodePacked(MSG_WITHDRAW, abi.encode(receiver, shares));
+    function _depositThroughBridge(
+        uint256 assets,
+        address receiver,
+        uint256 minShares
+    ) internal returns (uint256) {
+        if (assets == 0) revert InvalidAmount();
+        if (satelliteGateway == address(0)) revert ZeroAddress();
+        _requireFreshSharePrice();
+
+        asset.safeTransferFrom(msg.sender, address(this), assets);
+        asset.forceApprove(satelliteGateway, assets);
+        ISatelliteGateway(satelliteGateway).depositFor{value: msg.value}(
+            address(this),
+            assets,
+            receiver,
+            minShares,
+            msg.sender
+        );
+        asset.forceApprove(satelliteGateway, 0);
+
+        emit CrossChainDeposit(receiver, assets, 0, 0);
+        return 0;
     }
 
-    /// @notice Build default options for messages
-    function _buildDefaultOptions() internal pure returns (bytes memory) {
-        return abi.encodePacked(uint16(3), DEFAULT_GAS_LIMIT, uint128(0));
+    /// @notice [M04] Notify Hub that an instant withdrawal has settled on this satellite
+    /// @dev Carries both burned shares and disbursed assets so the Hub handler can
+    ///      atomically reduce credit, debit NAV, and mirror-burn locked PPT in one tx,
+    ///      preserving the share conservation invariant.
+    function _notifyInstantWithdrawSettled(uint256 shares, uint256 assets) internal {
+        bytes memory payload = MessageCodec.encodeInstantWithdrawSettled(shares, assets);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+
+        if (address(this).balance >= fee.nativeFee) {
+            _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+            return;
+        }
+
+        uint256 pendingId = pendingInstantWithdrawCount++;
+        pendingInstantWithdraws[pendingId] = PendingInstantWithdraw({shares: shares, assets: assets});
+        emit PendingInstantWithdrawStored(pendingId, shares, assets);
+    }
+
+    function notifyCreditRestored(uint256 amount) external whenNotPaused {
+        if (msg.sender != satelliteGateway) revert OnlySatelliteGateway(msg.sender);
+        if (amount == 0) revert InvalidAmount();
+
+        bytes memory payload = MessageCodec.encodeCreditRestored(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+
+        if (address(this).balance >= fee.nativeFee) {
+            _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+            return;
+        }
+
+        uint256 pendingId = pendingCreditRestoredCount++;
+        pendingCreditRestored[pendingId] = amount;
+        emit PendingCreditRestoredStored(pendingId, amount);
+    }
+
+    function flushPendingCreditUsed(uint256 pendingId) external payable onlyOwner whenNotPaused {
+        uint256 amount = pendingCreditUsed[pendingId];
+        if (amount == 0) revert UnknownPendingCredit(pendingId);
+
+        delete pendingCreditUsed[pendingId];
+
+        bytes memory payload = MessageCodec.encodeCreditUsed(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+        _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+
+        emit PendingCreditUsedFlushed(pendingId, amount);
+    }
+
+    function flushPendingCreditRestored(uint256 pendingId) external payable onlyOwner whenNotPaused {
+        uint256 amount = pendingCreditRestored[pendingId];
+        if (amount == 0) revert UnknownPendingCreditRestore(pendingId);
+
+        delete pendingCreditRestored[pendingId];
+
+        bytes memory payload = MessageCodec.encodeCreditRestored(amount);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+        _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+
+        emit PendingCreditRestoredFlushed(pendingId, amount);
+    }
+
+    /// @notice [M04] Flush a pending instant-withdraw settlement that was queued due to insufficient native fee
+    function flushPendingInstantWithdraw(uint256 pendingId) external payable onlyOwner whenNotPaused {
+        PendingInstantWithdraw memory pending = pendingInstantWithdraws[pendingId];
+        if (pending.shares == 0 && pending.assets == 0) revert UnknownPendingInstantWithdraw(pendingId);
+
+        delete pendingInstantWithdraws[pendingId];
+
+        bytes memory payload = MessageCodec.encodeInstantWithdrawSettled(pending.shares, pending.assets);
+        bytes memory options = LzOptionsLib.buildLzReceiveOptions(DEFAULT_GAS_LIMIT);
+        MessagingFee memory fee = _quote(hubEid, payload, options, false);
+        _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));
+
+        emit PendingInstantWithdrawFlushed(pendingId, pending.shares, pending.assets);
     }
 
     // ========== Configuration ==========
 
-    /// @notice Set the Hub endpoint ID (not used - immutable)
-    function setHubEid(uint32 /*_hubEid*/) external pure {
-        // hubEid is immutable, this function exists for interface compatibility
-        revert HubEidImmutable();
+    function setSatelliteGateway(address _gateway) external onlyOwner {
+        if (_gateway == address(0)) revert ZeroAddress();
+        emit SatelliteGatewayUpdated(satelliteGateway, _gateway);
+        satelliteGateway = _gateway;
     }
 
-    /// @notice Set the Hub adapter address
-    /// @param _hubAdapter New Hub adapter address
-    function setHubAdapter(address _hubAdapter) external onlyOwner {
-        if (_hubAdapter == address(0)) revert ZeroAddress();
-        emit HubAdapterUpdated(hubAdapter, _hubAdapter);
-        hubAdapter = _hubAdapter;
-    }
-
-    /// @notice Set instant withdrawal fee
     function setInstantWithdrawFee(uint256 _feeBps) external onlyOwner {
         if (_feeBps > MAX_INSTANT_WITHDRAW_FEE) revert FeeTooHigh();
         emit InstantWithdrawFeeUpdated(instantWithdrawFeeBps, _feeBps);
         instantWithdrawFeeBps = _feeBps;
     }
 
-    /// @notice Set share price (emergency admin function)
-    /// @dev In production, sharePrice should only be updated via cross-chain message
-    /// @param _sharePrice New share price (scaled by 1e18)
     function setSharePrice(uint256 _sharePrice) external onlyOwner {
-        if (_sharePrice == 0) revert InvalidSharePrice();
-        emit SharePriceUpdated(sharePrice, _sharePrice);
-        sharePrice = _sharePrice;
+        _updateSharePrice(_sharePrice);
     }
 
-    /// @notice Pause/unpause the satellite
+    function setMaxSharePriceStaleness(uint256 _staleness) external onlyOwner {
+        if (_staleness == 0) revert InvalidStaleness();
+        emit MaxSharePriceStalenessUpdated(maxSharePriceStaleness, _staleness);
+        maxSharePriceStaleness = _staleness;
+    }
+
     function setPaused(bool _paused) external onlyOwner {
         if (_paused) {
             _pause();
@@ -366,6 +476,21 @@ contract PPTSatellite is OApp, ReentrancyGuard, Pausable {
         }
     }
 
-    /// @notice Receive native token for gas
+    function _payNative(uint256 _nativeFee) internal virtual override returns (uint256 nativeFee) {
+        if (address(this).balance < _nativeFee) revert NotEnoughNative(_nativeFee);
+        return _nativeFee;
+    }
+
     receive() external payable {}
+}
+
+interface ISatelliteGateway {
+    function depositFor(
+        address payer,
+        uint256 assets,
+        address receiver,
+        uint256 minShares,
+        address refundAddress
+    ) external payable;
+    function quoteDeposit(uint256 assets, address receiver) external view returns (uint256 nativeFee, uint256 minReceive);
 }

@@ -1,0 +1,16 @@
+{
+  "sessions": [
+    {
+      "id": "20260309-154248-main-iter1",
+      "branch": "main",
+      "iteration": 1,
+      "mode": "full",
+      "timestamp": "2026-03-09T15:42:48Z",
+      "verdict": "APPROVE",
+      "p0": 0,
+      "p1": 21,
+      "total": 67,
+      "parent": null
+    }
+  ]
+}
