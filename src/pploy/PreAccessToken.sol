@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.35;
 
-// Self-contained Pre-IPO Token. Deploy ONLY the PreIPOToken contract. No Token proxy.
+// Self-contained PreAccess Token. Deploy ONLY the PreAccessToken contract. No Token proxy.
 // Repository: https://git.toolsfdg.net/william-lll/capped-token-template
-// Branch: feat/preipo-token; commit: b8062e57de0bd6d51fc0dfd8a3f1e5e40bd2769b
+// Branch: feat/PreAccess-token; commit: b8062e57de0bd6d51fc0dfd8a3f1e5e40bd2769b
 // Build: Solidity 0.8.35; optimizer ON, 200 runs; EVM Cancun; viaIR OFF.
 // OpenZeppelin Contracts 5.5.0, commit fcbae5394ae8ad52d8e580a3477db99814b9d565.
 // Source/license comments retained; imports inlined; Solidity pragma pinned to the repository compiler.
@@ -939,7 +939,7 @@ library SafeIntrospection {
         // BNB Smart Chain carry one, and only 4 clear all four checks here. Operators must create the
         // seats without a handler or clear it with `setFallbackHandler(0)` first. Kept as-is until the
         // business decides, because loosening an admission check is not a refactor;
-        // `PreIPOTokenBscFork.t.sol` pins the consequence against real Safes either way.
+        // `PreAccessTokenBscFork.t.sol` pins the consequence against real Safes either way.
         //
         // The transaction guard at keccak256("guard_manager.guard.address") is deliberately NOT
         // checked, even though it lives in the same undeclared-storage corner and reads the same way.
@@ -1049,7 +1049,7 @@ library SafeIntrospection {
 }
 
 // ============================================================================
-// File: src/PreIPOTokenTypes.sol
+// File: src/PreAccessTokenTypes.sol
 // Source SHA-256: 54f302e88c2e02be23956f287c19b0e859f5ad0577fe768f7d87ae265f3dbfe8
 // ============================================================================
 
@@ -1156,14 +1156,14 @@ struct ShareRatio {
 }
 
 // ============================================================================
-// File: src/PreIPOToken.sol
+// File: src/PreAccessToken.sol
 // Source SHA-256: fa3db1f5d760d02b2714f5aabe265a5ca26f357e4981c590b6a8ad9389287fa1
 //   ^^ STALE. This section was modified by Paimon (genesis mint); the hash above describes the
 //      vendor's original and no longer matches the code below. See the banner at the top of the file.
 // ============================================================================
 
 // Original source license: MIT
-contract PreIPOToken is ERC20, Pausable {
+contract PreAccessToken is ERC20, Pausable {
     // ---------------------------------------------------------------------------------------------
     // Waiting times
     // ---------------------------------------------------------------------------------------------
@@ -2033,7 +2033,7 @@ contract PreIPOToken is ERC20, Pausable {
         } else if (delayOf(kind) == 0) {
             // Keyed on the delay, not on `kind == CloseIssuance`, because the delay is what creates the
             // exposure. Every delayed kind is deliberately *not* invalidated by a role rotation, and
-            // the reason recorded in `PreIPOTokenTypes` is that the incoming role has a remedy: it can
+            // the reason recorded in `PreAccessTokenTypes` is that the incoming role has a remedy: it can
             // withdraw or veto during the window. A zero delay is exactly where that reason runs out —
             // confirmation *is* the execution, so there is no window and the remedy is a race the
             // incoming role can lose.
@@ -2048,7 +2048,7 @@ contract PreIPOToken is ERC20, Pausable {
             // `rolesFor` again to know which counter to read, and that is the role table written a
             // second time — the duplication that had `vetoRequest` authorising against a hardcoded
             // `confirmerSafe` until a review caught it. The extra strictness costs a re-proposal after
-            // a Confirmer rotation, which for a once-ever action taken deliberately at the IPO is not
+            // a Confirmer rotation, which for a once-ever action taken deliberately at the access is not
             // a cost worth buying a duplicated table to avoid.
             _requireRoleEpochsUnmoved(request);
         }
@@ -2144,7 +2144,7 @@ contract PreIPOToken is ERC20, Pausable {
     }
 
     /// @dev Writes two numbers and emits. Deliberately touches no balance, allowance, or supply, and
-    /// deliberately outside `_requiresOpenIssuance`: a corporate action can happen after the IPO, and
+    /// deliberately outside `_requiresOpenIssuance`: a corporate action can happen after the access, and
     /// the design keeps this available once issuance is closed.
     function _executeShareRatioChange(uint256 requestId, bytes32 evidenceHash) private {
         ShareRatio memory ratio = proposedShareRatio[requestId];
@@ -2216,7 +2216,7 @@ contract PreIPOToken is ERC20, Pausable {
     /// and closure itself — and none of the four handovers or the share ratio.
     ///
     /// Closing issuance ends minting, not the company. The seats still have to be rotatable through
-    /// the wind-down; an inventory Safe lost after the IPO is exactly when a handover is needed, and
+    /// the wind-down; an inventory Safe lost after the access is exactly when a handover is needed, and
     /// gating it would leave unsold inventory stranded in an unusable Safe with no recovery path in a
     /// contract that cannot be upgraded. Settlement is the same argument, more sharply: it is only
     /// *after* closure that retirement matters at all. And a corporate action still has to be
