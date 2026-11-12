@@ -2,7 +2,6 @@
 pragma solidity 0.8.35;
 
 // Self-contained PreAccess Token. Deploy ONLY the PreAccessToken contract. No Token proxy.
-// Repository: https://git.toolsfdg.net/william-lll/capped-token-template
 // Branch: feat/PreAccess-token; commit: b8062e57de0bd6d51fc0dfd8a3f1e5e40bd2769b
 // Build: Solidity 0.8.35; optimizer ON, 200 runs; EVM Cancun; viaIR OFF.
 // OpenZeppelin Contracts 5.5.0, commit fcbae5394ae8ad52d8e580a3477db99814b9d565.
