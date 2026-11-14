@@ -99,9 +99,10 @@ interface ICreditManager {
     function rebalance(uint32[] calldata eids, uint256[] calldata amounts) external payable;
 
     /// @notice Set credit for a specific chain (admin only)
+    /// @dev Requires msg.value for LayerZero fees when the remote allocation changes
     /// @param eid Chain endpoint ID
     /// @param amount New credit amount
-    function setCredit(uint32 eid, uint256 amount) external;
+    function setCredit(uint32 eid, uint256 amount) external payable;
 
     // ========== Configuration ==========
 

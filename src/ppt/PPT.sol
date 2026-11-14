@@ -12,7 +12,7 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PPTTypes} from "./PPTTypes.sol";
-import {IPPT, IAssetController, IRedemptionManager} from "./IPPTContracts.sol";
+import {IPPT, IAssetController, IRedemptionManager, ICrossChainNAVReporter} from "./IPPTContracts.sol";
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 /// @title PPT (Paimon Prime Token)
@@ -82,6 +82,10 @@ contract PPT is
     /// @notice Locked shares per user
     mapping(address => uint256) public override lockedSharesOf;
 
+    /// @notice Cross-chain NAV reporter (for aggregating remote chain positions)
+    /// @dev Appended at end of storage for upgrade safety
+    ICrossChainNAVReporter public crossChainNAVReporter;
+
     // /// @notice Last NAV update time
     // uint256 public lastNavUpdate;
 
@@ -107,6 +111,7 @@ contract PPT is
     event LockedMintAssetsReset(uint256 oldAmount);
     event RedemptionManagerUpdated(address indexed oldManager, address indexed newManager);
     event StandardQuotaRatioUpdated(uint256 oldRatio, uint256 newRatio);
+    event CrossChainNAVReporterUpdated(address indexed oldReporter, address indexed newReporter);
     event PendingApprovalSharesAdded(address indexed owner, uint256 shares);
     event PendingApprovalSharesRemoved(address indexed owner, uint256 shares);
     event PendingApprovalSharesConverted(address indexed owner, uint256 shares);
@@ -125,6 +130,7 @@ contract PPT is
     error DepositsBlockedAllSharesLocked();
     // N39 Fix: Backstop - never mint 0 shares for non-zero deposit
     error ZeroSharesMinted();
+    error UseRedemptionManager();
 
     // =============================================================================
     // Modifiers
@@ -212,7 +218,10 @@ contract PPT is
         uint256 assetValue = address(assetController) != address(0)
             ? assetController.calculateAssetValue()
             : 0;
-        return cashValue + assetValue;
+        uint256 crossChainValue = address(crossChainNAVReporter) != address(0)
+            ? crossChainNAVReporter.getCrossChainValue()
+            : 0;
+        return cashValue + assetValue + crossChainValue;
     }
 
     // =============================================================================
@@ -304,12 +313,12 @@ contract PPT is
     
     /// @notice Disable direct withdraw - Use RedemptionManager
     function withdraw(uint256, address, address) public pure override returns (uint256) {
-        revert("error");
+        revert UseRedemptionManager();
     }
 
     /// @notice Disable direct redeem - Use RedemptionManager
     function redeem(uint256, address, address) public pure override returns (uint256) {
-        revert("error");
+        revert UseRedemptionManager();
     }
 
     // =============================================================================
@@ -553,6 +562,13 @@ contract PPT is
         address old = address(redemptionManager);
         redemptionManager = IRedemptionManager(manager);
         emit RedemptionManagerUpdated(old, manager);
+    }
+
+    /// @notice Set cross-chain NAV reporter
+    function setCrossChainNAVReporter(address reporter) external onlyRole(ADMIN_ROLE) {
+        address old = address(crossChainNAVReporter);
+        crossChainNAVReporter = ICrossChainNAVReporter(reporter);
+        emit CrossChainNAVReporterUpdated(old, reporter);
     }
 
     /// @notice Set standard channel quota ratio

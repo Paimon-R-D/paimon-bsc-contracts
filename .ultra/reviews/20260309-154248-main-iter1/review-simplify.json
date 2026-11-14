@@ -1,0 +1,172 @@
+{
+  "$schema": "ultra-review-findings-v1",
+  "agent": "review-simplify",
+  "findings": [
+    {
+      "id": "simplify-001",
+      "severity": "P2",
+      "confidence": 92,
+      "category": "simplification",
+      "title": "Duplicated _buildOptions / _buildDefaultOptions / _buildLzReceiveOptions across 5 contracts",
+      "file": "src/layerzero/hub/CreditManager.sol",
+      "line": 319,
+      "code_snippet": "function _buildLzReceiveOptions(uint128 gasLimit) internal pure returns (bytes memory) {\n    return abi.encodePacked(\n        uint16(3),\n        gasLimit,\n        uint128(0)\n    );\n}",
+      "description": "The identical LZ options builder function is copy-pasted across 5 contracts under different names: CreditManager._buildLzReceiveOptions (L319), CrossChainAssetController._buildOptions (L351), PPTOFTAdapter._buildDefaultOptions (L299), PPTOFT._buildDefaultOptions (L298), PPTSatellite._buildDefaultOptions (L324), and RemoteAssetAdapter._buildOptions (L280). Meanwhile, LzOptionsLib already exists as a shared library that provides exactly this functionality but is never imported or used by any of these contracts.",
+      "suggestion": "BEFORE:\n// In each contract, a private copy:\nfunction _buildOptions(uint128 gasLimit) internal pure returns (bytes memory) {\n    return abi.encodePacked(uint16(3), gasLimit, uint128(0));\n}\n\nAFTER:\nimport {LzOptionsLib} from \"../libraries/LzOptionsLib.sol\";\n// Then use: LzOptionsLib.buildLzReceiveOptions(gasLimit)\n\nWHY: LzOptionsLib.sol (L12) was specifically created to eliminate this duplication but none of the 5 contracts actually use it. This is dead library code sitting next to 5 copies of itself. Using the library eliminates maintenance risk if the options format changes."
+    },
+    {
+      "id": "simplify-002",
+      "severity": "P2",
+      "confidence": 90,
+      "category": "simplification",
+      "title": "Duplicated error definitions across contracts instead of using shared LayerZeroErrors library",
+      "file": "src/layerzero/libraries/LayerZeroErrors.sol",
+      "line": 7,
+      "code_snippet": "library LayerZeroErrors {\n    error UnknownMessageType(bytes1 msgType);\n    error ZeroAddress();\n    error InvalidAmount();\n    error InvalidPeer(uint32 srcEid, bytes32 sender);\n    error UnauthorizedSource(uint32 srcEid);\n    // ...\n}",
+      "description": "LayerZeroErrors.sol defines 11 shared error types, but every contract redeclares its own copies: InvalidAmount (CreditManager L16, CrossChainAssetController L105, PPTOFTAdapter L99, PPTOFT L76, PPTSatellite L73, LiquidityPool L36, RemoteAssetAdapter implicit), UnknownMessageType (CreditManager L25, CrossChainAssetController L112, PPTSatellite L80, RemoteAssetAdapter L69), ZeroAddress (PPTOFTAdapter L105, LiquidityPool L41, RemoteAssetAdapter L70), UnauthorizedSource (CreditManager L26, CrossChainAssetController L111). The LayerZeroErrors library is never imported anywhere.",
+      "suggestion": "BEFORE:\n// Each contract declares its own:\nerror InvalidAmount();\nerror ZeroAddress();\nerror UnknownMessageType(bytes1 msgType);\n\nAFTER:\nimport {LayerZeroErrors} from \"../libraries/LayerZeroErrors.sol\";\n// Then use: revert LayerZeroErrors.InvalidAmount();\n// Or inherit via a base contract that uses the library errors.\n\nWHY: The shared library was created for this purpose but is unused. Having 6+ copies of the same error types means signature mismatches could silently diverge across contracts. Centralizing ensures consistency and reduces bytecode size."
+    },
+    {
+      "id": "simplify-003",
+      "severity": "P2",
+      "confidence": 88,
+      "category": "simplification",
+      "title": "Near-duplicate _debitView, _removeDust, _buildSendMessage, _bytes32ToAddress between PPTOFT and PPTOFTAdapter",
+      "file": "src/layerzero/satellite/PPTOFT.sol",
+      "line": 256,
+      "code_snippet": "function _debitView(\n    uint256 _amountLD,\n    uint256 _minAmountLD,\n    uint32 /*_dstEid*/\n) internal view returns (uint256 amountSentLD, uint256 amountReceivedLD) {\n    amountSentLD = _removeDust(_amountLD);\n    amountReceivedLD = amountSentLD;\n    if (amountReceivedLD < _minAmountLD) {\n        revert SlippageExceeded(amountReceivedLD, _minAmountLD);\n    }\n}",
+      "description": "PPTOFT and PPTOFTAdapter share 4 identical internal functions: _debitView (PPTOFT L256-268, PPTOFTAdapter L264-276), _removeDust (PPTOFT L282-284, PPTOFTAdapter L289-291), _buildSendMessage (PPTOFT L287-289, PPTOFTAdapter L294-296), and _bytes32ToAddress (PPTOFT L304-306, PPTOFTAdapter L304-306). These are line-for-line identical implementations. Since both handle OFT mechanics, extracting to a shared base contract or library would eliminate 4 duplicate functions (~30 lines).",
+      "suggestion": "BEFORE:\n// Identical code in both PPTOFT.sol and PPTOFTAdapter.sol:\nfunction _removeDust(uint256 _amountLD) internal view returns (uint256) {\n    return (_amountLD / decimalConversionRate) * decimalConversionRate;\n}\nfunction _buildSendMessage(uint256 _amountLD, address _to) internal pure returns (bytes memory) {\n    return abi.encode(_to, _amountLD);\n}\nfunction _bytes32ToAddress(bytes32 _b) internal pure returns (address) {\n    return address(uint160(uint256(_b)));\n}\n\nAFTER:\n// Create abstract contract OFTCore with shared logic:\nabstract contract OFTCore {\n    uint256 public immutable decimalConversionRate;\n    function _removeDust(uint256 _amountLD) internal view returns (uint256) { ... }\n    function _buildSendMessage(uint256 _amountLD, address _to) internal pure returns (bytes memory) { ... }\n    function _bytes32ToAddress(bytes32 _b) internal pure returns (address) { ... }\n    function _debitView(uint256 _amountLD, uint256 _minAmountLD, uint32) internal view returns (uint256, uint256) { ... }\n}\n\nWHY: 4 identical functions across 2 contracts is a clear sign of a missing abstraction. Changes to OFT mechanics would need coordinated updates in both files, risking divergence."
+    },
+    {
+      "id": "simplify-004",
+      "severity": "P2",
+      "confidence": 85,
+      "category": "code-quality",
+      "title": "CreditManager.rebalance has high cyclomatic complexity with nested branching in a loop",
+      "file": "src/layerzero/hub/CreditManager.sol",
+      "line": 139,
+      "code_snippet": "function rebalance(\n    uint32[] calldata eids,\n    uint256[] calldata amounts\n) external payable override onlyOwner whenNotPaused {\n    // ... 45 lines with for-loop containing if/else if branches,\n    // ternary, and multiple storage reads/writes\n}",
+      "description": "The rebalance function (L139-186, 48 lines) has a cyclomatic complexity of approximately 8 (2 guard clauses + loop + 3 branches inside loop + 1 ternary). It mixes validation, state updates, cross-chain message construction, fee splitting, and event emission in one function body. The inner loop body alone spans ~30 lines with 3 levels of nesting (function > loop > if/else if). This makes it the most complex function in the codebase.",
+      "suggestion": "BEFORE:\nfor (uint256 i = 0; i < eids.length; i++) {\n    if (!_isSupported[eids[i]]) revert ChainNotSupported(eids[i]);\n    uint256 oldCredit = _chainCredits[eids[i]].credit;\n    uint256 newCredit = amounts[i];\n    if (newCredit > oldCredit) {\n        uint256 delta = newCredit - oldCredit;\n        _chainCredits[eids[i]].credit = newCredit;\n        totalCredits += delta;\n        bytes memory payload = abi.encode(MSG_SEND_CREDIT, delta);\n        bytes memory options = _buildLzReceiveOptions(DEFAULT_GAS_LIMIT);\n        uint256 fee = (i == eids.length - 1) ? (totalFee - totalUsedFee) : feePerChain;\n        _lzSend(eids[i], payload, options, MessagingFee(fee, 0), payable(msg.sender));\n        totalUsedFee += fee;\n        emit CreditsSent(eids[i], delta);\n    } else if (newCredit < oldCredit) {\n        uint256 delta = oldCredit - newCredit;\n        uint256 available = _chainCredits[eids[i]].credit - _chainCredits[eids[i]].utilized;\n        if (available < delta) revert CannotReduceBelowUtilized(...);\n        _chainCredits[eids[i]].credit = newCredit;\n        totalCredits -= delta;\n    }\n    _chainCredits[eids[i]].lastUpdate = block.timestamp;\n    emit CreditUpdated(eids[i], oldCredit, newCredit);\n}\n\nAFTER:\n// Extract the inner logic:\nfunction _rebalanceSingle(\n    uint32 eid, uint256 newCredit, uint256 fee\n) internal returns (uint256 usedFee) {\n    if (!_isSupported[eid]) revert ChainNotSupported(eid);\n    uint256 oldCredit = _chainCredits[eid].credit;\n    if (newCredit > oldCredit) {\n        return _increaseChainCredit(eid, oldCredit, newCredit, fee);\n    } else if (newCredit < oldCredit) {\n        _decreaseChainCredit(eid, oldCredit, newCredit);\n    }\n    _chainCredits[eid].lastUpdate = block.timestamp;\n    emit CreditUpdated(eid, oldCredit, newCredit);\n    return 0;\n}\n\nWHY: The loop body handles two distinct operations (increase with cross-chain message vs. decrease locally). Extracting reduces nesting depth from 3 to 2 and makes each path independently testable."
+    },
+    {
+      "id": "simplify-005",
+      "severity": "P2",
+      "confidence": 87,
+      "category": "simplification",
+      "title": "Near-duplicate _sendWithdrawConfirmation and _sendYieldReport in RemoteAssetAdapter",
+      "file": "src/layerzero/satellite/adapters/RemoteAssetAdapter.sol",
+      "line": 202,
+      "code_snippet": "function _sendWithdrawConfirmation(uint256 amount) internal {\n    bytes memory payload = abi.encodePacked(MSG_WITHDRAW_CONFIRM, amount);\n    bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);\n    MessagingFee memory fee = _quote(hubEid, payload, options, false);\n    if (address(this).balance >= fee.nativeFee) {\n        MessagingReceipt memory receipt = _lzSend(\n            hubEid, payload, options,\n            MessagingFee(fee.nativeFee, 0), payable(address(this))\n        );\n        emit WithdrawConfirmationSent(amount, receipt.guid);\n    }\n}",
+      "description": "The functions _sendWithdrawConfirmation (L202-221) and _sendYieldReport (L225-243) are structurally identical: build payload with a message type and amount, build options, quote fee, check balance, send if sufficient. The only differences are the message type constant, the event emitted, and the parameter name. This is a textbook case for extracting a shared helper.",
+      "suggestion": "BEFORE:\nfunction _sendWithdrawConfirmation(uint256 amount) internal {\n    bytes memory payload = abi.encodePacked(MSG_WITHDRAW_CONFIRM, amount);\n    bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);\n    MessagingFee memory fee = _quote(hubEid, payload, options, false);\n    if (address(this).balance >= fee.nativeFee) {\n        MessagingReceipt memory receipt = _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));\n        emit WithdrawConfirmationSent(amount, receipt.guid);\n    }\n}\nfunction _sendYieldReport(uint256 yieldAmount) internal {\n    bytes memory payload = abi.encodePacked(MSG_YIELD_REPORT, yieldAmount);\n    bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);\n    MessagingFee memory fee = _quote(hubEid, payload, options, false);\n    if (address(this).balance >= fee.nativeFee) {\n        MessagingReceipt memory receipt = _lzSend(hubEid, payload, options, MessagingFee(fee.nativeFee, 0), payable(address(this)));\n        emit YieldReportSent(yieldAmount, receipt.guid);\n    }\n}\n\nAFTER:\nfunction _sendToHub(bytes memory payload) internal returns (bytes32 guid) {\n    bytes memory options = _buildOptions(DEFAULT_GAS_LIMIT);\n    MessagingFee memory fee = _quote(hubEid, payload, options, false);\n    if (address(this).balance >= fee.nativeFee) {\n        MessagingReceipt memory receipt = _lzSend(\n            hubEid, payload, options,\n            MessagingFee(fee.nativeFee, 0), payable(address(this))\n        );\n        return receipt.guid;\n    }\n    return bytes32(0);\n}\n\nfunction _sendWithdrawConfirmation(uint256 amount) internal {\n    bytes32 guid = _sendToHub(abi.encodePacked(MSG_WITHDRAW_CONFIRM, amount));\n    if (guid != bytes32(0)) emit WithdrawConfirmationSent(amount, guid);\n}\n\nfunction _sendYieldReport(uint256 yieldAmount) internal {\n    bytes32 guid = _sendToHub(abi.encodePacked(MSG_YIELD_REPORT, yieldAmount));\n    if (guid != bytes32(0)) emit YieldReportSent(yieldAmount, guid);\n}\n\nWHY: 19 lines of identical structure reduced to a single helper. The pattern is used 2 times now but will grow as more message types are added."
+    },
+    {
+      "id": "simplify-006",
+      "severity": "P2",
+      "confidence": 86,
+      "category": "simplification",
+      "title": "Duplicated removeChain/removeSupportedChain array-removal pattern across CreditManager and CrossChainAssetController",
+      "file": "src/layerzero/hub/CreditManager.sol",
+      "line": 236,
+      "code_snippet": "for (uint256 i = 0; i < _supportedChains.length; i++) {\n    if (_supportedChains[i] == eid) {\n        _supportedChains[i] = _supportedChains[_supportedChains.length - 1];\n        _supportedChains.pop();\n        break;\n    }\n}",
+      "description": "The swap-and-pop array removal pattern is duplicated identically in CreditManager.removeChain (L236-242) and CrossChainAssetController.removeSupportedChain (L309-315). Both operate on _supportedChains arrays of type uint32[]. This is a common utility pattern that could be extracted to a shared library function.",
+      "suggestion": "BEFORE:\n// Identical in both CreditManager.sol and CrossChainAssetController.sol:\nfor (uint256 i = 0; i < _supportedChains.length; i++) {\n    if (_supportedChains[i] == eid) {\n        _supportedChains[i] = _supportedChains[_supportedChains.length - 1];\n        _supportedChains.pop();\n        break;\n    }\n}\n\nAFTER:\n// In a shared library (e.g., ArrayLib.sol):\nlibrary ArrayLib {\n    function removeByValue(uint32[] storage arr, uint32 value) internal {\n        for (uint256 i = 0; i < arr.length; i++) {\n            if (arr[i] == value) {\n                arr[i] = arr[arr.length - 1];\n                arr.pop();\n                return;\n            }\n        }\n    }\n}\n\nWHY: Eliminates 7 lines of duplicated logic and provides a reusable primitive for any future contracts that manage supported chain arrays."
+    },
+    {
+      "id": "simplify-007",
+      "severity": "P2",
+      "confidence": 83,
+      "category": "simplification",
+      "title": "Duplicate struct definitions (SendParam, MessagingFee, MessagingReceipt, OFTReceipt) in IPPTOFT and IPPTOFTAdapter",
+      "file": "src/layerzero/interfaces/IPPTOFT.sol",
+      "line": 14,
+      "code_snippet": "struct SendParam {\n    uint32 dstEid;\n    bytes32 to;\n    uint256 amountLD;\n    uint256 minAmountLD;\n    bytes extraOptions;\n    bytes composeMsg;\n    bytes oftCmd;\n}",
+      "description": "IPPTOFT (L14-42) and IPPTOFTAdapter (L11-38) define identical structs: SendParam (7 fields), MessagingFee (2 fields), MessagingReceipt (3 fields), and OFTReceipt (2 fields). These 4 structs are defined twice, totaling ~56 lines of pure duplication. Any change to these types must be synchronized between both interfaces.",
+      "suggestion": "BEFORE:\n// In IPPTOFT.sol:\nstruct SendParam { uint32 dstEid; bytes32 to; uint256 amountLD; ... }\nstruct MessagingFee { uint256 nativeFee; uint256 lzTokenFee; }\n// In IPPTOFTAdapter.sol:\nstruct SendParam { uint32 dstEid; bytes32 to; uint256 amountLD; ... }\nstruct MessagingFee { uint256 nativeFee; uint256 lzTokenFee; }\n\nAFTER:\n// Create ILzTypes.sol:\ninterface ILzTypes {\n    struct SendParam { uint32 dstEid; bytes32 to; uint256 amountLD; uint256 minAmountLD; bytes extraOptions; bytes composeMsg; bytes oftCmd; }\n    struct MessagingFee { uint256 nativeFee; uint256 lzTokenFee; }\n    struct MessagingReceipt { bytes32 guid; uint64 nonce; MessagingFee fee; }\n    struct OFTReceipt { uint256 amountSentLD; uint256 amountReceivedLD; }\n}\n// Then: interface IPPTOFT is ILzTypes, IERC20 { ... }\n// And:  interface IPPTOFTAdapter is ILzTypes { ... }\n\nWHY: Four structs duplicated across two interfaces is fragile. A single source of struct definitions eliminates risk of type divergence."
+    },
+    {
+      "id": "simplify-008",
+      "severity": "P3",
+      "confidence": 82,
+      "category": "simplification",
+      "title": "Repeated storage reads of _chainCredits[eid] in CreditManager functions",
+      "file": "src/layerzero/hub/CreditManager.sol",
+      "line": 100,
+      "code_snippet": "_chainCredits[dstEid].credit += amount;\n_chainCredits[dstEid].lastUpdate = block.timestamp;\ntotalCredits += amount;\nuint256 oldCredit = _chainCredits[dstEid].credit - amount;",
+      "description": "In sendCredits (L100-120), _chainCredits[dstEid] is accessed 4 times as separate SLOAD operations. In restoreCredit (L128-136), _chainCredits[eid] is accessed 3 times. In _reduceCredit (L301-313), _chainCredits[eid] is accessed 5 times. Caching the storage pointer as a local variable would clarify intent and may save gas on repeated slot lookups.",
+      "suggestion": "BEFORE:\nfunction sendCredits(uint32 dstEid, uint256 amount) external payable ... {\n    ...\n    _chainCredits[dstEid].credit += amount;\n    _chainCredits[dstEid].lastUpdate = block.timestamp;\n    totalCredits += amount;\n    uint256 oldCredit = _chainCredits[dstEid].credit - amount;\n    ...\n}\n\nAFTER:\nfunction sendCredits(uint32 dstEid, uint256 amount) external payable ... {\n    ...\n    ChainCredit storage cc = _chainCredits[dstEid];\n    uint256 oldCredit = cc.credit;\n    cc.credit += amount;\n    cc.lastUpdate = block.timestamp;\n    totalCredits += amount;\n    ...\n}\n\nWHY: Caching the storage reference reduces repeated mapping lookups (hashing dstEid for slot computation). Also improves readability by computing oldCredit before mutation rather than back-computing it after."
+    },
+    {
+      "id": "simplify-009",
+      "severity": "P3",
+      "confidence": 80,
+      "category": "simplification",
+      "title": "Magic number 10000 used directly in LiquidityPool and PPTSatellite instead of named constant",
+      "file": "src/layerzero/satellite/LiquidityPool.sol",
+      "line": 92,
+      "code_snippet": "return (utilized * 10000) / credit;",
+      "description": "LiquidityPool.utilizationRatio (L92) uses the literal 10000 for basis points denomination. PPTSatellite.previewInstantWithdraw (L135) and instantWithdraw (L218) also use literal 10000. Meanwhile, CreditManager properly defines BPS_DENOMINATOR = 10000 as a named constant. Inconsistent use of magic numbers vs. named constants across the codebase.",
+      "suggestion": "BEFORE:\n// LiquidityPool.sol L92:\nreturn (utilized * 10000) / credit;\n// PPTSatellite.sol L135:\nfee = (grossAssets * instantWithdrawFeeBps) / 10000;\n\nAFTER:\nuint256 public constant BPS_DENOMINATOR = 10000;\n// Then:\nreturn (utilized * BPS_DENOMINATOR) / credit;\nfee = (grossAssets * instantWithdrawFeeBps) / BPS_DENOMINATOR;\n\nWHY: Named constants are self-documenting and prevent errors when the same value appears in arithmetic. CreditManager already uses BPS_DENOMINATOR; other contracts should follow the same pattern."
+    },
+    {
+      "id": "simplify-010",
+      "severity": "P3",
+      "confidence": 78,
+      "category": "simplification",
+      "title": "Duplicate quoteSend pattern between PPTOFT and PPTOFTAdapter with identical structure",
+      "file": "src/layerzero/satellite/PPTOFT.sol",
+      "line": 153,
+      "code_snippet": "function quoteSend(\n    uint32 _dstEid,\n    uint256 _amountLD,\n    bytes calldata _options,\n    bool _payInLzToken\n) external view returns (MessagingFee memory fee) {\n    bytes memory message = _buildSendMessage(_amountLD, msg.sender);\n    bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();\n    return _quote(_dstEid, message, options, _payInLzToken);\n}",
+      "description": "Both PPTOFT.quoteSend (L153-162) and PPTOFTAdapter.quoteSend (L160-169) have identical implementations with the same signature, same ternary for options fallback, same _buildSendMessage call, and same _quote delegation. This reinforces the need for a shared OFT base contract (related to finding simplify-003).",
+      "suggestion": "BEFORE:\n// In both PPTOFT.sol and PPTOFTAdapter.sol:\nfunction quoteSend(uint32 _dstEid, uint256 _amountLD, bytes calldata _options, bool _payInLzToken)\n    external view returns (MessagingFee memory fee) {\n    bytes memory message = _buildSendMessage(_amountLD, msg.sender);\n    bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();\n    return _quote(_dstEid, message, options, _payInLzToken);\n}\n\nAFTER:\n// In shared OFTCore base contract:\nfunction quoteSend(uint32 _dstEid, uint256 _amountLD, bytes calldata _options, bool _payInLzToken)\n    external view returns (MessagingFee memory fee) {\n    bytes memory message = _buildSendMessage(_amountLD, msg.sender);\n    bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();\n    return _quote(_dstEid, message, options, _payInLzToken);\n}\n\nWHY: Part of the broader OFT core duplication (see simplify-003). 5 duplicate functions between PPTOFT and PPTOFTAdapter points strongly to a missing abstract base."
+    },
+    {
+      "id": "simplify-011",
+      "severity": "P3",
+      "confidence": 79,
+      "category": "simplification",
+      "title": "Duplicate send function structure between PPTOFT and PPTOFTAdapter",
+      "file": "src/layerzero/satellite/PPTOFT.sol",
+      "line": 185,
+      "code_snippet": "function send(\n    uint32 _dstEid, bytes32 _to, uint256 _amountLD,\n    uint256 _minAmountLD, bytes calldata _options, address _refundAddress\n) external payable whenNotPaused returns (MessagingReceipt memory receipt) {\n    if (_amountLD == 0) revert InvalidAmount();\n    (uint256 amountSentLD, uint256 amountReceivedLD) = _debitView(_amountLD, _minAmountLD, _dstEid);\n    _burn(msg.sender, amountSentLD);\n    bytes memory message = _buildSendMessage(amountReceivedLD, _bytes32ToAddress(_to));\n    bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();\n    receipt = _lzSend(_dstEid, message, options, MessagingFee(msg.value, 0), payable(_refundAddress));\n    emit OFTSent(receipt.guid, _dstEid, msg.sender, amountSentLD, amountReceivedLD);\n}",
+      "description": "PPTOFT.send (L185-208) and PPTOFTAdapter.send (L179-202) share identical structure: validate amount, call _debitView, debit tokens (burn vs. safeTransferFrom), build message, send via LZ, emit OFTSent. The only difference is the debit mechanism (burn vs. lock). This is a classic Template Method pattern where the base provides the algorithm skeleton and subclasses override only the debit step.",
+      "suggestion": "BEFORE:\n// PPTOFT: _burn(msg.sender, amountSentLD);\n// PPTOFTAdapter: innerToken.safeTransferFrom(msg.sender, address(this), amountSentLD);\n\nAFTER:\n// In OFTCore base:\nfunction send(...) external payable whenNotPaused returns (MessagingReceipt memory receipt) {\n    if (_amountLD == 0) revert InvalidAmount();\n    (uint256 amountSentLD, uint256 amountReceivedLD) = _debitView(_amountLD, _minAmountLD, _dstEid);\n    _debit(msg.sender, amountSentLD);  // abstract - burn or lock\n    bytes memory message = _buildSendMessage(amountReceivedLD, _bytes32ToAddress(_to));\n    bytes memory options = _options.length > 0 ? _options : _buildDefaultOptions();\n    receipt = _lzSend(_dstEid, message, options, MessagingFee(msg.value, 0), payable(_refundAddress));\n    emit OFTSent(receipt.guid, _dstEid, msg.sender, amountSentLD, amountReceivedLD);\n}\nfunction _debit(address from, uint256 amount) internal virtual;\n\nWHY: Template Method pattern eliminates ~20 duplicated lines. Only the 1-line debit mechanism differs between the two contracts."
+    },
+    {
+      "id": "simplify-012",
+      "severity": "P3",
+      "confidence": 77,
+      "category": "simplification",
+      "title": "PPTSatellite.deposit and withdraw share common cross-chain send boilerplate",
+      "file": "src/layerzero/satellite/PPTSatellite.sol",
+      "line": 173,
+      "code_snippet": "bytes memory payload = _buildDepositPayload(assets, receiver);\nbytes memory options = _buildDefaultOptions();\nMessagingFee memory fee = _quote(hubEid, payload, options, false);\nif (msg.value < fee.nativeFee) revert InsufficientFee();\nMessagingReceipt memory receipt = _lzSend(\n    hubEid, payload, options,\n    MessagingFee(msg.value, 0), payable(msg.sender)\n);",
+      "description": "PPTSatellite.deposit (L187-199) and PPTSatellite.withdraw (L251-263) share 7 identical lines of cross-chain send boilerplate: build options, quote fee, check msg.value, call _lzSend. The only difference is the payload construction. This pattern repeats within a single contract.",
+      "suggestion": "BEFORE:\n// In deposit:\nbytes memory options = _buildDefaultOptions();\nMessagingFee memory fee = _quote(hubEid, payload, options, false);\nif (msg.value < fee.nativeFee) revert InsufficientFee();\nMessagingReceipt memory receipt = _lzSend(hubEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));\n// Same 4 lines in withdraw\n\nAFTER:\nfunction _sendToHub(bytes memory payload) internal returns (MessagingReceipt memory receipt) {\n    bytes memory options = _buildDefaultOptions();\n    MessagingFee memory fee = _quote(hubEid, payload, options, false);\n    if (msg.value < fee.nativeFee) revert InsufficientFee();\n    return _lzSend(hubEid, payload, options, MessagingFee(msg.value, 0), payable(msg.sender));\n}\n\nWHY: Extracting a _sendToHub helper eliminates 7 lines of duplication within the same contract. Also makes it trivial to add new message types without repeating the send boilerplate."
+    },
+    {
+      "id": "simplify-013",
+      "severity": "P3",
+      "confidence": 76,
+      "category": "simplification",
+      "title": "Redundant explicit return in DeltaLib.calculateOptimalWeights",
+      "file": "src/layerzero/libraries/DeltaLib.sol",
+      "line": 36,
+      "code_snippet": "function calculateOptimalWeights(\n    uint256[] memory usages,\n    uint256 totalUsage\n) internal pure returns (uint256[] memory weights) {\n    if (usages.length == 0) revert EmptyArray();\n    weights = new uint256[](usages.length);\n    if (totalUsage == 0) {\n        uint256 equalWeight = BPS_DENOMINATOR / usages.length;\n        for (uint256 i = 0; i < usages.length; i++) {\n            weights[i] = equalWeight;\n        }\n        return weights;  // <-- redundant\n    }\n    for (uint256 i = 0; i < usages.length; i++) {\n        weights[i] = (usages[i] * BPS_DENOMINATOR) / totalUsage;\n    }\n    return weights;  // <-- redundant\n}",
+      "description": "calculateOptimalWeights uses a named return variable 'weights' but also has two explicit 'return weights' statements (L50 and L57). Since 'weights' is the named return, the function will automatically return it at the end. The early 'return weights' at L50 is fine for control flow (short-circuiting), but the final 'return weights' at L57 is redundant.",
+      "suggestion": "BEFORE:\n    for (uint256 i = 0; i < usages.length; i++) {\n        weights[i] = (usages[i] * BPS_DENOMINATOR) / totalUsage;\n    }\n    return weights;\n}\n\nAFTER:\n    for (uint256 i = 0; i < usages.length; i++) {\n        weights[i] = (usages[i] * BPS_DENOMINATOR) / totalUsage;\n    }\n    // Named return 'weights' is returned automatically\n}\n\nWHY: Minor clarity improvement. When using named returns, the trailing explicit return is redundant noise. The early return at L50 is fine since it serves as short-circuit control flow."
+    }
+  ],
+  "summary": {
+    "total_findings": 13,
+    "by_severity": {
+      "P0": 0,
+      "P1": 0,
+      "P2": 7,
+      "P3": 6
+    },
+    "verdict": "The codebase has a clear pattern of code duplication stemming from two root causes: (1) Shared libraries LzOptionsLib and LayerZeroErrors were created but never imported by any contract, leaving 5+ copies of identical functions and error definitions. (2) PPTOFT and PPTOFTAdapter duplicate at least 5 functions that belong in a shared OFT base contract. The CreditManager.rebalance function is the highest-complexity hotspot with nested branching inside a loop. No individual function exceeds 50 lines, keeping all findings at P2-P3 severity. The primary recommendation is to actually use the existing shared libraries and extract a common OFTCore base contract."
+  }
+}

@@ -8,16 +8,6 @@ interface IPPTOFTAdapter {
     // ========== Structs ==========
 
     /// @notice Send parameters for cross-chain transfer
-    struct SendParam {
-        uint32 dstEid;              // Destination chain endpoint ID
-        bytes32 to;                 // Recipient address (bytes32 for cross-chain compatibility)
-        uint256 amountLD;           // Amount in local decimals
-        uint256 minAmountLD;        // Minimum amount to receive (slippage protection)
-        bytes extraOptions;         // Additional LayerZero options
-        bytes composeMsg;           // Compose message for destination chain
-        bytes oftCmd;               // OFT specific command
-    }
-
     /// @notice Messaging fee structure
     struct MessagingFee {
         uint256 nativeFee;          // Native token fee
@@ -29,12 +19,6 @@ interface IPPTOFTAdapter {
         bytes32 guid;               // Global unique identifier
         uint64 nonce;               // Message nonce
         MessagingFee fee;           // Fee paid
-    }
-
-    /// @notice OFT receipt for send operation
-    struct OFTReceipt {
-        uint256 amountSentLD;       // Amount sent in local decimals
-        uint256 amountReceivedLD;   // Amount to be received in local decimals
     }
 
     // ========== Events ==========
@@ -132,51 +116,42 @@ interface IPPTOFTAdapter {
     // ========== Core OFT Functions ==========
 
     /// @notice Quote the messaging fee for a send operation
-    /// @param sendParam Send parameters
+    /// @param dstEid Destination chain endpoint ID
+    /// @param amountLD Amount in local decimals
+    /// @param options LayerZero options bytes
     /// @param payInLzToken Whether to pay fee in LZ token
     /// @return msgFee Messaging fee structure
     function quoteSend(
-        SendParam calldata sendParam,
+        uint32 dstEid,
+        uint256 amountLD,
+        bytes calldata options,
         bool payInLzToken
     ) external view returns (MessagingFee memory msgFee);
 
     /// @notice Send tokens cross-chain
-    /// @param sendParam Send parameters
-    /// @param fee Messaging fee to pay
+    /// @param dstEid Destination chain endpoint ID
+    /// @param to Recipient address in bytes32 format
+    /// @param amountLD Amount in local decimals
+    /// @param minAmountLD Minimum amount to receive
+    /// @param options LayerZero options bytes
     /// @param refundAddress Address to refund excess fee
     /// @return msgReceipt Messaging receipt
-    /// @return oftReceipt OFT receipt
     function send(
-        SendParam calldata sendParam,
-        MessagingFee calldata fee,
+        uint32 dstEid,
+        bytes32 to,
+        uint256 amountLD,
+        uint256 minAmountLD,
+        bytes calldata options,
         address refundAddress
-    ) external payable returns (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt);
+    ) external payable returns (MessagingReceipt memory msgReceipt);
 
     // ========== Cross-Chain Vault Operations ==========
 
-    /// @notice Process a cross-chain deposit request
-    /// @dev Called internally when deposit message is received from satellite
-    /// @param srcEid Source chain endpoint ID
-    /// @param depositor Address of the depositor on source chain
-    /// @param assets Amount of assets to deposit
-    /// @return shares Shares minted
-    function processDeposit(
-        uint32 srcEid,
-        address depositor,
-        uint256 assets
-    ) external returns (uint256 shares);
+    function mintSharesOnSatellite(uint32 dstEid, address receiver, uint256 shares) external;
 
-    /// @notice Process a cross-chain withdrawal request
-    /// @dev Called internally when withdrawal message is received from satellite
-    /// @param srcEid Source chain endpoint ID
-    /// @param withdrawer Address of the withdrawer on source chain
-    /// @param shares Amount of shares to burn
-    /// @return assets Assets to send back
-    function processWithdraw(
-        uint32 srcEid,
-        address withdrawer,
-        uint256 shares
-    ) external returns (uint256 assets);
+    function syncCreditToSatellite(uint32 dstEid, uint256 newCredit, address refundAddress) external payable;
+
+    function syncSharePrice(uint32 dstEid) external payable;
 
     // ========== Peer Configuration ==========
 
@@ -195,6 +170,12 @@ interface IPPTOFTAdapter {
     /// @notice Set the CreditManager address
     /// @param _creditManager Address of CreditManager
     function setCreditManager(address _creditManager) external;
+
+    function setVault(address vault) external;
+
+    function setRedemptionManager(address redemptionManager) external;
+
+    function setHubStargateComposer(address composer) external;
 
     /// @notice Set enforced options for a destination chain
     /// @param eid Destination endpoint ID

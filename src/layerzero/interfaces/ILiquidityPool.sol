@@ -125,6 +125,10 @@ interface ILiquidityPool {
     /// @param _satellite Address of the PPTSatellite
     function setSatellite(address _satellite) external;
 
+    /// @notice Set the Stargate gateway allowed to replenish local liquidity
+    /// @param _gateway Address of the SatelliteGateway
+    function setLiquidityGateway(address _gateway) external;
+
     /// @notice Set minimum liquidity buffer
     /// @param _minBuffer Minimum liquidity to maintain
     function setMinBuffer(uint256 _minBuffer) external;
